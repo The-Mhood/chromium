@@ -37,7 +37,11 @@
 //      primitive) -> block, even with a fresh gesture.
 //   4. An open initiated from a cross-origin iframe (the standard ad-embed
 //      pattern) -> block, even on a real click. Same-origin iframe opens are
-//      treated like top-frame opens.
+//      treated like top-frame opens. Attribution covers BOTH ways a frame
+//      opens a tab: a window.open call recorded in that frame, and a
+//      target=_blank anchor CLICK recorded in that frame (which never
+//      involves window.open and was the hole that let "sponsored" ad
+//      iframes open tabs on the user's click).
 //   5. Tab budget exhausted                           -> block.
 //   6. A second script popup from the same page within REPEAT_WINDOW_MS
 //      (even with a fresh gesture each time) -> block, and report the
@@ -74,6 +78,39 @@ function getRegistrableDomain(input) {
   } catch {
     return '';
   }
+}
+
+/** True when an anchor href and the destination it opened are the same URL. */
+function sameAnchorHref(href, destination) {
+  if (!href || !destination) return false;
+  try {
+    const a = new URL(href);
+    const b = new URL(destination);
+    a.hash = '';
+    b.hash = '';
+    return a.toString() === b.toString();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick the per-frame record that most plausibly initiated a given open:
+ *   - a click whose anchor href MATCHES the destination is an exact
+ *     attribution (that click is what the browser acted on);
+ *   - otherwise the freshest of the window.open and click records — the
+ *     action that just happened is the one Chromium is reporting.
+ * Returns null when the page keeps no usable record (CDP unavailable).
+ */
+function pickAttribution({ url, disposition, pageState }) {
+  const openRecord = pageState && pageState.open;
+  const clickRecord = pageState && pageState.click;
+  if (!openRecord && !clickRecord) return null;
+  if (clickRecord && sameAnchorHref(clickRecord.href, url)) return clickRecord;
+  if (disposition !== 'foreground-tab' && openRecord && !clickRecord) return openRecord;
+  const candidates = [openRecord, clickRecord].filter(Boolean);
+  candidates.sort((a, b) => (b.t || 0) - (a.t || 0));
+  return candidates[0];
 }
 
 function createPopupPolicy(options = {}) {
@@ -115,10 +152,15 @@ function createPopupPolicy(options = {}) {
    * @param {string} p.sourceUrl    the page that opened it
    * @param {string} p.disposition  "default" | "foreground-tab" | "background-tab"
    * @param {number} p.tabCount     external tabs currently open
-   * @param {object|null} p.pageState { ageMs, open } from the isolated worlds,
-   *                                   or null when CDP is unavailable.
-   *                                   `open` = { isTop, crossOrigin, ... } of
-   *                                   the freshest window.open record.
+   * @param {object|null} p.pageState { ageMs, open, click } from the isolated
+   *                                   worlds, or null when CDP is unavailable.
+   *                                   `open` = { t, isTop, crossOrigin, ... }
+   *                                   of the freshest window.open record;
+   *                                   `click` = { t, isTop, crossOrigin,
+   *                                   href, ... } of the freshest anchor
+   *                                   click (target=_blank never calls
+   *                                   window.open, so this is the only
+   *                                   record of that path).
    * @param {number} p.contentsId
    * @returns {{ allowed: boolean, reason: string, needsCommit?: boolean, earlierUrl?: string }}
    */
@@ -136,11 +178,18 @@ function createPopupPolicy(options = {}) {
     if (disposition === 'background-tab') {
       return { allowed: false, reason: 'background-tab', needsCommit: false };
     }
-    // Cross-origin iframe opens are the canonical ad-embed pattern: a
-    // third-party ad unit inside the page opens a tab "on" the user's click.
-    // A same-origin iframe is part of the page the user is looking at.
-    const openRecord = pageState && pageState.open;
-    if (openRecord && openRecord.crossOrigin === true) {
+    // Frame attribution: which frame's action caused THIS open. A cross-
+    // origin iframe is the canonical ad-embed pattern — a third-party ad
+    // unit opens a tab "on" the user's click — and never gets one, even on
+    // a real click. A same-origin iframe is part of the page being viewed.
+    // Two mechanisms open tabs:
+    //   * a scripted window.open      -> the `open` record in that frame;
+    //   * a target=_blank anchor click -> the `click` record (window.open is
+    //     NOT called; the browser opens the tab directly). This is the
+    //     "sponsored link" ad pattern and the hole a window.open-only check
+    //     misses.
+    const attribution = pickAttribution({ url, disposition, pageState });
+    if (attribution && attribution.crossOrigin === true) {
       return { allowed: false, reason: 'ad-iframe', needsCommit: false };
     }
     if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsCommit: false };
@@ -233,4 +282,4 @@ function committedNavigationVerdict(p) {
   return { block: false, reason: 'accepted', type: null };
 }
 
-module.exports = { createPopupPolicy, getRegistrableDomain, committedNavigationVerdict };
+module.exports = { createPopupPolicy, getRegistrableDomain, committedNavigationVerdict, pickAttribution, sameAnchorHref };
