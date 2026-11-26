@@ -682,6 +682,17 @@ test('main process wiring (Electron stub)', async t => {
     await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-h12');
   });
 
+  await t.test('permissions: fullscreen is allowed, tracker abuses stay denied', async () => {
+    assert.ok(calls.permissions, 'a permission request handler is installed');
+    const decide = permission => new Promise(resolve => calls.permissions({}, permission, resolve));
+    // YouTube's own fullscreen button calls requestFullscreen() — denying
+    // the permission made every video player "refuse fullscreen".
+    assert.equal(await decide('fullscreen'), true, 'video fullscreen is allowed');
+    assert.equal(await decide('notifications'), false, 'notification abuse stays denied');
+    assert.equal(await decide('media'), false, 'camera/microphone stays denied');
+    assert.equal(await decide('geolocation'), false, 'geolocation stays denied');
+  });
+
   await t.test('the window control and F11 toggle true browser fullscreen', async () => {
     calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
     assert.equal(winStub().__fullscreen, true, 'the OS window entered fullscreen');
