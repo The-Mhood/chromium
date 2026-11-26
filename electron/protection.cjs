@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { ElectronBlocker, fromElectronDetails } = require('@ghostery/adblocker-electron');
+const { Request } = require('@ghostery/adblocker');
 const fetch = require('cross-fetch');
 const { getDomain } = require('tldts');
 const { webContents } = require('electron');
@@ -47,6 +48,11 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
     }
     callback({});
   });
+
+  function shouldBlockPopup(url, sourceUrl) {
+    const request = Request.fromRawDetails({ url, sourceUrl, type: 'popup' });
+    return engines.ads.match(request).match || engines.threats.match(request).match;
+  }
 
   async function rebuild(filters) {
     const signature = JSON.stringify(filters.filter(item => item.enabled).map(item => [item.id, item.url, item.updated]));
@@ -103,7 +109,7 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
     cssKeys.set(contents.id, keys);
   }
 
-  return { rebuild, applyCosmetics, forget: id => cssKeys.delete(id) };
+  return { rebuild, applyCosmetics, shouldBlockPopup, forget: id => cssKeys.delete(id) };
 }
 
 module.exports = { createProtectionEngine };
