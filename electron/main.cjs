@@ -81,8 +81,12 @@ function makeTab(id) {
   contents.setWindowOpenHandler(details => {
     try {
       const url = browsingUrl(details.url);
-      if (state.protection.enabled && state.protection.popups && !isAllowedDomain(contents.getURL(), state.allowlist) && !['foreground-tab', 'background-tab'].includes(details.disposition)) recordBlocked('Pop-up', url, contents.getURL());
-      else send('core:open-tab', { url, title: new URL(url).hostname });
+      const sourceUrl = contents.getURL();
+      if (state.protection.enabled && state.protection.popups && !isAllowedDomain(sourceUrl, state.allowlist) && engine.shouldBlockPopup(url, sourceUrl)) {
+        recordBlocked('Pop-up', url, sourceUrl);
+      } else {
+        send('core:open-tab', { url, title: new URL(url).hostname });
+      }
     } catch { /* Never open privileged URLs from a remote page. */ }
     return { action: 'deny' };
   });
