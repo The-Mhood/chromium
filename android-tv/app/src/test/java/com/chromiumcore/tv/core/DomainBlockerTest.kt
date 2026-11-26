@@ -16,6 +16,14 @@ class DomainBlockerTest {
     }
 
     @Test
+    fun blocksKnownAdHostsWhenUsedAsTopLevelDestinations() {
+        // MainActivity applies this same classifier to main-frame redirects and popup destinations.
+        assertEquals(BlockType.AD, blocker.classify("landing.doubleclick.net", "publisher.example"))
+        assertEquals(BlockType.AD, blocker.classify("click.taboola.com", "publisher.example"))
+        assertNull(blocker.classify("publisher.example", "publisher.example"))
+    }
+
+    @Test
     fun classifiesTrackersSeparately() {
         assertEquals(BlockType.TRACKER, blocker.classify("www.google-analytics.com", "example.com"))
     }

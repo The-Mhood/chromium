@@ -77,6 +77,8 @@ export interface DesktopBridge {
   onTabUpdate: (callback: (tab: { id: string; title: string; url: string }) => void) => () => void;
   onOpenTab: (callback: (tab: { url: string; title: string }) => void) => () => void;
   onStats: (callback: (stats: NativeStats) => void) => () => void;
+  onChromeVisibility: (callback: (visible: boolean) => void) => () => void;
+  onFullscreenState: (callback: (fullscreen: boolean) => void) => () => void;
 }
 
 declare global {

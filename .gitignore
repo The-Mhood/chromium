@@ -6,3 +6,11 @@ test-results/
 playwright-report/
 *.log
 .DS_Store
+
+# Android/Gradle generated output
+**/.gradle/
+**/build/
+local.properties
+
+# Signing material must never be committed
+.android-signing/

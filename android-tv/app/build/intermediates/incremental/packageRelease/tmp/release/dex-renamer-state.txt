@@ -1,7 +1,0 @@
-#Thu Nov 26 14:08:02 UTC 2026
-base.1=/home/user/sandbox/android-tv/app/build/intermediates/global_synthetics_dex/release/mergeReleaseGlobalSynthetics/classes.dex
-path.1=classes.dex
-base.0=/home/user/sandbox/android-tv/app/build/intermediates/dex/release/mergeDexRelease/classes.dex
-renamed.1=classes2.dex
-renamed.0=classes.dex
-path.0=classes.dex
