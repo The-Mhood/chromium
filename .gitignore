@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.desktop-build/
+artifacts/
+test-results/
+playwright-report/
+*.log
+.DS_Store

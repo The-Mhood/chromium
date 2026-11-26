@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">ChromiumCore</string>
+    <string name="url_hint">Search or enter address</string>
+    <string name="back">Back</string>
+    <string name="forward">Forward</string>
+    <string name="reload">Reload</string>
+    <string name="home">Home</string>
+    <string name="menu">Menu</string>
+    <string name="protection">Protection</string>
+</resources>

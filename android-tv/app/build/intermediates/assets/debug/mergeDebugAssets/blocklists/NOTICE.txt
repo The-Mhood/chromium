@@ -1,0 +1,4 @@
+The domain lists in this folder are derived from EasyList and EasyPrivacy.
+Copyright The EasyList authors. https://easylist.to
+Licensed under GPLv3 or CC BY-SA 3.0. Only simple domain rules were extracted and the lists were compacted.
+The lists are a convenience subset and are not a substitute for the full upstream lists.

@@ -1,0 +1,38 @@
+{
+  "version": "1.0.0",
+  "source": "chromiumcore-source.zip",
+  "releases": [
+    {
+      "platform": "android",
+      "arch": "universal",
+      "name": "Android TV",
+      "file": "ChromiumCore-1.0.0-android-universal.apk",
+      "size": "1.7 MB",
+      "sha256": "b67e2d8f53a16dd38c7eac2777e385d9fb24364b2b09891e07549ff94c84a579"
+    },
+    {
+      "platform": "win32",
+      "arch": "x64",
+      "name": "Windows 64-bit",
+      "file": "ChromiumCore-1.0.0-win32-x64.zip",
+      "size": "154.2 MB",
+      "sha256": "7fa2c6f88520f690a866c7fcf43dde19a02eafc52389caca4513e0f612f91fdd"
+    },
+    {
+      "platform": "darwin",
+      "arch": "arm64",
+      "name": "macOS Apple Silicon",
+      "file": "ChromiumCore-1.0.0-darwin-arm64.zip",
+      "size": "117.3 MB",
+      "sha256": "a4de076ff4c7d4fe19a0474902dab3705283ec575413570208fb1d5558116439"
+    },
+    {
+      "platform": "darwin",
+      "arch": "x64",
+      "name": "macOS Intel",
+      "file": "ChromiumCore-1.0.0-darwin-x64.zip",
+      "size": "121.4 MB",
+      "sha256": "c8c38be0c46acada81d0828ab61cd109e975b19e0c49f2c09963ded6178ba042"
+    }
+  ]
+}

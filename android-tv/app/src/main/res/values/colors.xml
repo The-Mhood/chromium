@@ -1,0 +1,8 @@
+<resources>
+    <color name="cc_bg">#FF14161A</color>
+    <color name="cc_surface">#FF1D2128</color>
+    <color name="cc_surface_alt">#FF2B2F36</color>
+    <color name="cc_accent">#FFED7545</color>
+    <color name="cc_text">#FFE8EAED</color>
+    <color name="cc_muted">#FF8D94A0</color>
+</resources>
