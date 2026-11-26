@@ -22,4 +22,6 @@ contextBridge.exposeInMainWorld('chromiumCore', {
   onTabUpdate: subscribe('core:tab-update'),
   onOpenTab: subscribe('core:open-tab'),
   onStats: subscribe('core:stats-update'),
+  onChromeVisibility: subscribe('core:chrome-visibility'),
+  onFullscreenState: subscribe('core:fullscreen-state'),
 });
