@@ -37,7 +37,7 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
     if (protection.network) candidates.push(['threats', 'Threat'], ['ads', 'Ad']);
     if (protection.tracking) candidates.push(['trackers', 'Tracker']);
     for (const [group, type] of candidates) {
-      if (details.resourceType === 'mainFrame' && group !== 'threats') continue;
+      // Main-frame navigations are checked too: ad clicks often redirect the active tab.
       const result = engines[group].match(request);
       if (result.match) {
         recordBlocked(type, details.url, sourceUrl);
