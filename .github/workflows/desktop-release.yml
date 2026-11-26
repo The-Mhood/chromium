@@ -42,6 +42,8 @@ jobs:
       # branch, where it is readable via the API.
       - if: failure()
         uses: actions/github-script@v7
+        permissions:
+          contents: write
         env:
           GH_TOKEN: ${{ github.token }}
         with:
