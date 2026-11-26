@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { initialFilters, pageDetails, safeUrl } from '../lib/data';
-import type { Bookmark, BrowserTab, FilterList, NativeStats, Page, Protection } from '../types';
+import type { Bookmark, BrowserTab, FilterList, FullscreenState, NativeStats, Page, Protection } from '../types';
 
 interface BrowserState {
   tabs: BrowserTab[];
@@ -14,8 +14,10 @@ interface BrowserState {
   searchEngine: string;
   doNotTrack: boolean;
   nativeStats: NativeStats | null;
+  fullscreenState: FullscreenState;
   activityCleared: boolean;
   toast: { text: string; tone: 'success' | 'info' | 'error'; key: number } | null;
+  setFullscreenState: (state: FullscreenState) => void;
   navigatePage: (page: Exclude<Page, 'external'>) => void;
   newTab: (url?: string, title?: string) => void;
   closeTab: (id: string) => void;
@@ -56,8 +58,10 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
   searchEngine: 'google',
   doNotTrack: true,
   nativeStats: null,
+  fullscreenState: { media: false, window: false },
   activityCleared: false,
   toast: null,
+  setFullscreenState: (fullscreenState) => set({ fullscreenState }),
   navigatePage: (page) => {
     const detail = pageDetails[page];
     get().navigate(`core://${detail.path}`);

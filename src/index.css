@@ -57,6 +57,8 @@ h1, h2, h3, h4, p { margin: 0; }
 .window-dot.close { background: #ed807a; }
 .window-dot.minimize { background: #efc16a; }
 .window-dot.maximize { background: #91bf8c; }
+.window-dot.fullscreen { background: #7f9fc9; }
+.window-dot.fullscreen.active { background: #4d6fa8; box-shadow: inset 0 0 0 .5px #00000030; }
 .window-dot:hover { filter: brightness(.92); }
 .browser-tabs { display: flex; align-items: end; min-width: 0; height: 100%; gap: 4px; overflow: hidden; }
 .browser-tab { width: 209px; min-width: 110px; height: 34px; display: flex; align-items: center; border-radius: 9px 9px 0 0; position: relative; color: #717580; }
@@ -305,6 +307,8 @@ h1, h2, h3, h4, p { margin: 0; }
 .activity-summary strong, .filter-summary strong { display: block; font-size: 13px; font-weight: 550; }
 .activity-summary p, .filter-summary p { margin-top: 6px; color: var(--muted); font-size: 10px; }
 .activity-summary > .preview-note { margin-left: auto; }
+.engine-status { margin: -18px 0 18px; font-size: 10px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.engine-status::before { content: ""; width: 6px; height: 6px; border-radius: 100%; background: #a4b6a1; flex-shrink: 0; }
 .full-panel { margin-top: 1px; }
 .list-toolbar { padding: 18px 21px; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-bottom: 1px solid var(--border); min-height: 70px; }
 .segmented-tabs { display: flex; gap: 4px; }
