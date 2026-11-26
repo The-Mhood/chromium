@@ -5,6 +5,7 @@ on:
     tags: ['v*']
 permissions:
   contents: read
+  checks: write
 jobs:
   package:
     strategy:
@@ -29,7 +30,45 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: node scripts/package-desktop.mjs --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+      - id: pkg
+        shell: bash
+        run: |
+          # tee the output so the failure step below can report it (the
+          # log artifact is not reachable from everywhere).
+          node scripts/package-desktop.mjs --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} 2>&1 | tee package.log
+          exit "${PIPESTATUS[0]}"
+      # Surface the failure as a check run whose summary holds the log tail:
+      # check-run output is readable via the API even where log artifacts are not.
+      - if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let tail = '';
+            try {
+              tail = fs.readFileSync('package.log', 'utf8').trim().split('\n').slice(-70).join('\n');
+            } catch (e) { /* keep empty */ }
+            const body = [
+              '## ChromiumCore packaging failed',
+              'runner: ' + (process.env.RUNNER_OS || '?') + ' / node ' + process.version,
+              'target: ${{ matrix.platform }} / ${{ matrix.arch }}',
+              '',
+              '```',
+              tail.slice(-38000) || '(no output captured)',
+              '```',
+            ].join('\n');
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'package-tail: ${{ matrix.platform }}-${{ matrix.arch }}',
+              head_sha: context.payload.sha,
+              status: 'completed',
+              conclusion: 'failure',
+              output: {
+                title: 'packaging failed — log tail below',
+                summary: body.slice(0, 60000),
+              },
+            });
       - uses: actions/upload-artifact@v4
         with:
           name: ChromiumCore-${{ matrix.platform }}-${{ matrix.arch }}
