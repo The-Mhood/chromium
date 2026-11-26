@@ -9,7 +9,9 @@ const argument = (name, fallback) => { const index = process.argv.indexOf(name);
 const platform = argument('--platform', process.platform);
 const arch = argument('--arch', process.arch);
 if (!['win32', 'darwin', 'linux'].includes(platform) || !['x64', 'arm64'].includes(arch)) throw new Error('Unsupported platform or architecture.');
-execFileSync(process.execPath, ['scripts/prepare-desktop.mjs'], { cwd: root, stdio: 'inherit' });
+// Packaging needs the full dependency tree (electron + forge); the default
+// prepare install is runtime-only and would leave forge out of node_modules.
+execFileSync(process.execPath, ['scripts/prepare-desktop.mjs', '--full'], { cwd: root, stdio: 'inherit' });
 const stage = path.join(root, '.desktop-build');
 execFileSync(process.execPath, [path.join(stage, 'node_modules/@electron-forge/cli/dist/electron-forge.js'), 'make', '--platform', platform, '--arch', arch], { cwd: stage, stdio: 'inherit', env: process.env });
 

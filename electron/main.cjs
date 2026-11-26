@@ -47,6 +47,10 @@ const navigationLocks = new Map();
 // did-fail-load for a sub-resource is never reported as a failed page.
 const lastRequested = new Map();
 const pendingPopupOpens = [];
+// Allowed script popup -> the tab that opened for it (filled when that tab's
+// navigation arrives). Used to close the tab of an earlier popup when the
+// same page proves to be a repeat offender.
+const popupTabByOpenUrl = new Map();
 const defaults = {
   protection: { enabled: true, network: true, tracking: true, cosmetic: true, popups: true, youtube: true },
   allowlist: [], filters: [], doNotTrack: true, stats: { ads: 0, trackers: 0, popups: 0, threats: 0, events: [] },
@@ -110,10 +114,24 @@ function applyLayout() {
   // (zero) geometry even though the window size did not change.
   const geometryChanged = `${width}x${viewHeight}@${top}` !== lastBounds;
   if (geometryChanged) lastBounds = `${width}x${viewHeight}@${top}`;
+  const activeView = showExternal && views.has(activeId) ? views.get(activeId) : null;
+  // Z-order: child views stack in the order they were added, so a view for a
+  // later-created tab always paints above earlier ones. Move the view that is
+  // actually on screen to the end of the child list — otherwise switching to
+  // an older tab can leave the newer tab's view painted over it (the
+  // "previous site still showing" freeze).
+  const children = win.contentView.children;
+  if (activeView && children.length && children[children.length - 1] !== activeView) {
+    win.contentView.removeChildView(activeView);
+    win.contentView.addChildView(activeView);
+  }
+  // Hide every other view first, then show the active one last, so there is
+  // never a frame where two views are visible at once.
+  for (const [id, view] of views) if (view !== activeView) view.setVisible(false);
   for (const [id, view] of views) {
-    const shouldShow = showExternal && activeId === id;
-    view.setVisible(shouldShow);
-    if (shouldShow || geometryChanged) view.setBounds(bounds);
+    if (view !== activeView) continue;
+    view.setBounds(bounds);
+    view.setVisible(true);
   }
 }
 
@@ -199,6 +217,7 @@ function destroyTab(id) {
   engine.popupPolicy.forget(contents.id);
   navigationLocks.delete(contents.id);
   lastRequested.delete(contents.id);
+  for (const [openUrl, tabId] of popupTabByOpenUrl) if (tabId === id) popupTabByOpenUrl.delete(openUrl);
   win.contentView.removeChildView(view);
   views.delete(id);
   try { contents.close(); } catch { /* already closing */ }
@@ -246,6 +265,9 @@ async function handleWindowOpen(details, contents) {
   if (!decision.allowed) {
     recordBlocked('Pop-up', url, sourceUrl);
     noticePopupBlocked(url, sourceUrl);
+    // Repeat offender: the page already had one popup through, so close the
+    // tab it got earlier — the user never asked for either.
+    if (decision.earlierUrl) closeEarlierPopupTab(decision.earlierUrl);
     return;
   }
   if (decision.needsWatch) {
@@ -253,6 +275,17 @@ async function handleWindowOpen(details, contents) {
     if (pendingPopupOpens.length > 50) pendingPopupOpens.splice(0, pendingPopupOpens.length - 50);
   }
   send('core:open-tab', { url, title: safeHost(url) });
+}
+
+// Close the tab that a previously-allowed popup created, so a repeat-popup
+// block removes both unwanted tabs instead of just the latest one.
+function closeEarlierPopupTab(openUrl) {
+  const id = popupTabByOpenUrl.get(openUrl);
+  if (!id) return;
+  popupTabByOpenUrl.delete(openUrl);
+  if (!views.has(id)) return;
+  destroyTab(id);
+  send('core:tab-closed', { id });
 }
 
 // First-navigation inspection for allowed script-opened tabs (popunders).
@@ -450,6 +483,7 @@ function registerIPC() {
     if (pending) {
       pendingPopupOpens.splice(pendingPopupOpens.indexOf(pending), 1);
       engine.popupPolicy.registerPopup(view.webContents.id, pending);
+      popupTabByOpenUrl.set(url, id);
     }
     // Make sure the document-start scripts are in place before the page loads.
     // Bounded: a stuck DevTools session must never hold up browsing — the
@@ -468,13 +502,20 @@ function registerIPC() {
     }
   });
   handle('core:focus', (id, external) => {
-    activeId = id;
-    showExternal = external === true;
-    const contents = views.get(id)?.webContents;
-    const mediaIsFullscreen = !!(contents && !contents.isDestroyed() && contents.isFullscreen());
-    fsCtl.tabFocused(id, { mediaIsFullscreen });
-    fsCtl.tick({ windowFocused: win?.isFocused() ?? false, showingExternal: showExternal, cursorMoved: false });
-    applyLayout();
+    try {
+      activeId = id;
+      showExternal = external === true;
+      const contents = views.get(id)?.webContents;
+      const mediaIsFullscreen = !!(contents && !contents.isDestroyed() && contents.isFullscreen());
+      fsCtl.tabFocused(id, { mediaIsFullscreen });
+      fsCtl.tick({ windowFocused: win?.isFocused() ?? false, showingExternal: showExternal, cursorMoved: false });
+    } finally {
+      // A tab switch must never be lost: even if the state machine throws,
+      // the right view comes on screen and takes keyboard focus.
+      applyLayout();
+      const view = views.get(id);
+      if (view && !view.webContents.isDestroyed()) { try { view.webContents.focus(); } catch { /* transitional */ } }
+    }
   });
   handle('core:close', id => destroyTab(id));
   handle('core:tab-action', (id, action) => {

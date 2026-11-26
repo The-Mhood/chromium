@@ -16,7 +16,7 @@ import { Downloads } from './pages/Downloads';
 import { useBrowser } from './store/browser';
 
 export default function App() {
-  const { tabs, activeTabId, protection, setProtection, filters, allowlist, theme, doNotTrack, nativeStats, setNativeStats, updateTab, newTab, notify, navigatePage, fullscreenState, setFullscreenState, tabIssues, setTabIssue } = useBrowser();
+  const { tabs, activeTabId, protection, setProtection, filters, allowlist, theme, doNotTrack, nativeStats, setNativeStats, updateTab, newTab, removeTab, notify, navigatePage, fullscreenState, setFullscreenState, tabIssues, setTabIssue } = useBrowser();
   const active = tabs.find(tab => tab.id === activeTabId) || tabs[0];
   const page = getPage(active.url);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -43,8 +43,9 @@ export default function App() {
     const offPopup = bridge.onPopupBlocked(() => notify('Blocked an unwanted popup.', 'info'));
     const offNavBlocked = bridge.onNavigationBlocked(info => setTabIssue(info.id, { kind: 'blocked', url: info.url, type: info.type }));
     const offLoadFailed = bridge.onLoadFailed(info => setTabIssue(info.id, { kind: 'failed', url: info.url }));
-    return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); offNavBlocked(); offLoadFailed(); };
-  }, [setNativeStats, updateTab, newTab, notify, setFullscreenState, setTabIssue]);
+    const offTabClosed = bridge.onTabClosed(info => removeTab(info.id));
+    return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); offNavBlocked(); offLoadFailed(); offTabClosed(); };
+  }, [setNativeStats, updateTab, newTab, removeTab, notify, setFullscreenState, setTabIssue]);
   useEffect(() => {
     const bridge = window.chromiumCore;
     if (!bridge) return;

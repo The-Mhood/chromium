@@ -37,5 +37,26 @@ const manifest = {
   devDependencies: { electron: '45.5.0', '@electron-forge/cli': '7.11.2', '@electron-forge/maker-zip': '7.11.2', '@electron-forge/maker-dmg': '7.11.2', '@electron-forge/maker-squirrel': '7.11.2' },
 };
 await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
-if (!process.argv.includes('--no-install')) execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-audit', '--no-fund'], { cwd: stage, stdio: 'inherit', env: { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' } });
+// Only the pure-JS runtime deps are needed to run the unit tests (the test
+// harness stubs the Electron API). The devDependency tree (electron,
+// electron-forge) is therefore skipped by default: it drags in a git-hosted
+// @electron/node-gyp tarball and the Electron binary, which are slow to fetch
+// and need network access test environments often do not have. Note
+// `--omit=dev` alone is not enough — npm still resolves every dependency in
+// the manifest (including git deps) while building the ideal tree — so the
+// install runs against a temporary manifest without devDependencies, and the
+// full manifest is restored afterwards. `--full` (used by the packaging path)
+// installs the complete dependency set exactly as before.
+if (!process.argv.includes('--no-install')) {
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const env = { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' };
+  if (process.argv.includes('--full')) {
+    execFileSync(npm, ['install', '--no-audit', '--no-fund'], { cwd: stage, stdio: 'inherit', env });
+  } else {
+    const runtimeManifest = { ...manifest, devDependencies: {} };
+    await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(runtimeManifest, null, 2) + '\n');
+    execFileSync(npm, ['install', '--no-audit', '--no-fund', '--ignore-scripts'], { cwd: stage, stdio: 'inherit', env });
+    await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
+  }
+}
 console.log(`Desktop workspace ready: ${stage}`);
