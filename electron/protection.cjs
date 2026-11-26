@@ -112,4 +112,4 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
   return { rebuild, applyCosmetics, shouldBlockPopup, forget: id => cssKeys.delete(id) };
 }
 
-module.exports = { createProtectionEngine };
+module.exports = { createProtectionEngine, fallbackRules };
