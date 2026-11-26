@@ -19,9 +19,11 @@ contextBridge.exposeInMainWorld('chromiumCore', {
   getStats: () => ipcRenderer.invoke('core:stats'),
   clearData: () => ipcRenderer.invoke('core:clear-data'),
   windowAction: action => ipcRenderer.send('core:window', action),
+  getEngineStatus: () => ipcRenderer.invoke('core:engine-status'),
   onTabUpdate: subscribe('core:tab-update'),
   onOpenTab: subscribe('core:open-tab'),
   onStats: subscribe('core:stats-update'),
   onChromeVisibility: subscribe('core:chrome-visibility'),
   onFullscreenState: subscribe('core:fullscreen-state'),
+  onPopupBlocked: subscribe('core:popup-blocked'),
 });

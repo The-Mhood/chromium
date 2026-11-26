@@ -61,6 +61,25 @@ export interface Release {
   sha256: string;
 }
 
+export interface EngineGroupStatus {
+  source: 'baseline' | 'fallback' | 'cache' | 'cache-stale' | 'fetched' | 'empty';
+  rules: number;
+  updatedAt: string | null;
+}
+
+export interface EngineStatus {
+  ready: boolean;
+  totalRules: number;
+  ads: EngineGroupStatus;
+  trackers: EngineGroupStatus;
+  threats: EngineGroupStatus;
+}
+
+export interface FullscreenState {
+  media: boolean;
+  window: boolean;
+}
+
 export interface DesktopBridge {
   platform: string;
   navigate: (id: string, url: string) => Promise<void>;
@@ -72,13 +91,15 @@ export interface DesktopBridge {
   setFilters: (filters: FilterList[]) => Promise<void>;
   setPrivacy: (doNotTrack: boolean) => Promise<void>;
   getStats: () => Promise<NativeStats>;
+  getEngineStatus: () => Promise<EngineStatus>;
   clearData: () => Promise<void>;
-  windowAction: (action: 'minimize' | 'maximize' | 'close') => void;
+  windowAction: (action: 'minimize' | 'maximize' | 'close' | 'fullscreen') => void;
   onTabUpdate: (callback: (tab: { id: string; title: string; url: string }) => void) => () => void;
   onOpenTab: (callback: (tab: { url: string; title: string }) => void) => () => void;
   onStats: (callback: (stats: NativeStats) => void) => () => void;
   onChromeVisibility: (callback: (visible: boolean) => void) => () => void;
-  onFullscreenState: (callback: (fullscreen: boolean) => void) => () => void;
+  onFullscreenState: (callback: (state: FullscreenState) => void) => () => void;
+  onPopupBlocked: (callback: (info: { url: string; source: string }) => void) => () => void;
 }
 
 declare global {
