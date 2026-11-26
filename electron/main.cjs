@@ -888,8 +888,22 @@ app.whenReady().then(() => {
     state = { ...defaults, ...saved, protection: { ...defaults.protection, ...saved.protection }, stats: { ...defaults.stats, ...saved.stats } };
   } catch { /* First launch uses the defaults. */ }
   browsingSession = session.fromPartition('persist:chromiumcore-browsing');
-  browsingSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  browsingSession.setPermissionCheckHandler(() => false);
+  // Permissions: deny what ads and trackers abuse (notifications, camera /
+  // microphone, geolocation, device capture) but ALLOW the benign,
+  // user-gesture-gated permissions the web relies on. Denying 'fullscreen'
+  // is what broke video players: YouTube's own fullscreen button calls
+  // requestFullscreen(), which rejects when the permission is refused.
+  const allowedPermissions = new Set([
+    'fullscreen',            // video players (YouTube & friends)
+    'pointerLock',           // first-person video / map panning
+    'storage-access',        // Storage Access API (legit web apps)
+    'clipboard-sanitized-write', // copy operations on the web
+    'web-share',             // navigator.share (native share sheet)
+    'speaking',              // speech synthesis
+    'mediaKeySystem',        // EME/DRM so high-quality streams work
+  ]);
+  browsingSession.setPermissionRequestHandler((_contents, permission, callback) => callback(allowedPermissions.has(permission)));
+  browsingSession.setPermissionCheckHandler((_contents, permission) => allowedPermissions.has(permission));
   browsingSession.webRequest.onBeforeSendHeaders((details, callback) => {
     const requestHeaders = { ...details.requestHeaders };
     if (state.doNotTrack) requestHeaders.DNT = '1';

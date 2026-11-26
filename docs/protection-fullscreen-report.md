@@ -417,3 +417,42 @@ click that still opens a working tab.
   frame attribution needs the isolated-world read, and we would rather
   keep legitimate links working than break the page.
 - In-stream media ads and server-side content remain out of scope.
+
+## 16. Round 5 — real-app regressions: refused links + refused YouTube fullscreen (2026-11-27)
+
+Two symptoms from the silver build on a real machine:
+
+1. **Site links refused to open** (fmhy.net): round-4 attribution had a
+   freshest-click fallback — when the user clicked an ad element and then a
+   site link within the 3 s record window (the top frame's own record
+   missing or stale), the ad iframe's cross-origin click was attributed as
+   the cause and the site link was blocked as `ad-iframe`. A second
+   over-blocker: the repeat-popup rule (8 s) also blocked link clicks after
+   any allowed scripted popup.
+2. **YouTube refused fullscreen**: the session permission handlers denied
+   *every* permission — including `fullscreen` — so the player's own
+   `requestFullscreen()` rejected and the video never entered HTML
+   fullscreen.
+
+### Fixes
+- **Precise attribution** (`popup-blocker.cjs`): a link open is attributed
+  only to a click whose anchor href *matches* the destination (catches the
+  sponsored-link ad pattern, attributes top-frame links to the top frame);
+  scripted opens are attributed to the window.open record. A link open with
+  no matching click is left to the (unspoofable) gesture check + commit
+  verification — a stale cross-origin click can no longer block site links.
+- **Repeat rule is scripted-only**: a page that legitimately popped once no
+  longer swallows the user's next link click (the rule still stops scripted
+  popup bursts and still closes the first popup's tab).
+- **Permissions, per-permission** (`main.cjs`): `fullscreen`,
+  `pointerLock`, `storage-access`, `clipboard-sanitized-write`,
+  `web-share`, `speaking`, `mediaKeySystem` are allowed (all
+  user-gesture-gated); `notifications`, `media` (camera/mic),
+  `geolocation`, device capture and the rest stay denied.
+
+### Verification
+Staged suite **114/114** (+3): regression guards for the non-matching-href
+stale ad click (link now opens), scripted-open attribution, and the
+repeat-rule-not-swallowing-link-clicks case; wiring subtest asserting the
+permission handler allows `fullscreen` and denies `notifications`/`media`/
+`geolocation`. `tsc` clean; **v1.0.12** built on all three platforms.

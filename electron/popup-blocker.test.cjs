@@ -128,20 +128,59 @@ test('a target=_blank click from a cross-origin ad iframe is blocked (no window.
   assert.equal(decision.reason, 'ad-iframe');
 });
 
-test('a cross-origin iframe click is blocked even when its href does not match', () => {
+test('a stale cross-origin click with a NON-matching href does not block a link click', () => {
   const { policy, at, classify } = makePolicy();
   at(1_000_000);
   policy.observeInput(1, 'mouseDown');
   at(1_000_100);
-  // A cross-origin click that is the freshest action (href unknown, e.g. a
-  // non-anchor element) is still attributed to the ad iframe and blocked.
+  // Regression guard (real app, fmhy.net): the user clicked an ad element
+  // and then a site link within the record window. The ad iframe's click
+  // is the only/freshest record but its href does not match the site link —
+  // it must NOT be attributed as the cause, or legitimate site links are
+  // refused. The gesture check decides instead (fresh click -> allowed).
   const decision = classify({
-    url: 'https://sponsored-offers.example.org/deal',
+    url: 'https://site.test/another-page',
     disposition: 'foreground-tab',
-    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test', href: '' } },
+    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test', href: 'https://adunit.net/promo' } },
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'link-click');
+});
+
+test('a scripted open is still attributed to the window.open record', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  // A scripted window.open from a cross-origin iframe (open record) is
+  // blocked even when a freshest-click fallback would have been ambiguous.
+  const decision = classify({
+    url: 'https://adunit.net/promo',
+    disposition: 'default',
+    pageState: { ageMs: 100, open: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' }, click: { t: 1_000_090, isTop: true, crossOrigin: false, frameHost: 'site.test', topHost: 'site.test', href: '' } },
   });
   assert.equal(decision.allowed, false);
   assert.equal(decision.reason, 'ad-iframe');
+});
+
+test('a page that popped once does not block the user\u2019s next link click', () => {
+  const { policy, at, classify } = makePolicy();
+  // A legitimate scripted popup (fresh gesture) goes through...
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  const first = classify({ url: 'https://share-widget.test/', disposition: 'default', pageState: null });
+  assert.equal(first.allowed, true);
+  // ...and 2s later the user clicks a normal site link (fresh gesture).
+  // The repeat rule targets scripted popups only — it must not swallow the
+  // user's link navigation (and must not report the earlier popup to close).
+  at(1_002_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_002_100);
+  const link = classify({ url: 'https://site.test/next', disposition: 'foreground-tab', pageState: null });
+  assert.equal(link.allowed, true);
+  assert.equal(link.reason, 'link-click');
+  assert.equal(link.earlierUrl, undefined);
 });
 
 test('a top-frame target=_blank click is NOT blocked by the ad-iframe rule', () => {

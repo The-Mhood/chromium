@@ -95,22 +95,25 @@ function sameAnchorHref(href, destination) {
 }
 
 /**
- * Pick the per-frame record that most plausibly initiated a given open:
+ * Pick the per-frame record that initiated a given open — precisely:
  *   - a click whose anchor href MATCHES the destination is an exact
- *     attribution (that click is what the browser acted on);
- *   - otherwise the freshest of the window.open and click records — the
- *     action that just happened is the one Chromium is reporting.
- * Returns null when the page keeps no usable record (CDP unavailable).
+ *     attribution (that click is what the browser acted on): it catches the
+ *     "sponsored link in a cross-origin ad iframe" pattern, and it
+ *     attributes a top-frame link click to the top frame;
+ *   - a scripted window.open is attributed to the window.open record.
+ * A link open with NO matching-href click is NOT attributed to a stale
+ * cross-origin click: the freshest-click heuristic misfired in practice —
+ * a user who clicked an ad element and then a site link within the record
+ * window had their site link blocked as an "ad-iframe" open. When no
+ * record matches, the (unspoofable) gesture check and commit verification
+ * decide instead.
  */
 function pickAttribution({ url, disposition, pageState }) {
   const openRecord = pageState && pageState.open;
   const clickRecord = pageState && pageState.click;
-  if (!openRecord && !clickRecord) return null;
   if (clickRecord && sameAnchorHref(clickRecord.href, url)) return clickRecord;
-  if (disposition !== 'foreground-tab' && openRecord && !clickRecord) return openRecord;
-  const candidates = [openRecord, clickRecord].filter(Boolean);
-  candidates.sort((a, b) => (b.t || 0) - (a.t || 0));
-  return candidates[0];
+  if (disposition !== 'foreground-tab' && openRecord) return openRecord;
+  return openRecord || null;
 }
 
 function createPopupPolicy(options = {}) {
@@ -194,12 +197,15 @@ function createPopupPolicy(options = {}) {
     }
     if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsCommit: false };
 
-    // Repeat rule: this page already got a script popup through inside the
-    // window. Ad redirectors fire one popup per user action, so a second
-    // script open from the same page is unwanted: block it and report the
-    // earlier popup's URL so the main process can close that tab too.
+    // Repeat rule (SCRIPTED opens only): this page already got a script
+    // popup through inside the window. Ad redirectors fire one popup per
+    // user action, so a second script open from the same page is unwanted:
+    // block it and report the earlier popup's URL so the main process can
+    // close that tab too. Link clicks (foreground-tab) are user
+    // navigations, not popups — a page that legitimately popped once must
+    // not swallow the user's next link click.
     const repeat = repeatOpeners.get(contentsId);
-    if (repeat && now() - repeat.firstAt < REPEAT_WINDOW_MS) {
+    if (disposition !== 'foreground-tab' && repeat && now() - repeat.firstAt < REPEAT_WINDOW_MS) {
       return { allowed: false, reason: 'repeat-popup', needsCommit: false, earlierUrl: repeat.url };
     }
 
