@@ -27,7 +27,7 @@ const { createProtectionEngine } = require('./protection.cjs');
 const { FullscreenController } = require('./fullscreen-state.cjs');
 const { browsingUrl, isAllowedDomain, trustedFilterUrl } = require('./security.cjs');
 const { buildShieldScript } = require('./youtube-shield.cjs');
-const { committedNavigationVerdict } = require('./popup-blocker.cjs');
+const { committedNavigationVerdict, pickAttribution } = require('./popup-blocker.cjs');
 
 let win;
 let engine;
@@ -287,7 +287,7 @@ function destroyTab(id) {
 // top page. A failed read degrades to the main-process input observation
 // (see popup-blocker.classifyWindowOpen), which still requires a real,
 // recent gesture.
-const POPUP_STATE_EXPR = '(function () { var s = window.__ccPopupState; if (!s) return null; return { age: s.t ? Date.now() - s.t : 999999999, open: s.lastOpen && Date.now() - s.lastOpen.t < 3000 ? s.lastOpen : null }; })()';
+const POPUP_STATE_EXPR = '(function () { var s = window.__ccPopupState; if (!s) return null; return { age: s.t ? Date.now() - s.t : 999999999, open: s.lastOpen && Date.now() - s.lastOpen.t < 3000 ? s.lastOpen : null, click: s.lastClick && Date.now() - s.lastClick.t < 3000 ? s.lastClick : null }; })()';
 
 async function readPagePopupState(contents) {
   const entry = syncQueue.get(contents.id);
@@ -311,13 +311,15 @@ async function readPagePopupState(contents) {
     })), 'popup state', 2500);
     let ageMs = null;
     let open = null;
+    let click = null;
     for (const value of reads) {
       if (!value) continue;
       if (typeof value.age === 'number' && (ageMs === null || value.age < ageMs)) ageMs = value.age;
       if (value.open && (!open || value.open.t > open.t)) open = value.open;
+      if (value.click && (!click || value.click.t > click.t)) click = value.click;
     }
-    if (ageMs === null && !open) return null;
-    return { ageMs: ageMs === null ? 999999999 : ageMs, open };
+    if (ageMs === null && !open && !click) return null;
+    return { ageMs: ageMs === null ? 999999999 : ageMs, open, click };
   } catch {
     return null;
   }
@@ -351,7 +353,10 @@ async function handleWindowOpen(details, contents) {
     pageState,
     contentsId: contents.id,
   });
-  const frame = pageState && pageState.open ? { isTop: !!pageState.open.isTop, crossOrigin: !!pageState.open.crossOrigin } : null;
+  // For the log: the frame that actually initiated this open (a window.open
+  // record, or — for a target=_blank link click — the click record).
+  const attributed = pickAttribution({ url, disposition, pageState });
+  const frame = attributed ? { isTop: !!attributed.isTop, crossOrigin: !!attributed.crossOrigin, via: pageState && pageState.open && (attributed === pageState.open) ? 'window.open' : 'click' } : null;
   if (!decision.allowed) {
     logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'deny', reason: decision.reason, created: false });
     recordBlocked('Pop-up', url, sourceUrl);

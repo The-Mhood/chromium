@@ -112,6 +112,73 @@ test('a top-frame open with no frame record falls back to the gesture check', ()
   assert.equal(decision.reason, 'user-gesture');
 });
 
+test('a target=_blank click from a cross-origin ad iframe is blocked (no window.open involved)', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  // The user clicked the ad iframe's own anchor; the click record's href is
+  // the destination and the frame is cross-origin. No open record exists.
+  const decision = classify({
+    url: 'https://sponsored-offers.example.org/deal',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test', href: 'https://sponsored-offers.example.org/deal' } },
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'ad-iframe');
+});
+
+test('a cross-origin iframe click is blocked even when its href does not match', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  // A cross-origin click that is the freshest action (href unknown, e.g. a
+  // non-anchor element) is still attributed to the ad iframe and blocked.
+  const decision = classify({
+    url: 'https://sponsored-offers.example.org/deal',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test', href: '' } },
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'ad-iframe');
+});
+
+test('a top-frame target=_blank click is NOT blocked by the ad-iframe rule', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  // Same page, but the user clicked the page's own link in the top document.
+  const decision = classify({
+    url: 'https://docs.example.com/guide',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: true, crossOrigin: false, frameHost: 'site.test', topHost: 'site.test', href: 'https://docs.example.com/guide' } },
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'link-click');
+});
+
+test('a matching top-frame click is not shadowed by a stale ad-iframe click', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  // The ad iframe clicked 400ms ago (stale), the user clicked the page's own
+  // link just now. The href-matched top-frame click must win attribution.
+  const decision = classify({
+    url: 'https://docs.example.com/guide',
+    disposition: 'foreground-tab',
+    pageState: {
+      ageMs: 100,
+      open: null,
+      click: { t: 1_000_100, isTop: true, crossOrigin: false, frameHost: 'site.test', topHost: 'site.test', href: 'https://docs.example.com/guide' },
+    },
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'link-click');
+});
+
 test('tab budget blocks further popups', () => {
   const { classify } = makePolicy({ maxTabs: 2 });
   const decision = classify({ tabCount: 2, pageState: { ageMs: 0 } });

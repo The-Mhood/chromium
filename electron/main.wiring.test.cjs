@@ -602,6 +602,62 @@ test('main process wiring (Electron stub)', async t => {
     await closeTabs('h-11');
   });
 
+  await t.test('hostile: a target=_blank click inside a cross-origin ad iframe opens nothing', async () => {
+    const { view: page, known } = await freshTab('h-13', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    cdpStub.pageStateEnabled = true;
+    try {
+      // The user clicks the "sponsored" link. The click lands in the ad
+      // IFRAME's document and the anchor is target=_blank, so NO window.open
+      // is ever called — the browser opens the tab directly. The only record
+      // of who initiated it is the click record: cross-origin frame, and its
+      // href is exactly the destination. This is the hole a window.open-only
+      // check lets through.
+      cdpStub.stateValue = {
+        age: 40,
+        open: null,
+        click: { t: Date.now(), isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com', href: 'https://sponsored-offers.example.org/deal' },
+      };
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://sponsored-offers.example.org/deal', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!openPublished('https://sponsored-offers.example.org/deal'), 'the ad-iframe link click was blocked');
+      assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+    } finally {
+      cdpStub.pageStateEnabled = false;
+      cdpStub.stateValue = null;
+    }
+    await closeTabs('h-13');
+  });
+
+  await t.test('legitimate: a top-frame target=_blank click is not misattributed to an ad iframe', async () => {
+    const { view: page, known } = await freshTab('h-14', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    cdpStub.pageStateEnabled = true;
+    try {
+      // Same page, but the user clicked the page's OWN target=_blank link in
+      // the top document: the click record is top-frame / same-origin. The
+      // new attribution rule must not treat this as an ad-iframe open.
+      cdpStub.stateValue = {
+        age: 40,
+        open: null,
+        click: { t: Date.now(), isTop: true, crossOrigin: false, frameHost: 'victim.example.com', topHost: 'victim.example.com', href: 'https://docs.example.com/guide' },
+      };
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://docs.example.com/guide', disposition: 'foreground-tab' });
+      await settle();
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'a top-frame link click is verified, not blocked');
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate top-frame link was published');
+      await closeTabs('h-14');
+    } finally {
+      cdpStub.pageStateEnabled = false;
+      cdpStub.stateValue = null;
+    }
+  });
+
   await t.test('legitimate: a clicked link to an honest site still opens a working tab', async () => {
     const { view: page, known } = await freshTab('h-12', 'https://victim.example.com/');
     const viewsBefore = winStub().contentView.__views.length;
