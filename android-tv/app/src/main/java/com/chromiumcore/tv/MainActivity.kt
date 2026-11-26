@@ -204,7 +204,7 @@ class MainActivity : Activity() {
         ws.setSupportZoom(false)
         ws.builtInZoomControls = false
         ws.displayZoomControls = false
-        ws.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        ws.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ws.safeBrowsingEnabled = true
         CookieManager.getInstance().setAcceptCookie(true)
         webView.isFocusable = true
@@ -218,6 +218,16 @@ class MainActivity : Activity() {
             }
 
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                // Filter top-level ad redirects as well as subresources. Click-triggered ad landers
+                // are main-frame requests and must not bypass the domain blocker.
+                val current = settings
+                val host = request.url.host
+                if (request.isForMainFrame && current.protection && current.ads && !current.isAllowlisted(pageHost) &&
+                    blocker.classify(host, pageHost) == BlockType.AD) {
+                    sessionAds.incrementAndGet()
+                    scheduleCounterUpdate()
+                    return true
+                }
                 // Only web pages may load. intent:, file:, javascript: and custom schemes are refused.
                 val scheme = request.url.scheme?.lowercase()
                 return !(scheme == "http" || scheme == "https" || scheme == "about")
@@ -274,12 +284,22 @@ class MainActivity : Activity() {
                     return false
                 }
                 val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
-                // A user-initiated window opens in this tab. A short-lived WebView receives the URL first.
+                // User-initiated links may open in this tab, but known advertising destinations
+                // are rejected even when the popup was triggered by a click.
                 val carrier = WebView(this@MainActivity)
                 carrier.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
                         val scheme = request.url.scheme?.lowercase()
-                        if (scheme == "http" || scheme == "https") webView.loadUrl(request.url.toString())
+                        val host = request.url.host
+                        val latest = settings
+                        val blockedAd = latest.protection && latest.popups && !latest.isAllowlisted(pageHost) &&
+                            blocker.classify(host, pageHost) == BlockType.AD
+                        if (blockedAd) {
+                            sessionPopups.incrementAndGet()
+                            scheduleCounterUpdate()
+                        } else if (scheme == "http" || scheme == "https") {
+                            webView.loadUrl(request.url.toString())
+                        }
                         handler.post { runCatching { v.destroy() } }
                         return true
                     }
@@ -437,6 +457,15 @@ class MainActivity : Activity() {
         }
         customView = view
         customCallback = callback
+        previousSystemUiVisibility = window.decorView.systemUiVisibility
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            )
         fullscreenContainer.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         fullscreenContainer.visibility = View.VISIBLE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -452,10 +481,25 @@ class MainActivity : Activity() {
         fullscreenContainer.removeView(view)
         fullscreenContainer.visibility = View.GONE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.decorView.systemUiVisibility = previousSystemUiVisibility
         callback?.onCustomViewHidden()
         clampPointer()
         webView.requestFocus()
         updatePointerVisibility()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && customView != null) {
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                )
+        }
     }
 
     // ---------------------------------------------------------------- remote control and pointer
