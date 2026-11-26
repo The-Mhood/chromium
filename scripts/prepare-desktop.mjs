@@ -48,14 +48,17 @@ await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(manifest, nu
 // full manifest is restored afterwards. `--full` (used by the packaging path)
 // installs the complete dependency set exactly as before.
 if (!process.argv.includes('--no-install')) {
+  // Windows: npm is a .cmd shim, which node can only spawn through a shell
+  // (execFileSync('npm.cmd') fails with EINVAL), so route it via cmd.exe.
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const npmOptions = { shell: process.platform === 'win32' };
   const env = { ...process.env, ELECTRON_SKIP_BINARY_DOWNLOAD: '1' };
   if (process.argv.includes('--full')) {
-    execFileSync(npm, ['install', '--no-audit', '--no-fund'], { cwd: stage, stdio: 'inherit', env });
+    execFileSync(npm, ['install', '--no-audit', '--no-fund'], { cwd: stage, stdio: 'inherit', env, ...npmOptions });
   } else {
     const runtimeManifest = { ...manifest, devDependencies: {} };
     await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(runtimeManifest, null, 2) + '\n');
-    execFileSync(npm, ['install', '--no-audit', '--no-fund', '--ignore-scripts'], { cwd: stage, stdio: 'inherit', env });
+    execFileSync(npm, ['install', '--no-audit', '--no-fund', '--ignore-scripts'], { cwd: stage, stdio: 'inherit', env, ...npmOptions });
     await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
   }
 }
