@@ -27,7 +27,11 @@
 //   5. Script-driven window.open ("default" / "background-tab"):
 //        allowed only with a recent user activation and within the per-gesture
 //        quota. "background-tab" (window.open 'background' — the classic
-//        popunder primitive) needs a near-synchronous gesture.
+//        popunder primitive) needs a near-synchronous gesture. Activation is
+//        key/click input only — scrolling (mouseWheel) grants none.
+//   6. A second script popup from the same page within REPEAT_WINDOW_MS
+//        (even with a fresh gesture each time) -> block, and report the
+//        earlier popup's URL so the main process can close that tab.
 // This stops timer popups, popup chains and popunders to *unlisted*
 // destinations, which a domain blocklist alone cannot catch.
 //
@@ -41,6 +45,10 @@
 const GESTURE_WINDOW_MS = 1500;
 const BACKGROUND_GESTURE_WINDOW_MS = 500;
 const OPENS_PER_ACTIVATION = 1;
+// A page that fires more than one script popup inside this window — even
+// with a fresh click for each — is an ad redirector, not a user workflow.
+// The second open is blocked and the first one is closed by the main process.
+const REPEAT_WINDOW_MS = 8000;
 const WATCH_TTL_MS = 30000;
 const NO_ACTIVATION_MS = 999999999;
 
@@ -72,15 +80,20 @@ function createPopupPolicy(options = {}) {
   const pageInput = new Map();
   // Popunder watches: webContents id -> watch.
   const watches = new Map();
+  // Repeat-popup tracking: webContents id -> { url, firstAt } of the last
+  // allowed script popup from that page.
+  const repeatOpeners = new Map();
 
   function settings() {
     const s = getSettings();
     return { protection: s.protection || {}, allowlist: s.allowlist || [] };
   }
 
-  /** The main process reports a key/mouse/wheel event delivered to the page. */
+  /** The main process reports input delivered to the page. Only key/click
+   *  input grants popup activation: scrolling (mouseWheel) is continuous and
+   *  would let a page fire a popup on every scroll position. */
   function observeInput(contentsId, type) {
-    if (!type || type === 'mouseMove' || type === 'keyUp' || type === 'mouseUp') return;
+    if (!type || type === 'mouseMove' || type === 'keyUp' || type === 'mouseUp' || type === 'mouseWheel') return;
     const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
     entry.lastInputAt = now();
     entry.opens = 0;
@@ -113,6 +126,15 @@ function createPopupPolicy(options = {}) {
     if (disposition === 'foreground-tab') return { allowed: true, reason: 'link-click', needsWatch: false };
     if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsWatch: false };
 
+    // Repeat rule: this page already got a script popup through inside the
+    // window. Ad redirectors fire one popup per user action, so a second
+    // script open from the same page is unwanted: block it and report the
+    // earlier popup's URL so the main process can close that tab too.
+    const repeat = repeatOpeners.get(contentsId);
+    if (repeat && now() - repeat.firstAt < REPEAT_WINDOW_MS) {
+      return { allowed: false, reason: 'repeat-popup', needsWatch: false, earlierUrl: repeat.url };
+    }
+
     const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
     entry.opens += 1; // every script-driven attempt consumes quota until a fresh gesture
     pageInput.set(contentsId, entry);
@@ -130,12 +152,14 @@ function createPopupPolicy(options = {}) {
       const observed = (pageState !== null) || entry.observed;
       if (!observed) {
         log('popup: degraded allow (no activation data)', { url, disposition });
+        repeatOpeners.set(contentsId, { url, firstAt: now() });
         return { allowed: true, reason: 'degraded', needsWatch: true };
       }
       return { allowed: false, reason: 'no-gesture', needsWatch: false };
     }
 
     if (age <= limit && entry.opens <= OPENS_PER_ACTIVATION) {
+      repeatOpeners.set(contentsId, { url, firstAt: now() });
       return { allowed: true, reason: 'user-gesture', needsWatch: true };
     }
     return { allowed: false, reason: age <= limit ? 'popup-chain' : 'no-gesture', needsWatch: false };
@@ -177,12 +201,14 @@ function createPopupPolicy(options = {}) {
   function forget(contentsId) {
     pageInput.delete(contentsId);
     watches.delete(contentsId);
+    repeatOpeners.delete(contentsId);
   }
 
   return {
     GESTURE_WINDOW_MS,
     BACKGROUND_GESTURE_WINDOW_MS,
     OPENS_PER_ACTIVATION,
+    REPEAT_WINDOW_MS,
     WATCH_TTL_MS,
     classifyWindowOpen,
     registerPopup,

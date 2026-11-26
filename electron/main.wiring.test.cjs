@@ -58,6 +58,7 @@ function makeWebContents(id) {
     insertCSS: async () => `css-${id}-${Math.random().toString(36).slice(2)}`,
     removeInsertedCSS: async () => {},
     close: () => {},
+    focus: () => {},
     send: (channel, payload) => calls.sends.push({ id, channel, payload }),
     setWindowOpenHandler: fn => { wc.__openHandler = fn; },
     on: (event, fn) => { listeners.set(event, [...(listeners.get(event) || []), fn]); },
@@ -90,6 +91,9 @@ class BrowserWindowStub {
     this.__destroyed = false;
     this.contentView = {
       __views: [],
+      get children() { return this.__views; },
+      // Arrows here capture the BrowserWindowStub instance as `this`, not the
+      // contentView object, so reach the view list through this.contentView.
       addChildView: view => this.contentView.__views.push(view),
       removeChildView: view => { const i = this.contentView.__views.indexOf(view); if (i >= 0) this.contentView.__views.splice(i, 1); },
     };
@@ -186,6 +190,11 @@ const fakeEvent = () => { const w = winStub(); return { sender: { id: 1 }, sende
 const channels = ['core:navigate', 'core:focus', 'core:close', 'core:tab-action', 'core:protection', 'core:allowlist', 'core:filters', 'core:stats', 'core:engine-status', 'core:privacy', 'core:clear-data'];
 
 test('main process wiring (Electron stub)', async t => {
+  // View identity by tab. Layout keeps the active view as the LAST child of
+  // the window's contentView (z-order fix), so positional children lookups
+  // are not stable once a second tab exists — always use these references.
+  let tab1View = null;
+  let tab2View = null;
   await t.test('startup wires the session, engine and all IPC channels', async () => {
     appReady();
     await new Promise(resolve => setTimeout(resolve, 50)); // let the ready callback run
@@ -224,6 +233,7 @@ test('main process wiring (Electron stub)', async t => {
     await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-1', 'https://example.com/');
     assert.equal(winStub().contentView.__views.length, 1, 'one WebContentsView for the tab');
     const view = winStub().contentView.__views[0];
+    tab1View = view;
     assert.deepEqual(view.__bounds, { x: 0, y: 96, width: 1440, height: 904 },
       'the view fills the window below the 96px chrome');
     assert.equal(view.webContents.__url, 'https://example.com/', 'the page was loaded');
@@ -256,6 +266,7 @@ test('main process wiring (Electron stub)', async t => {
     await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-2', true);
     await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-2', 'https://second.example.com/');
     const [first, second] = winStub().contentView.__views;
+    tab2View = second;
     assert.equal(first.__visible, false, 'the previous tab view is hidden');
     assert.equal(second.__visible, true, 'the switched-to tab view is visible');
     assert.deepEqual(second.__bounds, { x: 0, y: 96, width: 1440, height: 904 },
@@ -265,10 +276,15 @@ test('main process wiring (Electron stub)', async t => {
     assert.equal(first.__visible, true, 'the restored tab view is visible');
     assert.deepEqual(first.__bounds, { x: 0, y: 96, width: 1440, height: 904 },
       'the restored view is re-bounded on every layout pass');
+    // Z-order: the view on screen must be the topmost child of the window —
+    // otherwise the (hidden) sibling added later would still paint over it.
+    const kids = winStub().contentView.children;
+    assert.equal(kids[kids.length - 1], first, 'the visible view is the topmost child');
+    assert.equal(second.__visible, false, 'the other view is hidden');
   });
 
   await t.test('a blocked main-frame navigation tells the renderer (no silent placeholder)', async () => {
-    const view = winStub().contentView.__views[0];
+    const view = tab1View; // tab-1's view, however the z-order is arranged
     const before = calls.sends.filter(s => s.channel === 'core:navigation-blocked').length;
     // The request pipeline cancels a listed main frame — exactly what leaves
     // a tab on its placeholder. The renderer must be told why.
@@ -281,7 +297,7 @@ test('main process wiring (Electron stub)', async t => {
   });
 
   await t.test('a failed load is reported so the placeholder can explain itself', async () => {
-    const view = winStub().contentView.__views[0];
+    const view = tab1View; // tab-1's view, however the z-order is arranged
     // Point the tab at a fresh URL so lastRequested matches the failure.
     await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-1', 'https://fail.example.com/');
     const before = calls.sends.filter(s => s.channel === 'core:load-failed').length;
@@ -296,7 +312,7 @@ test('main process wiring (Electron stub)', async t => {
   });
 
   await t.test('the chrome hides after seven idle seconds and reveals on activity', async () => {
-    const view = winStub().contentView.__views[0];
+    const view = tab1View; // tab-1 is the active tab, so its view gets laid out
     const hiddenBefore = calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === false).length;
 
     // The idle timer ticks every 250 ms with a static cursor; the last
@@ -347,6 +363,31 @@ test('main process wiring (Electron stub)', async t => {
       'the layout returned below the chrome');
 
     await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-3');
+  });
+
+  await t.test('a page firing repeated popups loses its first tab too', async () => {
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-9', true);
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-9', 'https://burst-source.example.com/');
+    const source = winStub().contentView.__views[0];
+    // First script popup (no CDP, no observed input -> degraded allow).
+    source.webContents.__openHandler({ url: 'https://first-popup.example.com/', disposition: 'default' });
+    await new Promise(resolve => setTimeout(resolve, 300)); // handleWindowOpen is async
+    let opens = calls.sends.filter(s => s.channel === 'core:open-tab');
+    assert.ok(opens.some(s => s.payload.url === 'https://first-popup.example.com/'), 'the first popup tab was published');
+    // The renderer opens that tab; the main process learns the tab->popup link.
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-p1', true);
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-p1', 'https://first-popup.example.com/');
+    assert.equal(winStub().contentView.__views.length, 2, 'the popup tab has a view');
+    // The page fires a second popup shortly after (fresh click, new tab).
+    source.webContents.__openHandler({ url: 'https://second-popup.example.com/', disposition: 'default' });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    opens = calls.sends.filter(s => s.channel === 'core:open-tab');
+    assert.ok(!opens.some(s => s.payload.url === 'https://second-popup.example.com/'), 'the second popup tab was not created');
+    const closed = calls.sends.filter(s => s.channel === 'core:tab-closed');
+    assert.equal(closed.length, 1, 'the renderer was told the first popup tab was closed');
+    assert.equal(closed.at(-1).payload.id, 'tab-p1');
+    assert.equal(winStub().contentView.__views.length, 1, 'only the source tab remains');
+    await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-9');
   });
 
   await t.test('the window control and F11 toggle true browser fullscreen', async () => {

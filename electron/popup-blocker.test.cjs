@@ -110,7 +110,7 @@ test('a stale activation (older than the gesture window) is blocked', () => {
   assert.equal(decision.reason, 'no-gesture');
 });
 
-test('a popup chain is cut off after the first open per gesture', () => {
+test('a popup chain is cut off after the first open', () => {
   const { policy, at, classify } = makePolicy();
   at(1_000_000);
   policy.observeInput(1, 'mouseDown');
@@ -119,22 +119,22 @@ test('a popup chain is cut off after the first open per gesture', () => {
   at(1_000_400);
   const second = classify({ pageState: { ageMs: 400 } });
   assert.equal(second.allowed, false);
-  assert.equal(second.reason, 'popup-chain');
-  // A fresh gesture resets the quota.
-  at(1_000_500);
-  policy.observeInput(1, 'mouseDown');
-  at(1_000_600);
-  assert.equal(classify({ pageState: { ageMs: 100 } }).allowed, true);
+  // The repeat rule catches this: a second script open from the same page
+  // inside the window is unwanted, regardless of the per-gesture quota.
+  assert.equal(second.reason, 'repeat-popup');
 });
 
 test('background-tab opens need a near-synchronous gesture', () => {
-  const { policy, at, classify } = makePolicy();
+  const { policy, at } = makePolicy();
   at(1_000_000);
   policy.observeInput(1, 'mouseDown');
   at(1_000_400);
-  assert.equal(classify({ disposition: 'background-tab', pageState: { ageMs: 400 } }).allowed, true);
+  assert.equal(policy.classifyWindowOpen({ url: 'https://popup-target.test/open', sourceUrl: 'https://site.test/page', disposition: 'background-tab', tabCount: 1, pageState: { ageMs: 400 }, contentsId: 1 }).allowed, true);
+  // A stale gesture on a fresh tab (no earlier popup) is refused outright.
+  at(1_000_000);
+  policy.observeInput(2, 'mouseDown');
   at(1_001_200);
-  const stale = classify({ disposition: 'background-tab', pageState: { ageMs: 1200 } });
+  const stale = policy.classifyWindowOpen({ url: 'https://popup-target.test/open', sourceUrl: 'https://site.test/page', disposition: 'background-tab', tabCount: 1, pageState: { ageMs: 1200 }, contentsId: 2 });
   assert.equal(stale.allowed, false);
   assert.equal(stale.reason, 'no-gesture');
 });
@@ -159,6 +159,57 @@ test('with no observation at all the policy degrades to allow (never break sites
   assert.equal(decision.allowed, true);
   assert.equal(decision.reason, 'degraded');
   assert.equal(decision.needsWatch, true);
+});
+
+test('scrolling does not grant popup activation', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseWheel');
+  at(1_000_100);
+  // The isolated-world script is installed (it reports an age), but the only
+  // "input" was a scroll: the open is refused like a no-gesture one.
+  const decision = classify({ pageState: { ageMs: 999999999 } });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'no-gesture');
+});
+
+test('a page firing repeated popups is stopped and its first popup reported', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_200);
+  const first = classify({ url: 'https://stake.example/join', pageState: { ageMs: 200 } });
+  assert.equal(first.allowed, true);
+  assert.equal(first.reason, 'user-gesture');
+  // The user clicks again a moment later: a fresh gesture, a second popup.
+  // Ad redirectors do exactly this — each click spawns a new ad tab.
+  at(1_001_500);
+  policy.observeInput(1, 'mouseDown');
+  at(1_001_600);
+  const second = classify({ url: 'https://opera.example/gx', pageState: { ageMs: 100 } });
+  assert.equal(second.allowed, false);
+  assert.equal(second.reason, 'repeat-popup');
+  assert.equal(second.earlierUrl, 'https://stake.example/join');
+  // After the repeat window elapses, ordinary sites can open again.
+  at(1_009_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_009_100);
+  const later = classify({ url: 'https://partner.example/open', pageState: { ageMs: 100 } });
+  assert.equal(later.allowed, true);
+  assert.equal(later.reason, 'user-gesture');
+});
+
+test('repeat-popup state is per tab and cleared by forget', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  assert.equal(classify({ url: 'https://one.example/' }).allowed, true);
+  policy.forget(1); // tab closed / destroyed
+  at(1_000_300);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_400);
+  assert.equal(classify({ url: 'https://two.example/' }).allowed, true);
 });
 
 test('a page cannot spoof the isolated-world clock to open without a gesture', () => {

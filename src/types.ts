@@ -110,6 +110,7 @@ export interface DesktopBridge {
   onPopupBlocked: (callback: (info: { url: string; source: string }) => void) => () => void;
   onNavigationBlocked: (callback: (info: { id: string; url: string; type: TabIssue['type'] }) => void) => () => void;
   onLoadFailed: (callback: (info: { id: string; url: string }) => void) => () => void;
+  onTabClosed: (callback: (info: { id: string }) => void) => () => void;
 }
 
 declare global {

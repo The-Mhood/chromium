@@ -38,6 +38,7 @@ interface BrowserState {
   setPreference: (key: 'theme' | 'searchEngine' | 'doNotTrack', value: string | boolean) => void;
   setNativeStats: (stats: NativeStats) => void;
   setTabIssue: (id: string, issue: TabIssue | null) => void;
+  removeTab: (id: string) => void;
   clearActivity: () => void;
   notify: (text: string, tone?: 'success' | 'info' | 'error') => void;
   dismissToast: () => void;
@@ -87,6 +88,19 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
     });
   },
   focusTab: (id) => set({ activeTabId: id }),
+  removeTab: (id) => set(state => {
+    // The main process already closed this tab (e.g. it was a repeat popup).
+    const index = state.tabs.findIndex(item => item.id === id);
+    if (index < 0) return {};
+    const tabs = state.tabs.filter(item => item.id !== id);
+    const tabIssues = { ...state.tabIssues };
+    delete tabIssues[id];
+    if (!tabs.length) {
+      const replacement = tab(crypto.randomUUID(), 'New Tab', 'core://newtab');
+      return { tabs: [replacement], activeTabId: replacement.id, tabIssues };
+    }
+    return { tabs, tabIssues, activeTabId: state.activeTabId === id ? tabs[Math.max(0, index - 1)].id : state.activeTabId };
+  }),
   navigate: (input) => {
     const url = safeUrl(input, get().searchEngine);
     const detail = Object.values(pageDetails).find(item => url === `core://${item.path}`);
