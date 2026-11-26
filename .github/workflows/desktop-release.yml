@@ -3,8 +3,10 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*']
+# contents:write lets the failure-report step write its log tail to the
+# build-failure-logs branch (the report step must keep using github.token).
 permissions:
-  contents: read
+  contents: write
 jobs:
   package:
     strategy:
@@ -42,8 +44,6 @@ jobs:
       # branch, where it is readable via the API.
       - if: failure()
         uses: actions/github-script@v7
-        permissions:
-          contents: write
         env:
           GH_TOKEN: ${{ github.token }}
         with:
