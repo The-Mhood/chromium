@@ -40,8 +40,12 @@ let broadcastTimer;
 let settleTimer = null;
 let lastBounds = null;
 let measureTimer = null;
+let mediaMaximized = false; // true when the window was maximised for media fullscreen
 const views = new Map();
 const navigationLocks = new Map();
+// The URL each tab's main frame is currently trying to reach, so a
+// did-fail-load for a sub-resource is never reported as a failed page.
+const lastRequested = new Map();
 const pendingPopupOpens = [];
 const defaults = {
   protection: { enabled: true, network: true, tracking: true, cosmetic: true, popups: true, youtube: true },
@@ -99,13 +103,17 @@ function applyLayout() {
   const [width, height] = win.getContentSize();
   const top = fsCtl.viewTop();
   const viewHeight = Math.max(0, height - top);
+  const bounds = { x: 0, y: top, width, height: viewHeight };
+  // A window-geometry change re-bounds every view; the view that is actually
+  // on screen is re-bounded on *every* layout pass, because a hidden→visible
+  // tab switch or a freshly created view must never be left at its default
+  // (zero) geometry even though the window size did not change.
+  const geometryChanged = `${width}x${viewHeight}@${top}` !== lastBounds;
+  if (geometryChanged) lastBounds = `${width}x${viewHeight}@${top}`;
   for (const [id, view] of views) {
-    view.setVisible(showExternal && activeId === id);
-  }
-  const signature = `${width}x${viewHeight}@${top}`;
-  if (signature !== lastBounds) {
-    lastBounds = signature;
-    for (const view of views.values()) view.setBounds({ x: 0, y: top, width, height: viewHeight });
+    const shouldShow = showExternal && activeId === id;
+    view.setVisible(shouldShow);
+    if (shouldShow || geometryChanged) view.setBounds(bounds);
   }
 }
 
@@ -148,7 +156,23 @@ function syncFullscreenState() {
 fsCtl.onEffect(effect => {
   if (!win || win.isDestroyed()) return;
   if (effect.type === 'window-fullscreen' && win.isFullScreen() !== effect.value) {
+    // Browser (user) fullscreen only — media never comes through here.
     win.setFullScreen(effect.value);
+    settleLayout();
+  }
+  if (effect.type === 'window-maximize') {
+    // Window-level media fullscreen: cover the screen with the window
+    // itself. No OS transition, so the document's fullscreen element is
+    // never torn down by a competing transition (the old failure mode).
+    // Only undo the maximise we did — a window the user maximised
+    // themselves must survive the media session.
+    if (effect.on) {
+      mediaMaximized = !win.isMaximized();
+      if (!win.isMaximized()) win.maximize();
+    } else if (mediaMaximized) {
+      mediaMaximized = false;
+      if (win.isMaximized() && !win.isFullScreen()) win.unmaximize();
+    }
     settleLayout();
   }
   if (effect.type === 'chrome') send('core:chrome-visibility', effect.visible);
@@ -174,6 +198,7 @@ function destroyTab(id) {
   fsCtl.tabClosed(id);
   engine.popupPolicy.forget(contents.id);
   navigationLocks.delete(contents.id);
+  lastRequested.delete(contents.id);
   win.contentView.removeChildView(view);
   views.delete(id);
   try { contents.close(); } catch { /* already closing */ }
@@ -264,12 +289,14 @@ function makeTab(id) {
     // Navigations we started (address bar, app logic) keep the user's intent;
     // renderer-initiated navigations are checked against the filters.
     if (navigationLockFor(contents, url)) return;
+    lastRequested.set(contents.id, url);
     try {
       if (checkPopunderNavigation(contents, url, id)) { event.preventDefault(); return; }
       const hit = engine.matchMainFrame(url, contents.getURL());
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
+        send('core:navigation-blocked', { id, url, type: hit });
       }
     } catch (error) { console.warn('Navigation check failed:', error.message); }
   });
@@ -282,11 +309,26 @@ function makeTab(id) {
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
+        send('core:navigation-blocked', { id, url, type: hit });
       }
     } catch (error) { console.warn('Redirect check failed:', error.message); }
   });
 
-  contents.on('enter-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaEnter(id); });
+  // A page that never loads (DNS, offline, refused) leaves the tab on the
+  // placeholder; report main-frame failures so the renderer can explain.
+  // Sub-resource failures are ignored (their URL never matches lastRequested).
+  contents.on('did-fail-load', (_event, errorCode, _errorDescription, validatedURL) => {
+    if (errorCode === -3) return; // ERR_ABORTED: superseded or cancelled, not a failure
+    if (validatedURL && lastRequested.get(contents.id) === validatedURL) {
+      lastRequested.delete(contents.id);
+      send('core:load-failed', { id, url: validatedURL });
+    }
+  });
+
+  // A background tab can't own media fullscreen: the user is looking at a
+  // different tab, and maximising the window for a hidden video would be a
+  // surprise. The active tab's real isFullscreen() is re-synced on focus.
+  contents.on('enter-html-full-screen', () => { if (!contents.isDestroyed() && activeId === id) fsCtl.mediaEnter(id); });
   contents.on('leave-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaLeave(id); });
 
   contents.on('before-input-event', (_event, input) => {
@@ -303,12 +345,13 @@ function makeTab(id) {
   contents.on('page-title-updated', () => publishTab(id, contents));
   contents.on('did-navigate', () => publishTab(id, contents));
   contents.on('did-navigate-in-page', () => publishTab(id, contents));
-  contents.on('did-finish-load', () => { publishTab(id, contents); engine.applyCosmetics(contents).catch(console.warn); });
+  contents.on('did-finish-load', () => { publishTab(id, contents); applyLayout(); engine.applyCosmetics(contents).catch(console.warn); });
   contents.on('destroyed', () => {
     engine.forget(contents.id);
     engine.popupPolicy.forget(contents.id);
     syncQueue.delete(contents.id);
     navigationLocks.delete(contents.id);
+    lastRequested.delete(contents.id);
   });
 
   syncPageScripts(contents);
@@ -409,13 +452,17 @@ function registerIPC() {
       engine.popupPolicy.registerPopup(view.webContents.id, pending);
     }
     // Make sure the document-start scripts are in place before the page loads.
+    // Bounded: a stuck DevTools session must never hold up browsing — the
+    // worst case is that this one document misses the document-start scripts
+    // (the next navigation gets them).
     const syncEntry = syncQueue.get(view.webContents.id);
-    if (syncEntry) await syncEntry.queue.catch(() => {});
+    if (syncEntry) await Promise.race([syncEntry.queue.catch(() => {}), new Promise(resolve => setTimeout(resolve, 5000))]);
     // Let the filter lists finish their initial build (bounded: the bundled
     // baseline is already active, so a slow network never stalls browsing).
     await Promise.race([engine.ready, new Promise(resolve => setTimeout(resolve, 4000))]);
     if (view.webContents.getURL() !== url && !view.webContents.isLoadingMainFrame()) {
       navigationLocks.set(view.webContents.id, { url, at: Date.now() });
+      lastRequested.set(view.webContents.id, url);
       try { await view.webContents.loadURL(url); }
       catch (error) { if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Navigation failed:', error.message); }
     }
@@ -555,6 +602,11 @@ app.whenReady().then(() => {
     cacheDir: path.join(app.getPath('userData'), 'filters'),
     getSettings: () => state,
     recordBlocked,
+    onMainframeBlocked: (webContentsId, url, type) => {
+      // The page will never load — tell the renderer so the tab shows why
+      // instead of sitting on a placeholder that reads like a prompt.
+      for (const [id, view] of views) if (view.webContents.id === webContentsId) { send('core:navigation-blocked', { id, url, type }); break; }
+    },
   });
   // The bundled baseline is already active; this upgrades it to the full
   // fetched lists (or settles to the baseline when none are requested).

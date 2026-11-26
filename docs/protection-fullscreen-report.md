@@ -225,3 +225,61 @@ macOS ARM / macOS Intel zips plus the SHA-256 manifest from this commit;
 `scripts/package-desktop.mjs` is unchanged and compatible with the new
 modules (the baseline `electron/resources/*.txt` are packaged inside the
 app directory and read through the asar).
+
+## 13. Runtime fixes round 2 (user-reported, 2026-11-26)
+
+Three issues reported against the running desktop app (screenshot: external
+tab showing the "BROWSER PREVIEW" card instead of the page):
+
+1. **External navigation showed the web-preview placeholder** ("This website
+   is ready to explore … Open {host} … In the web preview, external sites
+   open in a new window") — i.e. a click-to-open prompt inside the desktop
+   app. Causes addressed:
+   - `ExternalPage` in desktop mode no longer renders any open-in-new-window
+     prompt; it is now an honest *loading* state (spinner + "Loading
+     {host}…") that the tab's WebContentsView covers as soon as the page
+     paints.
+   - **Blocked main-frame navigations are now reported to the renderer**
+     (`core:navigation-blocked`): the protection engine cancels listed main
+     frames (e.g. parked/ad domains), which previously left the tab on the
+     placeholder forever with no explanation. The tab now shows
+     "Blocked by protection" with the filter category and a link to the
+     activity page / allowlist hint. Wired at both layers: the request
+     pipeline (`onMainframeBlocked` hook in `protection.cjs`) and the
+     navigation layer (`will-navigate` / `will-redirect`).
+   - **Failed loads are reported** (`core:load-failed` via
+     `did-fail-load`, main-frame only — sub-resource failures are ignored
+     via a per-tab `lastRequested` match). Unreachable addresses show
+     "Couldn't reach {host}" with a Try-again button instead of an
+     endless "loading" card.
+   - `applyLayout` now re-bounds the *visible* view on every layout pass
+     (previously only on window-size signature change), so a view can never
+     be left at its default zero geometry after a hidden→visible tab switch
+     or creation without a resize. `did-finish-load` also re-asserts the
+     layout. The DevTools-script sync in `core:navigate` is bounded at 5 s
+     so a stuck CDP session can never hold a navigation.
+   - Session permission handlers remain `callback(false)` for every
+     permission: no native permission prompt can appear from the browsing
+     session; the only "permission-like" UI was the placeholder card, which
+     is gone in desktop mode.
+
+2. **Media (YouTube/other) fullscreen**: re-architected as *window-level*
+   fullscreen. The document's fullscreen element already fills the contents
+   viewport, so the app now maximises the frameless window and hides the
+   chrome (`window-maximize` effect) instead of calling `win.setFullScreen`.
+   OS transitions layered on an active document-fullscreen are what tore
+   the element down (spurious `leave-html-full-screen`). The OS window is
+   now in native fullscreen **only** for the user's own browser fullscreen
+   (F11 / maximize dot / OS shortcut), which is unchanged and stays
+   settled. Media enter/leave never crosses into the OS transition path,
+   the maximise is only undone if the app did it, and background tabs
+   cannot own media fullscreen.
+
+3. **Verification**: `node --test` in `.desktop-build` — 84/84 (24
+   fullscreen-state, 20 popup-blocker, 14 protection, 12 youtube-shield,
+   14 wiring, incl. new subtests: tab-switch re-bounding, blocked
+   main-frame report, failed-load report, window-level media
+   fullscreen). `tsc --noEmit` clean; production build 600.43 kB.
+   **Not verified in this environment**: actual rendering on a real
+   display (no Electron binary/display in CI sandbox) — the packaged app
+   from `main` is the ground truth for the three fixes.

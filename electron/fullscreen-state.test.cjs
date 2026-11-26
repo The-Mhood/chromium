@@ -17,10 +17,12 @@ function makeController(options = {}) {
   });
   ctl.onEffect(effect => effects.push(effect));
   const windowEffects = () => effects.filter(e => e.type === 'window-fullscreen');
+  const maximizeEffects = () => effects.filter(e => e.type === 'window-maximize');
   return {
     ctl,
     effects,
     windowEffects,
+    maximizeEffects,
     at: t => { clock = t; },
     last: type => {
       for (let i = effects.length - 1; i >= 0; i -= 1) if (effects[i].type === type) return effects[i];
@@ -37,52 +39,67 @@ test('starts windowed with visible chrome and top=chromeHeight', () => {
   assert.equal(ctl.viewTop(), 96);
 });
 
-test('media fullscreen on the active tab: window fullscreen, chrome off, top=0', () => {
-  const { ctl, effects, windowEffects } = makeController();
+test('media fullscreen on the active tab: window-level (maximize), chrome off, top=0, no OS fullscreen', () => {
+  const { ctl, effects, windowEffects, maximizeEffects } = makeController();
   ctl.mediaEnter('tab-a');
-  assert.equal(ctl.wantsWindowFullscreen, true);
+  assert.equal(ctl.wantsWindowFullscreen, false); // OS fullscreen is the user's
+  assert.equal(ctl.mediaActive, true);
   assert.equal(ctl.chromeHidden(), true);
   assert.equal(ctl.viewTop(), 0);
-  assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: true }]);
+  assert.deepEqual(windowEffects(), []);
+  assert.deepEqual(maximizeEffects(), [{ type: 'window-maximize', on: true }]);
   assert.equal(effects.some(e => e.type === 'chrome' && e.visible === false), true);
 });
 
-test('media fullscreen on a background tab does not force the window fullscreen', () => {
-  const { ctl } = makeController();
-  ctl.mediaEnter('tab-b'); // not the active tab
-  assert.equal(ctl.wantsWindowFullscreen, false);
-  assert.equal(ctl.viewTop(), 96);
-  ctl.tabFocused('tab-b', { mediaIsFullscreen: true });
-  assert.equal(ctl.wantsWindowFullscreen, true);
-  ctl.tabFocused('tab-a', { mediaIsFullscreen: false });
-  assert.equal(ctl.wantsWindowFullscreen, false);
-});
-
-test('media exit restores chrome, layout and window size', () => {
-  const { ctl, windowEffects } = makeController();
+test('media exit restores chrome, layout and window size (no OS transition)', () => {
+  const { ctl, windowEffects, maximizeEffects } = makeController();
   ctl.mediaEnter('tab-a');
   ctl.mediaLeave('tab-a');
   assert.equal(ctl.wantsWindowFullscreen, false);
   assert.equal(ctl.chromeVisible, true);
   assert.equal(ctl.viewTop(), 96);
-  assert.deepEqual(windowEffects(), [
-    { type: 'window-fullscreen', value: true },
-    { type: 'window-fullscreen', value: false },
+  assert.deepEqual(windowEffects(), []);
+  assert.deepEqual(maximizeEffects(), [
+    { type: 'window-maximize', on: true },
+    { type: 'window-maximize', on: false },
   ]);
   // Stale leave from a non-owner is ignored.
   ctl.mediaLeave('tab-b');
+  assert.equal(ctl.chromeVisible, true);
+  assert.equal(ctl.mediaTabId, null);
+});
+
+test('media fullscreen on a background tab does not change the window', () => {
+  const { ctl, maximizeEffects } = makeController();
+  ctl.mediaEnter('tab-b'); // not the active tab
   assert.equal(ctl.wantsWindowFullscreen, false);
+  assert.equal(ctl.chromeVisible, true);
+  assert.equal(ctl.viewTop(), 96);
+  assert.equal(maximizeEffects().length, 0);
+  // Focusing the tab presents the media fullscreen it really has.
+  ctl.tabFocused('tab-b', { mediaIsFullscreen: true });
+  assert.equal(ctl.wantsWindowFullscreen, false);
+  assert.equal(ctl.chromeVisible, false);
+  assert.equal(maximizeEffects().length, 1);
+  ctl.tabFocused('tab-a', { mediaIsFullscreen: false });
+  assert.equal(ctl.mediaTabId, null);
+  assert.equal(ctl.chromeVisible, true);
+  assert.equal(maximizeEffects().length, 2); // maximise undone
 });
 
 test('closing the tab that owns media fullscreen clears everything (no stuck state)', () => {
-  const { ctl } = makeController();
+  const { ctl, maximizeEffects } = makeController();
   ctl.mediaEnter('tab-a');
-  assert.equal(ctl.wantsWindowFullscreen, true);
+  assert.equal(ctl.mediaActive, true);
   assert.equal(ctl.chromeVisible, false);
   ctl.tabClosed('tab-a');
   assert.equal(ctl.wantsWindowFullscreen, false);
   assert.equal(ctl.chromeVisible, true);
   assert.equal(ctl.mediaTabId, null);
+  assert.deepEqual(maximizeEffects(), [
+    { type: 'window-maximize', on: true },
+    { type: 'window-maximize', on: false },
+  ]);
   // A leave event arriving after the close must not disturb the state.
   ctl.mediaLeave('tab-a');
   assert.equal(ctl.wantsWindowFullscreen, false);
@@ -90,25 +107,31 @@ test('closing the tab that owns media fullscreen clears everything (no stuck sta
 });
 
 test('switching tabs abandons the background tab media fullscreen and reveals chrome', () => {
-  const { ctl } = makeController();
+  const { ctl, maximizeEffects } = makeController();
   ctl.mediaEnter('tab-a');
   ctl.tabFocused('tab-b', { mediaIsFullscreen: false });
   assert.equal(ctl.wantsWindowFullscreen, false);
   assert.equal(ctl.chromeVisible, true);
   assert.equal(ctl.mediaTabId, null);
+  assert.deepEqual(maximizeEffects(), [
+    { type: 'window-maximize', on: true },
+    { type: 'window-maximize', on: false },
+  ]);
 });
 
 test('focus re-syncs the real media state of the focused tab', () => {
-  const { ctl } = makeController();
+  const { ctl, maximizeEffects } = makeController();
   // We missed the enter event (it happened while the tab was backgrounded);
   // focusing the tab and reporting its real isFullscreen() adopts it.
   ctl.tabFocused('tab-b', { mediaIsFullscreen: true });
   assert.equal(ctl.mediaTabId, 'tab-b');
-  assert.equal(ctl.wantsWindowFullscreen, true);
+  assert.equal(ctl.wantsWindowFullscreen, false);
   assert.equal(ctl.chromeVisible, false);
+  assert.equal(maximizeEffects().length, 1);
   ctl.tabFocused('tab-a', { mediaIsFullscreen: false });
   assert.equal(ctl.wantsWindowFullscreen, false);
   assert.equal(ctl.chromeVisible, true);
+  assert.equal(maximizeEffects().length, 2);
 });
 
 test('user toggle enters and exits browser fullscreen', () => {
@@ -127,50 +150,68 @@ test('user toggle enters and exits browser fullscreen', () => {
 });
 
 test('user fullscreen + media fullscreen interact without double work', () => {
-  const { ctl, windowEffects } = makeController();
+  const { ctl, effects, windowEffects, maximizeEffects } = makeController();
   ctl.userToggle(); // on
   ctl.mediaEnter('tab-a');
   assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: true }]); // no second request
+  // No maximise: the OS fullscreen already covers the screen.
+  assert.equal(maximizeEffects().length, 0);
   ctl.mediaLeave('tab-a'); // user fullscreen keeps the window fullscreen
   assert.equal(ctl.wantsWindowFullscreen, true);
   assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: true }]);
+  assert.equal(effects.filter(e => e.type === 'chrome' && e.visible === true).length, 1); // chrome back
   ctl.userToggle(); // off
   assert.equal(ctl.wantsWindowFullscreen, false);
   assert.equal(windowEffects().length, 2);
 });
 
 test('media enter while user fullscreen: exit media keeps user fullscreen', () => {
-  const { ctl } = makeController();
+  const { ctl, maximizeEffects } = makeController();
   ctl.userToggle();
   ctl.mediaEnter('tab-a');
   ctl.mediaLeave('tab-a');
   assert.equal(ctl.wantsWindowFullscreen, true);
+  assert.equal(maximizeEffects().length, 0);
   ctl.userToggle();
   assert.equal(ctl.wantsWindowFullscreen, false);
 });
 
-test('the OS dropping fullscreen for media re-asserts it', () => {
+test('the OS dropping user fullscreen while media is active only clears the user flag', () => {
   const { ctl, windowEffects } = makeController();
+  ctl.userToggle();
   ctl.mediaEnter('tab-a');
-  ctl.windowFullscreenChanged(false); // e.g. display metrics change
-  assert.equal(windowEffects().at(-1).value, true);
-  assert.equal(ctl.wantsWindowFullscreen, true);
+  ctl.windowFullscreenChanged(false); // e.g. the user used the OS shortcut
+  assert.equal(ctl.userFullscreen, false);
+  assert.equal(ctl.wantsWindowFullscreen, false);
+  assert.deepEqual(windowEffects(), [
+    { type: 'window-fullscreen', value: true },
+    { type: 'window-fullscreen', value: false },
+  ]);
+  // Media keeps its window-level presentation until it leaves.
+  assert.equal(ctl.mediaActive, true);
+  assert.equal(ctl.viewTop(), 0);
 });
 
 test('the OS dropping user fullscreen is treated as the user exiting', () => {
-  const { ctl } = makeController();
+  const { ctl, windowEffects } = makeController();
   ctl.userToggle();
   ctl.windowFullscreenChanged(false); // user pressed Esc / OS shortcut
   assert.equal(ctl.userFullscreen, false);
   assert.equal(ctl.wantsWindowFullscreen, false);
+  assert.deepEqual(windowEffects(), [
+    { type: 'window-fullscreen', value: true },
+    { type: 'window-fullscreen', value: false },
+  ]);
 });
 
 test('an OS-initiated fullscreen is adopted, not fought', () => {
-  const { ctl } = makeController();
+  const { ctl, windowEffects } = makeController();
   ctl.windowFullscreenChanged(true);
   assert.equal(ctl.userFullscreen, true);
+  assert.deepEqual(windowEffects(), []); // no re-assert: we did not ask for it
   ctl.userToggle();
   assert.equal(ctl.wantsWindowFullscreen, false);
+  assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: false }]);
 });
 
 test('chrome hides after seven idle seconds while browsing', () => {
@@ -283,4 +324,15 @@ test('a destroyed owner cannot re-enter media fullscreen through stale events', 
   ctl.tabFocused('tab-b', { mediaIsFullscreen: false });
   assert.equal(ctl.mediaTabId, null);
   assert.equal(ctl.wantsWindowFullscreen, false);
+});
+
+test('media maximize is not re-emitted when it is already in effect', () => {
+  const { ctl, maximizeEffects } = makeController();
+  ctl.mediaEnter('tab-a');
+  // A second enter from the same document is a no-op.
+  ctl.mediaEnter('tab-a');
+  assert.equal(maximizeEffects().length, 1);
+  // Re-adopting the active tab (focus re-sync) does not re-maximize.
+  ctl.adoptMedia('tab-a');
+  assert.equal(maximizeEffects().length, 1);
 });

@@ -10,14 +10,22 @@
 // chrome, re-lay-out the WebContentsViews).
 //
 // Two independent fullscreen modes coexist:
-//   - Browser fullscreen: the user explicitly took the window fullscreen.
+//   - Browser fullscreen: the user explicitly took the window fullscreen
+//     (F11 / maximize dot / OS shortcut). This is the ONLY thing that puts
+//     the OS window into native fullscreen.
 //   - Media fullscreen: a page's element is in the HTML fullscreen state,
-//     owned by the tab whose document entered it.
-// The OS window is fullscreen iff the user asked for it OR the *active* tab
-// owns a media fullscreen. Chrome visibility is a third, independent state:
-// it is forced off while media is active, and otherwise auto-hides after
-// seven seconds of inactivity (only while focused and while an external page
-// or browser fullscreen is on screen), revealing on any activity.
+//     owned by the tab whose document entered it. This is window-level:
+//     the WebContentsView is laid out over the entire window and the chrome
+//     is hidden. The document's fullscreen element already fills the
+//     contents viewport, so no OS transition is needed. Deliberately NOT
+//     routed through win.setFullScreen: layering an OS transition on top of
+//     an active document-fullscreen makes Chromium tear the element down
+//     (spurious leave-html-full-screen), which is why media fullscreen used
+//     to appear broken or flash back out.
+// Chrome visibility is a third, independent state: it is forced off while
+// media is active, and otherwise auto-hides after seven seconds of
+// inactivity (only while focused and while an external page or browser
+// fullscreen is on screen), revealing on any activity.
 //
 // Previously these were scattered booleans in main.cjs with no single owner;
 // that is what produced the "stuck in fullscreen" states (closing the owning
@@ -42,6 +50,7 @@ class FullscreenController {
     this._windowFocused = options.windowFocused ?? true;
     this._showingExternal = options.showingExternal ?? false;
     this._size = { width: options.width || 0, height: options.height || 0 };
+    this._mediaMaximized = false;
   }
 
   onEffect(fn) {
@@ -55,9 +64,12 @@ class FullscreenController {
     }
   }
 
-  /** The OS window should be fullscreen in exactly these situations. */
+  /** The OS window is in native fullscreen only for the user's own
+   *  (browser) fullscreen. Media fullscreen is window-level and uses
+   *  window-maximize instead, so a document-fullscreen element is never
+   *  fought by an OS transition. */
   get wantsWindowFullscreen() {
-    return this.userFullscreen || (this.mediaTabId !== null && this.mediaTabId === this.activeTabId);
+    return this.userFullscreen;
   }
 
   get mediaActive() {
@@ -133,28 +145,22 @@ class FullscreenController {
 
   /** A tab's document entered the HTML fullscreen state. */
   mediaEnter(tabId) {
-    if (this.mediaTabId === tabId) return;
-    const before = this._wants();
-    this.mediaTabId = tabId;
-    if (this.mediaTabId === this.activeTabId && this.chromeVisible) {
-      this.chromeVisible = false;
-      this._emit({ type: 'chrome', visible: false });
-    }
-    this._maybeEmitWindow(before);
-    this._emit({ type: 'layout' });
+    this._adoptMedia(tabId);
   }
 
   /** A tab's document left the HTML fullscreen state (Esc, API, navigation, close). */
   mediaLeave(tabId) {
     if (this.mediaTabId !== tabId) return;
-    const before = this._wants();
     this.mediaTabId = null;
+    if (this._mediaMaximized) {
+      this._mediaMaximized = false;
+      this._emit({ type: 'window-maximize', on: false });
+    }
     if (!this.chromeVisible) {
       this.chromeVisible = true;
       this._emit({ type: 'chrome', visible: true });
     }
     this._lastActivityAt = this._now();
-    this._maybeEmitWindow(before);
     this._emit({ type: 'layout' });
   }
 
@@ -181,46 +187,63 @@ class FullscreenController {
    *  webContents.isFullscreen() of the focused tab (source of truth). */
   tabFocused(tabId, { mediaIsFullscreen = false } = {}) {
     const previousActive = this.activeTabId;
-    const before = this._wants();
     this.activeTabId = tabId;
     this._lastActivityAt = this._now();
     // A hidden tab's media fullscreen is abandoned when we look away; the real
     // state of the focused tab is re-synced below.
-    if (this.mediaTabId !== null && this.mediaTabId !== tabId) this.mediaTabId = null;
-    if (mediaIsFullscreen) this._adoptMedia(tabId, before);
+    if (this.mediaTabId !== null && this.mediaTabId !== tabId) this._abandonMedia();
+    if (mediaIsFullscreen) this._adoptMedia(tabId);
     if (!this.chromeVisible && !this.mediaActive) {
       this.chromeVisible = true;
       this._emit({ type: 'chrome', visible: true });
     }
-    this._maybeEmitWindow(before);
     this._emit({ type: 'layout' });
     return previousActive;
   }
 
   /** The focused tab actually reports HTML fullscreen (we missed the event). */
   adoptMedia(tabId) {
-    this._adoptMedia(tabId, this._wants());
+    this._adoptMedia(tabId);
   }
 
-  _adoptMedia(tabId, before) {
-    if (this.mediaTabId === tabId) return;
+  _adoptMedia(tabId) {
     this.mediaTabId = tabId;
+    if (tabId !== this.activeTabId) return; // background: presented when focused
     if (this.chromeVisible) {
       this.chromeVisible = false;
       this._emit({ type: 'chrome', visible: false });
     }
-    this._maybeEmitWindow(before);
+    if (!this.userFullscreen && !this._mediaMaximized) {
+      // Window-level media fullscreen: grow the window so the document's
+      // fullscreen element can cover the screen. No OS transition — those
+      // race with the active fullscreen element and tore it down.
+      this._mediaMaximized = true;
+      this._emit({ type: 'window-maximize', on: true });
+    }
     this._emit({ type: 'layout' });
+  }
+
+  /** Abandon media fullscreen owned by a tab we are no longer looking at
+   *  (hidden tabs don't keep the window maximized). */
+  _abandonMedia() {
+    this.mediaTabId = null;
+    if (this._mediaMaximized) {
+      this._mediaMaximized = false;
+      this._emit({ type: 'window-maximize', on: false });
+    }
   }
 
   /** A tab was closed. If it owned the media fullscreen, clear it: this is the
    *  transition that used to leave the app stuck in fullscreen. */
   tabClosed(tabId) {
-    const before = this._wants();
     let changed = false;
     if (this.mediaTabId === tabId) {
       this.mediaTabId = null;
       changed = true;
+      if (this._mediaMaximized) {
+        this._mediaMaximized = false;
+        this._emit({ type: 'window-maximize', on: false });
+      }
     }
     if (changed && !this.chromeVisible) {
       this.chromeVisible = true;
@@ -228,26 +251,19 @@ class FullscreenController {
     }
     if (this.activeTabId === tabId) this.activeTabId = null;
     this._lastActivityAt = this._now();
-    this._maybeEmitWindow(before);
     if (changed) this._emit({ type: 'layout' });
   }
 
   /** The OS told us the window entered/left native fullscreen. Reconcile:
-   *  - media still wants it (display change) -> re-assert;
-   *  - user fullscreen dropped by the OS (Esc / shortcut) -> treat as exited. */
+   *  - OS entered on its own (user shortcut) -> adopt it;
+   *  - OS dropped the user fullscreen (Esc / shortcut) -> treat as exited.
+   *  Media never drives the OS window, so there is nothing to re-assert. */
   windowFullscreenChanged(actual) {
-    const wants = this._wants();
-    if (actual && !wants) {
-      // The OS entered fullscreen on its own (user OS shortcut): adopt it so a
-      // later toggle exits cleanly instead of fighting the OS.
+    if (actual && !this.userFullscreen) {
       this.userFullscreen = true;
       return;
     }
-    if (!actual && wants) {
-      if (this.mediaTabId !== null && this.mediaTabId === this.activeTabId) {
-        this._emit({ type: 'window-fullscreen', value: true });
-        return;
-      }
+    if (!actual && this.userFullscreen) {
       this.userFullscreen = false;
       this._emit({ type: 'window-fullscreen', value: false });
     }
@@ -256,7 +272,7 @@ class FullscreenController {
   // ------------------------------------------------------------------ impl
 
   _wants() {
-    return this.userFullscreen || (this.mediaTabId !== null && this.mediaTabId === this.activeTabId);
+    return this.userFullscreen;
   }
 
   _maybeEmitWindow(before) {

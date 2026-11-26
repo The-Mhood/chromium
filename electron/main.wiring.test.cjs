@@ -86,6 +86,7 @@ class BrowserWindowStub {
     this.__listeners = new Map();
     this.__once = new Map();
     this.__fullscreen = false;
+    this.__maximized = false;
     this.__destroyed = false;
     this.contentView = {
       __views: [],
@@ -110,9 +111,9 @@ class BrowserWindowStub {
   getBounds() { return { x: 0, y: 0, width: 1440, height: 1000 }; }
   isFocused() { return true; }
   minimize() {}
-  maximize() {}
-  isMaximized() { return false; }
-  unmaximize() {}
+  maximize() { this.__maximized = true; }
+  isMaximized() { return this.__maximized; }
+  unmaximize() { this.__maximized = false; }
   loadFile() {}
 }
 BrowserWindowStub.getAllWindows = () => BrowserWindowStub.windows;
@@ -251,6 +252,49 @@ test('main process wiring (Electron stub)', async t => {
     assert.equal(winStub().contentView.__views.length, 1, 'the main process does not create the view itself');
   });
 
+  await t.test('switching tabs re-bounds the visible view even without a window resize', async () => {
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-2', true);
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-2', 'https://second.example.com/');
+    const [first, second] = winStub().contentView.__views;
+    assert.equal(first.__visible, false, 'the previous tab view is hidden');
+    assert.equal(second.__visible, true, 'the switched-to tab view is visible');
+    assert.deepEqual(second.__bounds, { x: 0, y: 96, width: 1440, height: 904 },
+      'the switched-to view is fully laid out even though the window size never changed');
+    // Switch back: the first view must be on screen with the right geometry.
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-1', true);
+    assert.equal(first.__visible, true, 'the restored tab view is visible');
+    assert.deepEqual(first.__bounds, { x: 0, y: 96, width: 1440, height: 904 },
+      'the restored view is re-bounded on every layout pass');
+  });
+
+  await t.test('a blocked main-frame navigation tells the renderer (no silent placeholder)', async () => {
+    const view = winStub().contentView.__views[0];
+    const before = calls.sends.filter(s => s.channel === 'core:navigation-blocked').length;
+    // The request pipeline cancels a listed main frame — exactly what leaves
+    // a tab on its placeholder. The renderer must be told why.
+    calls.onBeforeRequest({ url: 'https://pagead2.googlesyndication.com/', resourceType: 'mainFrame', webContentsId: view.webContents.id, referrer: 'https://example.com/' }, () => {});
+    const blocked = calls.sends.filter(s => s.channel === 'core:navigation-blocked');
+    assert.equal(blocked.length, before + 1, 'core:navigation-blocked was sent');
+    assert.equal(blocked.at(-1).payload.id, 'tab-1');
+    assert.equal(blocked.at(-1).payload.url, 'https://pagead2.googlesyndication.com/');
+    assert.equal(typeof blocked.at(-1).payload.type, 'string');
+  });
+
+  await t.test('a failed load is reported so the placeholder can explain itself', async () => {
+    const view = winStub().contentView.__views[0];
+    // Point the tab at a fresh URL so lastRequested matches the failure.
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-1', 'https://fail.example.com/');
+    const before = calls.sends.filter(s => s.channel === 'core:load-failed').length;
+    view.webContents.emit('did-fail-load', {}, -105, 'net::ERR_NAME_NOT_RESOLVED', 'https://fail.example.com/');
+    const failed = calls.sends.filter(s => s.channel === 'core:load-failed');
+    assert.equal(failed.length, before + 1, 'core:load-failed was sent for the main frame');
+    assert.equal(failed.at(-1).payload.id, 'tab-1');
+    assert.equal(failed.at(-1).payload.url, 'https://fail.example.com/');
+    // A sub-resource failure must NOT be reported as a failed page.
+    view.webContents.emit('did-fail-load', {}, -105, 'net::ERR_NAME_NOT_RESOLVED', 'https://fail.example.com/ad.js');
+    assert.equal(calls.sends.filter(s => s.channel === 'core:load-failed').length, before + 1, 'sub-resource failures are ignored');
+  });
+
   await t.test('the chrome hides after seven idle seconds and reveals on activity', async () => {
     const view = winStub().contentView.__views[0];
     const hiddenBefore = calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === false).length;
@@ -276,7 +320,33 @@ test('main process wiring (Electron stub)', async t => {
 
   await t.test('closing a tab removes its view and state', async () => {
     await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-1');
+    await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-2');
     assert.equal(winStub().contentView.__views.length, 0, 'the view was removed from the window');
+  });
+
+  await t.test('media fullscreen is window-level: maximise/restore, never an OS transition', async () => {
+    // Fresh tab: the media events only take effect for the active tab.
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-3', true);
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-3', 'https://youtube.example.com/');
+    const view = winStub().contentView.__views[0];
+
+    view.webContents.emit('enter-html-full-screen');
+    assert.equal(winStub().__fullscreen, false, 'media never triggers an OS fullscreen transition');
+    assert.equal(winStub().__maximized, true, 'the window was maximised for the player');
+    assert.equal(view.__visible, true);
+    assert.deepEqual(view.__bounds, { x: 0, y: 0, width: 1440, height: 1000 },
+      'the player view covers the full window');
+    const state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(state.payload, { media: true, window: false },
+      'the renderer sees media fullscreen without window fullscreen');
+
+    view.webContents.emit('leave-html-full-screen');
+    assert.equal(winStub().__maximized, false, 'the window size was restored');
+    assert.equal(winStub().__fullscreen, false);
+    assert.deepEqual(view.__bounds, { x: 0, y: 96, width: 1440, height: 904 },
+      'the layout returned below the chrome');
+
+    await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-3');
   });
 
   await t.test('the window control and F11 toggle true browser fullscreen', async () => {
