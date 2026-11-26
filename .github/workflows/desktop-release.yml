@@ -53,7 +53,7 @@ jobs:
             try {
               content =
                 'runner: ' + (process.env.RUNNER_OS || '?') + ' / node ' + process.version +
-                '\ntarget: ${{ matrix.platform }} / ${{ matrix.arch }}\ncommit: ' + (context.payload.sha || '') +
+                '\ntarget: ${{ matrix.platform }} / ${{ matrix.arch }}\ncommit: ' + (github.sha) +
                 '\n\n```\n' +
                 fs.readFileSync('package.log', 'utf8').trim().split('\n').slice(-70).join('\n') +
                 '\n```\n';
@@ -61,11 +61,11 @@ jobs:
               content = 'no output captured: ' + (e && e.message ? e.message : e);
             }
             const branch = 'build-failure-logs';
-            const path = 'failures/${{ matrix.platform }}-${{ matrix.arch }}-' + (context.payload.sha || 'unknown').slice(0, 8) + '.md';
+            const path = 'failures/${{ matrix.platform }}-${{ matrix.arch }}-' + (github.sha).slice(0, 8) + '.md';
             // createFile cannot create a new branch, so ensure the log
             // branch exists (from main) before writing to it.
             try {
-              const { data: mainRef } = await github.rest.repos.gitRef({
+              const { data: mainRef } = await github.rest.git.getRef({
                 owner: context.repo.owner, repo: context.repo.repo, ref: 'refs/heads/main',
               });
               await github.rest.git.createRef({
@@ -86,14 +86,9 @@ jobs:
               content: Buffer.from(content).toString('base64'),
               branch,
             };
-            if (sha) {
-              payload.path = path;
-              payload.sha = sha;
-              await github.rest.repos.updateFile(payload);
-            } else {
-              payload.path = path;
-              await github.rest.repos.createFile(payload);
-            }
+            payload.path = path;
+            if (sha) payload.sha = sha;
+            await github.rest.repos.createOrUpdateFileContents(payload);
             // and fail loudly so the run cannot be mistaken for a success
             throw new Error('packaging failed; log tail written to ' + path + ' on branch ' + branch);
       - uses: actions/upload-artifact@v4
