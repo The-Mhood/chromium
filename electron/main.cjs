@@ -12,6 +12,7 @@ let browsingSession;
 let activeId;
 let showExternal = false;
 let htmlFullscreen = false;
+let fullscreenTabId = null;
 let chromeVisible = true;
 let lastActivityAt = Date.now();
 let lastCursorPoint = null;
@@ -66,6 +67,16 @@ function setChromeVisible(visible) {
   bounds();
 }
 
+function exitHtmlFullscreen() {
+  if (!htmlFullscreen) return;
+  htmlFullscreen = false;
+  fullscreenTabId = null;
+  if (win && !win.isDestroyed() && win.isFullScreen()) win.setFullScreen(false);
+  setChromeVisible(true);
+  send('core:fullscreen-state', false);
+  bounds();
+}
+
 function publishTab(id, contents) {
   if (contents.isDestroyed()) return;
   // The blank page used to prepare a new tab is internal and never shown to the user.
@@ -94,19 +105,18 @@ function makeTab(id) {
   contents.on('will-redirect', (event, url) => { try { browsingUrl(url); } catch { event.preventDefault(); } });
   contents.on('enter-html-full-screen', () => {
     if (activeId !== id || !win || win.isDestroyed()) return;
+    fullscreenTabId = id;
     htmlFullscreen = true;
+    lastActivityAt = Date.now();
     setChromeVisible(false);
-    win.setFullScreen(true);
+    if (!win.isFullScreen()) win.setFullScreen(true);
     send('core:fullscreen-state', true);
     bounds();
   });
   contents.on('leave-html-full-screen', () => {
-    if (activeId !== id || !win || win.isDestroyed()) return;
-    htmlFullscreen = false;
-    win.setFullScreen(false);
-    setChromeVisible(true);
-    send('core:fullscreen-state', false);
-    bounds();
+    // The event can arrive after another tab has become active; use the owner
+    // recorded on entry rather than the current active tab.
+    if (fullscreenTabId === id) exitHtmlFullscreen();
   });
   contents.on('before-input-event', (_event, input) => {
     if (input.type === 'keyDown' && !htmlFullscreen) { lastActivityAt = Date.now(); setChromeVisible(true); }
@@ -190,7 +200,14 @@ function registerIPC() {
       catch (error) { if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Navigation failed:', error.message); }
     }
   });
-  handle('core:focus', (id, external) => { activeId = id; showExternal = external === true; lastActivityAt = Date.now(); setChromeVisible(true); bounds(); });
+  handle('core:focus', (id, external) => {
+    if (htmlFullscreen && fullscreenTabId !== id) exitHtmlFullscreen();
+    activeId = id;
+    showExternal = external === true;
+    lastActivityAt = Date.now();
+    if (!htmlFullscreen) setChromeVisible(true);
+    bounds();
+  });
   handle('core:close', id => { const view = views.get(id); if (view) { win.contentView.removeChildView(view); view.webContents.close(); views.delete(id); } });
   handle('core:tab-action', (id, action) => {
     const contents = views.get(id)?.webContents;
@@ -233,6 +250,9 @@ function createWindow() {
   });
   win.webContents.on('will-navigate', event => event.preventDefault());
   win.on('resize', bounds);
+  win.on('leave-full-screen', () => {
+    if (htmlFullscreen && fullscreenTabId) exitHtmlFullscreen();
+  });
   win.on('focus', () => { lastActivityAt = Date.now(); if (!htmlFullscreen) setChromeVisible(true); });
   win.on('closed', () => { for (const view of views.values()) if (!view.webContents.isDestroyed()) view.webContents.close(); views.clear(); win = null; });
   win.once('ready-to-show', () => win.show());

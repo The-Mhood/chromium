@@ -9,7 +9,7 @@ const { webContents } = require('electron');
 const { isAllowedDomain, trustedFilterUrl } = require('./security.cjs');
 
 const fallbackRules = {
-  ads: '||doubleclick.net^\n||googlesyndication.com^\n||googleadservices.com^\n||adnxs.com^\n||adsrvr.org^\n##.ad-banner\n##.adsbygoogle\n##[data-ad-slot]',
+  ads: '||doubleclick.net^\n||googlesyndication.com^\n||googleadservices.com^\n||adnxs.com^\n||adsrvr.org^\n||popads.net^\n||popcash.net^\n||propellerads.com^\n||exoclick.com^\n||trafficjunky.net^\n||juicyads.com^\n||adsterra.com^\n##.ad-banner\n##.adsbygoogle\n##[data-ad-slot]',
   trackers: '||google-analytics.com^\n||analytics.google.com^\n||connect.facebook.net^$third-party\n||pixel.facebook.com^\n||scorecardresearch.com^',
   threats: '',
 };
@@ -112,4 +112,4 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
   return { rebuild, applyCosmetics, shouldBlockPopup, forget: id => cssKeys.delete(id) };
 }
 
-module.exports = { createProtectionEngine };
+module.exports = { createProtectionEngine, fallbackRules };

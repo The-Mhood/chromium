@@ -26,3 +26,14 @@ test('Ghostery matches a known ad request and respects exception rules', async (
   assert.equal(engine.match(Request.fromRawDetails({ url: 'https://doubleclick.net/popup', sourceUrl: 'https://example.com', type: 'popup' })).match, true);
   assert.equal(engine.match(request('https://example.com/app.js')).match, false);
 });
+
+test('baseline protection blocks common popunder networks for popups and redirects', async () => {
+  const { FiltersEngine, Request } = await import('@ghostery/adblocker');
+  const { fallbackRules } = require('./protection.cjs');
+  const engine = FiltersEngine.parse(fallbackRules.ads);
+  for (const host of ['popads.net', 'popcash.net', 'propellerads.com', 'exoclick.com', 'trafficjunky.net', 'juicyads.com', 'adsterra.com']) {
+    const url = `https://${host}/click`;
+    assert.equal(engine.match(Request.fromRawDetails({ url, sourceUrl: 'https://publisher.example', type: 'popup' })).match, true, host);
+    assert.equal(engine.match(Request.fromRawDetails({ url, sourceUrl: 'https://publisher.example', type: 'main_frame' })).match, true, host);
+  }
+});
