@@ -46,7 +46,8 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licences
+        run: yes | sdkmanager --licenses
       - run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
       - name: Run Android TV unit tests
         working-directory: android-tv
