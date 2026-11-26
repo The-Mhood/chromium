@@ -283,3 +283,85 @@ tab showing the "BROWSER PREVIEW" card instead of the page):
    **Not verified in this environment**: actual rendering on a real
    display (no Electron binary/display in CI sandbox) — the packaged app
    from `main` is the ground truth for the three fixes.
+
+## 14. Round 3 — default-deny popup re-engineering + fullscreen button (2026-11-26)
+
+### Why the previous protection still let ad tabs through
+Audit of the shipping code found four real holes:
+1. **Degraded allow**: when CDP state was unavailable and no input had been
+   observed, the policy *allowed* the open "so ordinary sites keep working".
+   Ad pages with no user interaction slipped straight through.
+2. **`foreground-tab` was allowed unconditionally**: any `target="_blank"` /
+   link-style open skipped the gesture check, the frame check and any
+   verification. A deceptive ad element with `target="_blank"` opened a tab.
+3. **The destination was never verified before the tab chip appeared**: the
+   renderer received `core:open-tab` at allow time. If the URL then
+   redirected to an ad domain, the unwanted tab was already on screen.
+4. **The opener's frame was unknown**: an ad *iframe* opening a tab on the
+   user's click was indistinguishable from the top page's own link.
+
+### What was re-engineered
+- **`electron/popup-blocker.cjs` (v3, default-deny)**: no degraded mode — an
+  open with no activation evidence (main-process input *and* isolated-world
+  clock) is blocked. `foreground-tab` now requires a fresh gesture too.
+  Cross-origin-iframe opens are blocked outright (`ad-iframe`).
+  `background-tab` is blocked even with a fresh click. Every other allowed
+  open is marked `needsCommit`.
+- **Hidden commit inspector (`electron/main.cjs`)**: an allowed open is
+  navigated in an invisible, zero-size `WebContentsView` that is never
+  painted. Only when its main frame *commits* (after redirects) to a URL
+  that still passes the filter engine **and** the popunder domain-jump rule
+  is the tab published to the renderer. An ad — direct, via redirect, or via
+  a domain jump to an *unlisted* host — is destroyed in the inspector and no
+  chip or window ever appears. A commit that never arrives (6 s) is passed
+  through with a first-navigation popunder watch, so slow legitimate sites
+  keep working.
+- **All creation pathways audited and closed**: `setWindowOpenHandler`
+  (deny, with the policy around it), `did-create-window` (destroy), legacy
+  `new-window` (preventDefault), privileged schemes (deny + log),
+  download-triggered ads (`will-download` cancel on listed domains),
+  notification/permission abuse (already denied by default for the whole
+  browsing session).
+- **Per-frame `window.open` records (`shared/popup-support.js`)**: the
+  isolated-world script now wraps `window.open` in *every* frame and records
+  whether the opener is the top frame or a cross-origin iframe; the main
+  process reads all frames' isolated worlds (bounded, parallel CDP) and
+  classifies on the freshest record.
+- **Instrumentation (§7)**: every decision logs one line to the main
+  console — requesting page, destination, initiating frame, disposition,
+  decision, reason, and whether a browsing context was created
+  (`[popup] {…}`), including the commit stage.
+
+### Fullscreen button (section 10 of the directive)
+- The purple active state now follows the **verified native window state**,
+  not media fullscreen and not the last click (`fullscreenState.window` only;
+  `aria-pressed` added). A dedicated `--accent-purple: #8f6fd0` token drives
+  it (the product's brand accent is orange; no purple existed before).
+- **OS-transition verification**: after every `setFullScreen`, the main
+  process polls `isFullScreen()` for ~2.4 s; on a stuck transition it
+  retries once, then reconciles the state machine (and therefore the button)
+  back to the real window state. `enter/leave-full-screen` events cancel the
+  poll. Initial state is broadcast at `ready-to-show` so the button never
+  lags the window.
+- Repeated toggling, F11, Escape, and media-fullscreen interaction are
+  covered by wiring subtests (see below).
+
+### Automated test results (this environment)
+Staged suite (`npm test --prefix .desktop-build`): **105/105 pass**
+(17 new). Hostile-page wiring scenarios (driven against the *real* main
+process): clicked window.open to a listed ad, `target=_blank` to a listed
+ad, redirect-to-ad, domain-jump popunder to an *unlisted* ad, scroll-fired
+popup, delayed popup, cross-domain chain, background-tab, external protocol
+(`intent:`), no-CDP/no-input (the old degraded hole), cross-origin
+ad-iframe — all produce **no tab, no window, no chip**; a genuine clicked
+link still opens a fully working tab; a repeated-popper loses its first tab
+too.
+
+### What this environment cannot do (stated honestly)
+- No GUI / Electron binary here: the packaged app was **not** click-tested
+  in this sandbox. The hostile suite drives the real main-process code, not
+  mocks, but a human should run the acceptance clicks on the packaged build.
+- Unlisted ad domains that are neither in the filter lists nor caught by a
+  redirect/domain jump cannot be identified client-side (true for any
+  browser); list freshness + the commit inspector + gesture rules are the
+  mitigation. Server-side and in-stream media ads are out of scope.

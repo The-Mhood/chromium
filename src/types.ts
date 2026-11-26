@@ -107,7 +107,7 @@ export interface DesktopBridge {
   onStats: (callback: (stats: NativeStats) => void) => () => void;
   onChromeVisibility: (callback: (visible: boolean) => void) => () => void;
   onFullscreenState: (callback: (state: FullscreenState) => void) => () => void;
-  onPopupBlocked: (callback: (info: { url: string; source: string }) => void) => () => void;
+  onPopupBlocked: (callback: (info: { url: string; source: string; reason?: string }) => void) => () => void;
   onNavigationBlocked: (callback: (info: { id: string; url: string; type: TabIssue['type'] }) => void) => () => void;
   onLoadFailed: (callback: (info: { id: string; url: string }) => void) => () => void;
   onTabClosed: (callback: (info: { id: string }) => void) => () => void;

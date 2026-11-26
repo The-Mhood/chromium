@@ -27,6 +27,7 @@ const { createProtectionEngine } = require('./protection.cjs');
 const { FullscreenController } = require('./fullscreen-state.cjs');
 const { browsingUrl, isAllowedDomain, trustedFilterUrl } = require('./security.cjs');
 const { buildShieldScript } = require('./youtube-shield.cjs');
+const { committedNavigationVerdict } = require('./popup-blocker.cjs');
 
 let win;
 let engine;
@@ -46,11 +47,24 @@ const navigationLocks = new Map();
 // The URL each tab's main frame is currently trying to reach, so a
 // did-fail-load for a sub-resource is never reported as a failed page.
 const lastRequested = new Map();
-const pendingPopupOpens = [];
+// Verified popup opens awaiting the renderer's tab: when core:navigate
+// arrives for that URL, the tab->popup link is recorded (repeat rule) and,
+// for opens that timed out during verification, the first-navigation
+// popunder watch is armed.
+const verifiedPopupOpens = [];
 // Allowed script popup -> the tab that opened for it (filled when that tab's
 // navigation arrives). Used to close the tab of an earlier popup when the
 // same page proves to be a repeat offender.
 const popupTabByOpenUrl = new Map();
+// Hidden commit inspectors: webContents id -> record. An allowed open is
+// navigated here (invisible, zero-size) FIRST; only when its main frame
+// commits to a URL that still passes the filter engine is the tab published
+// to the renderer. An ad (direct, via redirect, or via a domain jump) is
+// destroyed here and the user never sees a chip or a window.
+const inspectors = new Map();
+const COMMIT_TIMEOUT_MS = 6000;
+// A browser context that never commits within this time is handed over as-is
+// (slow legitimate sites must not break); its first navigation stays watched.
 const defaults = {
   protection: { enabled: true, network: true, tracking: true, cosmetic: true, popups: true, youtube: true },
   allowlist: [], filters: [], doNotTrack: true, stats: { ads: 0, trackers: 0, popups: 0, threats: 0, events: [] },
@@ -89,11 +103,19 @@ function recordBlocked(type, url, sourceUrl) {
 }
 
 let lastPopupNoticeAt = 0;
-function noticePopupBlocked(url, sourceUrl) {
+function noticePopupBlocked(url, sourceUrl, reason) {
   const nowMs = Date.now();
   if (nowMs - lastPopupNoticeAt < 5000) return;
   lastPopupNoticeAt = nowMs;
-  send('core:popup-blocked', { url, source: safeHost(sourceUrl || url) });
+  send('core:popup-blocked', { url, source: safeHost(sourceUrl || url), reason: reason || 'protection' });
+}
+
+/** Diagnostic popup log (requirement: proof that blocked attempts never
+ *  become visible tabs or windows). One line per decision: the requesting
+ *  page, the destination, the initiating frame, the mechanism, the decision,
+ *  the reason, and whether a browsing context was actually created. */
+function logPopup(entry) {
+  try { console.log('[popup]', JSON.stringify({ at: new Date().toISOString(), ...entry })); } catch { /* logging must never throw */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,12 +193,45 @@ function syncFullscreenState() {
   send('core:fullscreen-state', payload);
 }
 
+// The OS fullscreen transition is asynchronous and can fail silently (a
+// display that refuses fullscreen, an interrupted transition). The state
+// machine must never drift from the REAL window state — the fullscreen
+// button must show purple only when the window is actually full-screen. So
+// after every setFullScreen we verify, retry once, and if it still does not
+// take, reconcile the state (and therefore the button) back to reality.
+let fullscreenVerifyTimer = null;
+function verifyWindowFullscreen(expected) {
+  clearInterval(fullscreenVerifyTimer);
+  let attempts = 0;
+  let retried = false;
+  fullscreenVerifyTimer = setInterval(() => {
+    if (!win || win.isDestroyed()) { clearInterval(fullscreenVerifyTimer); return; }
+    const actual = win.isFullScreen();
+    if (actual === expected) { clearInterval(fullscreenVerifyTimer); return; }
+    if (++attempts < 12) return; // ~2.4 s of grace for the OS animation
+    clearInterval(fullscreenVerifyTimer);
+    if (!retried) {
+      console.warn('[fullscreen] OS transition did not take; retrying once', { expected, actual });
+      win.setFullScreen(expected);
+      verifyWindowFullscreen(expected);
+      return;
+    }
+    // Still stuck: the window cannot honour the request. Reflect reality so
+    // the button, Escape handling and media fullscreen all agree again.
+    console.warn('[fullscreen] transition stuck; reconciling state to actual', { expected, actual });
+    fsCtl.windowFullscreenChanged(actual);
+    if (fsCtl.userFullscreen !== actual) fsCtl.setUserFullscreen(actual);
+    syncFullscreenState();
+  }, 200);
+}
+
 fsCtl.onEffect(effect => {
   if (!win || win.isDestroyed()) return;
   if (effect.type === 'window-fullscreen' && win.isFullScreen() !== effect.value) {
     // Browser (user) fullscreen only — media never comes through here.
     win.setFullScreen(effect.value);
     settleLayout();
+    verifyWindowFullscreen(effect.value);
   }
   if (effect.type === 'window-maximize') {
     // Window-level media fullscreen: cover the screen with the window
@@ -217,6 +272,7 @@ function destroyTab(id) {
   engine.popupPolicy.forget(contents.id);
   navigationLocks.delete(contents.id);
   lastRequested.delete(contents.id);
+  popunderWatches.delete(contents.id);
   for (const [openUrl, tabId] of popupTabByOpenUrl) if (tabId === id) popupTabByOpenUrl.delete(openUrl);
   win.contentView.removeChildView(view);
   views.delete(id);
@@ -224,24 +280,44 @@ function destroyTab(id) {
   applyLayout();
 }
 
-// The activation clock lives in the isolated "cc-popup" world; the page's own
-// world cannot touch it. A failed read degrades to the main-process input
-// observation (see popup-blocker.classifyWindowOpen).
+// The activation clock and the per-frame window.open records live in the
+// isolated "cc-popup" world; the page's own world cannot touch them. The
+// open is classified as coming from whichever frame recorded the freshest
+// window.open call — that is how an ad *iframe* is distinguished from the
+// top page. A failed read degrades to the main-process input observation
+// (see popup-blocker.classifyWindowOpen), which still requires a real,
+// recent gesture.
+const POPUP_STATE_EXPR = '(function () { var s = window.__ccPopupState; if (!s) return null; return { age: s.t ? Date.now() - s.t : 999999999, open: s.lastOpen && Date.now() - s.lastOpen.t < 3000 ? s.lastOpen : null }; })()';
+
 async function readPagePopupState(contents) {
   const entry = syncQueue.get(contents.id);
   if (!entry || contents.isDestroyed() || !contents.debugger.isAttached()) return null;
   const cdp = contents.debugger;
   try {
     const tree = await withTimeout(cdp.sendCommand('Page.getFrameTree'), 'frame tree', 1500);
-    const frameId = tree.frameTree.frame.id;
-    const context = await withTimeout(cdp.sendCommand('Runtime.getIsolatedContext', { frameId, worldName: POPUP_WORLD }), 'popup context', 1500);
-    const result = await withTimeout(cdp.sendCommand('Runtime.evaluate', {
-      expression: '(function () { var s = window.__ccPopupState; return s ? (s.t ? Date.now() - s.t : 999999999) : null; })()',
-      contextId: context.contextId,
-      returnByValue: true,
-    }), 'popup state', 1500);
-    const age = result && result.result ? result.result.value : null;
-    return typeof age === 'number' ? { ageMs: age } : null;
+    const frameIds = [];
+    (function walk(node, depth) {
+      if (!node || depth > 40 || frameIds.length >= 40) return;
+      if (node.frame && node.frame.id) frameIds.push(node.frame.id);
+      for (const child of node.childFrames || []) walk(child, depth + 1);
+    })(tree.frameTree, 0);
+    if (!frameIds.length) return null;
+    const reads = await withTimeout(Promise.all(frameIds.map(async frameId => {
+      try {
+        const context = await cdp.sendCommand('Runtime.getIsolatedContext', { frameId, worldName: POPUP_WORLD });
+        const result = await cdp.sendCommand('Runtime.evaluate', { expression: POPUP_STATE_EXPR, contextId: context.contextId, returnByValue: true });
+        return (result && result.result && result.result.value) || null;
+      } catch { return null; }
+    })), 'popup state', 2500);
+    let ageMs = null;
+    let open = null;
+    for (const value of reads) {
+      if (!value) continue;
+      if (typeof value.age === 'number' && (ageMs === null || value.age < ageMs)) ageMs = value.age;
+      if (value.open && (!open || value.open.t > open.t)) open = value.open;
+    }
+    if (ageMs === null && !open) return null;
+    return { ageMs: ageMs === null ? 999999999 : ageMs, open };
   } catch {
     return null;
   }
@@ -249,32 +325,165 @@ async function readPagePopupState(contents) {
 
 // The app converts every window.open into a managed tab, so the native
 // window is always denied here; the allow/block decision happens around it.
+// An *allowed* open is not shown yet: it is verified in a hidden inspector
+// first (startCommitVerification), so an ad — directly, via redirect or via
+// a domain jump — can never become a visible tab or window.
 async function handleWindowOpen(details, contents) {
-  let url;
-  try { url = browsingUrl(details.url); } catch { /* privileged schemes never open tabs */ return; }
   if (contents.isDestroyed()) return;
   const sourceUrl = contents.getURL();
+  const disposition = details.disposition || 'default';
+  let url;
+  try {
+    url = browsingUrl(details.url);
+  } catch {
+    // Privileged schemes (javascript:, data:, chrome-extension:, intent:,
+    // mailto:, ...) never open a browsing context in this browser.
+    logPopup({ source: safeHost(sourceUrl), url: details.url, disposition, decision: 'deny', reason: 'scheme', created: false });
+    return;
+  }
+  const pageState = await readPagePopupState(contents);
+  if (contents.isDestroyed()) return;
   const decision = engine.popupPolicy.classifyWindowOpen({
     url,
     sourceUrl,
-    disposition: details.disposition || 'default',
+    disposition,
     tabCount: views.size,
-    pageState: await readPagePopupState(contents),
+    pageState,
     contentsId: contents.id,
   });
+  const frame = pageState && pageState.open ? { isTop: !!pageState.open.isTop, crossOrigin: !!pageState.open.crossOrigin } : null;
   if (!decision.allowed) {
+    logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'deny', reason: decision.reason, created: false });
     recordBlocked('Pop-up', url, sourceUrl);
-    noticePopupBlocked(url, sourceUrl);
+    noticePopupBlocked(url, sourceUrl, decision.reason);
     // Repeat offender: the page already had one popup through, so close the
     // tab it got earlier — the user never asked for either.
     if (decision.earlierUrl) closeEarlierPopupTab(decision.earlierUrl);
     return;
   }
-  if (decision.needsWatch) {
-    pendingPopupOpens.push({ url, sourceUrl, at: Date.now() });
-    if (pendingPopupOpens.length > 50) pendingPopupOpens.splice(0, pendingPopupOpens.length - 50);
+  if (!decision.needsCommit) {
+    logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'allow', reason: decision.reason, created: true });
+    send('core:open-tab', { url, title: safeHost(url) });
+    return;
   }
-  send('core:open-tab', { url, title: safeHost(url) });
+  logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'verify', reason: decision.reason, created: false });
+  startCommitVerification({ url, sourceUrl });
+}
+
+// ---------------------------------------------------------------------------
+// Commit verification: the "no transient advertising UI" core.
+//
+// An allowed open is navigated in a hidden, zero-size WebContentsView that
+// is never painted (not in the tab list, invisible, negative bounds). When
+// its main frame commits — after any redirects — the committed URL is
+// checked against the filter engine and the popunder domain-jump rule:
+//   - passes  -> the inspector is destroyed and ONLY NOW is the tab
+//                published to the renderer (core:open-tab), so a chip for
+//                an ad can never even flash;
+//   - fails   -> the inspector is destroyed and the attempt is recorded.
+//                No tab, no window, no chip, no flash.
+// ---------------------------------------------------------------------------
+
+function startCommitVerification({ url, sourceUrl }) {
+  if (!win || win.isDestroyed()) return;
+  const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
+  const contents = view.webContents;
+  const record = { url, sourceUrl, view, openedAt: Date.now(), committed: false, settled: false, timer: null };
+  inspectors.set(contents.id, record);
+  view.setVisible(false); // never painted, ever
+  view.setBounds({ x: -1, y: -1, width: 0, height: 0 });
+  win.contentView.addChildView(view);
+
+  contents.setWindowOpenHandler(details => {
+    // An ad that escapes the inspector via its own window.open dies here.
+    logPopup({ source: safeHost(url), url: details.url, disposition: details.disposition || 'default', decision: 'deny', reason: 'inspector-escape', created: false });
+    return { action: 'deny' };
+  });
+  contents.on('will-navigate', (event, navUrl) => {
+    // JS-driven navigation inside the inspector (location.replace & co.).
+    try {
+      browsingUrl(navUrl);
+    } catch {
+      event.preventDefault();
+      resolveInspector(contents, { block: true, type: 'Threat', reason: 'scheme', url: navUrl });
+      return;
+    }
+    const hit = engine.matchMainFrame(navUrl, sourceUrl);
+    if (hit) { event.preventDefault(); resolveInspector(contents, { block: true, type: hit, reason: 'listed-redirect', url: navUrl }); return; }
+  });
+  contents.on('did-commit-navigation', () => {
+    if (record.settled || record.committed) return;
+    record.committed = true;
+    const finalUrl = contents.getURL();
+    const hit = engine.matchMainFrame(finalUrl, sourceUrl);
+    const verdict = committedNavigationVerdict({
+      intendedUrl: record.url,
+      openerUrl: record.sourceUrl,
+      finalUrl,
+      matchRequest: (u, s, _type, group) => (group === 'threats' ? engine.matchMainFrame(u, s, 'threats') : engine.matchMainFrame(u, s)) !== null,
+      nowMs: Date.now(),
+      createdAt: record.openedAt,
+    });
+    if (hit) resolveInspector(contents, { block: true, type: hit, reason: 'listed-destination', url: finalUrl });
+    else if (verdict.block) resolveInspector(contents, { block: true, type: verdict.type, reason: verdict.reason, url: finalUrl });
+    else resolveInspector(contents, { block: false, url: finalUrl });
+  });
+  contents.on('did-fail-load', (_event, code) => {
+    if (record.settled) return;
+    if (code === -3) {
+      // ERR_ABORTED: the request pipeline cancelled the main frame (listed
+      // ad host). The engine already recorded it; destroy without another
+      // record.
+      resolveInspector(contents, { block: true, type: 'Ad', reason: 'listed-destination', url: contents.getURL() || record.url, noRecord: true });
+    } else {
+      // A genuine load failure (DNS, offline, refused): hand the open over
+      // as-is — the tab shows the usual friendly "could not load" state.
+      resolveInspector(contents, { block: false, url: record.url });
+    }
+  });
+  contents.on('destroyed', () => {
+    if (record.settled) return;
+    // Torn down externally (window closed, session reset): settle quietly.
+    record.settled = true;
+    if (record.timer) clearTimeout(record.timer);
+    inspectors.delete(contents.id);
+  });
+
+  record.timer = setTimeout(() => {
+    if (!inspectors.has(contents.id)) return;
+    // Verification never finished (stalled ad server or very slow site):
+    // pass it through so ordinary sites keep working; its first navigation
+    // stays watched as a popunder fallback.
+    resolveInspector(contents, { block: false, url: record.url, reason: 'commit-timeout', watch: true });
+  }, COMMIT_TIMEOUT_MS);
+
+  contents.loadURL(url).catch(() => {}); // the did-fail-load path settles it
+}
+
+function resolveInspector(contents, outcome) {
+  const record = inspectors.get(contents.id);
+  if (!record || record.settled) return;
+  record.settled = true;
+  if (record.timer) clearTimeout(record.timer);
+  if (outcome.block) {
+    logPopup({ source: safeHost(record.sourceUrl), url: outcome.url || record.url, decision: 'deny', reason: outcome.reason, created: false, stage: 'commit' });
+    if (!outcome.noRecord) recordBlocked(outcome.type || 'Pop-up', outcome.url || record.url, record.sourceUrl);
+    noticePopupBlocked(outcome.url || record.url, record.sourceUrl, outcome.reason);
+  } else {
+    logPopup({ source: safeHost(record.sourceUrl), url: outcome.url, decision: 'allow', reason: outcome.reason || 'verified', created: true, stage: 'commit' });
+    // The renderer will create the tab for this URL; when its navigation
+    // arrives we learn the tab id (repeat rule + optional popunder watch).
+    verifiedPopupOpens.push({ url: outcome.url, sourceUrl: record.sourceUrl, at: Date.now(), watch: outcome.watch === true });
+    if (verifiedPopupOpens.length > 50) verifiedPopupOpens.splice(0, verifiedPopupOpens.length - 50);
+    send('core:open-tab', { url: outcome.url, title: safeHost(outcome.url) });
+  }
+  destroyInspector(contents, record);
+}
+
+function destroyInspector(contents, record) {
+  try { if (win && !win.isDestroyed() && record && record.view && win.contentView.children.includes(record.view)) win.contentView.removeChildView(record.view); } catch { /* already gone */ }
+  try { contents.close(); } catch { /* already closing */ }
+  inspectors.delete(contents.id);
 }
 
 // Close the tab that a previously-allowed popup created, so a repeat-popup
@@ -288,12 +497,26 @@ function closeEarlierPopupTab(openUrl) {
   send('core:tab-closed', { id });
 }
 
-// First-navigation inspection for allowed script-opened tabs (popunders).
+// First-navigation inspection for script-opened tabs whose commit
+// verification could not finish in time (popunder fallback watch).
+const popunderWatches = new Map(); // contents id -> { intendedUrl, sourceUrl, createdAt }
+
 function checkPopunderNavigation(contents, url, tabId) {
-  const verdict = engine.popupPolicy.checkFirstNavigation(contents.id, url);
+  const watch = popunderWatches.get(contents.id);
+  if (!watch) return false;
+  popunderWatches.delete(contents.id);
+  const verdict = committedNavigationVerdict({
+    intendedUrl: watch.intendedUrl,
+    openerUrl: watch.sourceUrl,
+    finalUrl: url,
+    matchRequest: (u, s, _type, group) => (group === 'threats' ? engine.matchMainFrame(u, s, 'threats') : engine.matchMainFrame(u, s)) !== null,
+    nowMs: Date.now(),
+    createdAt: watch.createdAt,
+  });
   if (!verdict.block) return false;
   recordBlocked(verdict.type || 'Pop-up', url, contents.getURL());
-  noticePopupBlocked(url, contents.getURL());
+  noticePopupBlocked(url, contents.getURL(), verdict.reason);
+  logPopup({ source: safeHost(watch.sourceUrl), url, decision: 'deny', reason: verdict.reason, created: true, stage: 'first-navigation' });
   setTimeout(() => destroyTab(tabId), 50);
   return true;
 }
@@ -316,6 +539,14 @@ function makeTab(id) {
     handleWindowOpen(details, contents).catch(console.warn);
     return { action: 'deny' };
   });
+  // Defence in depth: if a browsing context ever materialises through a
+  // pathway the handler does not cover (legacy new-window, a race), it is
+  // destroyed before it can be shown.
+  contents.on('did-create-window', (createdWindow) => {
+    logPopup({ source: safeHost(contents.getURL()), url: createdWindow.webContents.getURL(), decision: 'deny', reason: 'did-create-window', created: false });
+    try { createdWindow.close(); } catch { /* already gone */ }
+  });
+  contents.on('new-window', (event) => { event.preventDefault(); });
 
   contents.on('will-navigate', (event, url) => {
     try { browsingUrl(url); } catch { event.preventDefault(); return; }
@@ -385,6 +616,7 @@ function makeTab(id) {
     syncQueue.delete(contents.id);
     navigationLocks.delete(contents.id);
     lastRequested.delete(contents.id);
+    popunderWatches.delete(contents.id);
   });
 
   syncPageScripts(contents);
@@ -478,11 +710,13 @@ function registerIPC() {
     if (typeof id !== 'string' || id.length > 100) throw new Error('Invalid tab');
     const url = browsingUrl(input);
     const view = views.get(id) || makeTab(id);
-    // Arm the popunder watch for tabs that a script just opened.
-    const pending = pendingPopupOpens.find(item => item.url === url && Date.now() - item.at < 10000);
+    // Remember which tab a verified popup became (repeat rule: the earlier
+    // popup's tab is closed when its page repeats), and arm the popunder
+    // fallback watch for tabs whose commit verification timed out.
+    const pending = verifiedPopupOpens.find(item => item.url === url && Date.now() - item.at < 10000);
     if (pending) {
-      pendingPopupOpens.splice(pendingPopupOpens.indexOf(pending), 1);
-      engine.popupPolicy.registerPopup(view.webContents.id, pending);
+      verifiedPopupOpens.splice(verifiedPopupOpens.indexOf(pending), 1);
+      if (pending.watch) popunderWatches.set(view.webContents.id, { intendedUrl: pending.url, sourceUrl: pending.sourceUrl, createdAt: pending.at });
       popupTabByOpenUrl.set(url, id);
     }
     // Make sure the document-start scripts are in place before the page loads.
@@ -565,12 +799,25 @@ function registerIPC() {
 
 function createWindow() {
   win = new BrowserWindow({ width: 1440, height: 1000, minWidth: 850, minHeight: 620, frame: false, show: false, backgroundColor: '#f8f9fb', title: 'ChromiumCore', icon: path.join(__dirname, '../assets/icon.png'), webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
+  // The application renderer is first-party UI (the New Tab quick links,
+  // bookmarks): its opens are user actions on our own surface and are
+  // published directly. Privileged schemes still never leave it.
   win.webContents.setWindowOpenHandler(details => {
-    try { const url = browsingUrl(details.url); send('core:open-tab', { url, title: new URL(url).hostname }); }
-    catch { /* Privileged schemes never leave the application renderer. */ }
+    try {
+      const url = browsingUrl(details.url);
+      logPopup({ source: 'app-ui', url, disposition: details.disposition || 'default', decision: 'allow', reason: 'app-ui', created: true });
+      send('core:open-tab', { url, title: new URL(url).hostname });
+    } catch {
+      logPopup({ source: 'app-ui', url: details.url, decision: 'deny', reason: 'scheme', created: false });
+    }
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', event => event.preventDefault());
+  win.webContents.on('did-create-window', (createdWindow) => {
+    logPopup({ source: 'app-ui', url: createdWindow.webContents.getURL(), decision: 'deny', reason: 'did-create-window', created: false });
+    try { createdWindow.close(); } catch { /* already gone */ }
+  });
+  win.webContents.on('new-window', (event) => { event.preventDefault(); });
   win.webContents.on('before-input-event', (_event, input) => {
     if (input.type === 'keyDown' || input.type === 'char' || input.type === 'mouseDown' || input.type === 'mouseWheel') fsCtl.activity();
     if (input.type === 'keyDown') {
@@ -579,13 +826,16 @@ function createWindow() {
     }
   });
   win.on('resize', () => { applyLayout(); measureChromeHeight(); });
-  win.on('enter-full-screen', () => { fsCtl.windowFullscreenChanged(true); settleLayout(); });
-  win.on('leave-full-screen', () => { fsCtl.windowFullscreenChanged(false); settleLayout(); });
+  win.on('enter-full-screen', () => { clearInterval(fullscreenVerifyTimer); fsCtl.windowFullscreenChanged(true); settleLayout(); });
+  win.on('leave-full-screen', () => { clearInterval(fullscreenVerifyTimer); fsCtl.windowFullscreenChanged(false); settleLayout(); });
   win.on('focus', () => fsCtl.focusWindow());
   win.on('blur', () => fsCtl.blurWindow());
   win.on('closed', () => {
     for (const view of views.values()) if (!view.webContents.isDestroyed()) { try { view.webContents.close(); } catch { /* ignore */ } }
     views.clear();
+    for (const record of inspectors.values()) { if (record.timer) clearTimeout(record.timer); try { record.view.webContents.close(); } catch { /* ignore */ } }
+    inspectors.clear();
+    clearInterval(fullscreenVerifyTimer);
     fsCtl.activeTabId = null;
     fsCtl.userFullscreen = false;
     fsCtl.mediaTabId = null;
@@ -600,6 +850,10 @@ function createWindow() {
     fsCtl.resize(width, height);
     applyLayout();
     measureChromeHeight();
+    // The renderer starts at {media:false, window:false}; tell it the real
+    // state immediately so the fullscreen button never lags the window.
+    lastFullscreenPayload = null;
+    syncFullscreenState();
   });
   win.webContents.on('did-finish-load', measureChromeHeight);
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
@@ -637,7 +891,21 @@ app.whenReady().then(() => {
     else delete requestHeaders.DNT;
     callback({ requestHeaders });
   });
-  browsingSession.on('will-download', (_event, item) => item.setSaveDialogOptions({ title: 'Save your download', defaultPath: path.join(app.getPath('downloads'), path.basename(item.getFilename())) }));
+  browsingSession.on('will-download', (event, item) => {
+    try {
+      const url = item.getURL();
+      const hit = engine.matchMainFrame(url, '');
+      if (hit) {
+        // Adware pattern: an "download" that is actually an ad/threat domain.
+        const source = event && event.sender && !event.sender.isDestroyed() ? event.sender.getURL() : '';
+        recordBlocked(hit, url, source || url);
+        logPopup({ source: source || 'unknown', url, decision: 'deny', reason: 'listed-download', created: false });
+        if (typeof item.cancel === 'function') item.cancel(); else event.preventDefault();
+        return;
+      }
+    } catch { /* fall through: a broken check must not eat real downloads */ }
+    item.setSaveDialogOptions({ title: 'Save your download', defaultPath: path.join(app.getPath('downloads'), path.basename(item.getFilename())) });
+  });
   engine = createProtectionEngine({
     browsingSession,
     cacheDir: path.join(app.getPath('userData'), 'filters'),
@@ -647,6 +915,9 @@ app.whenReady().then(() => {
       // The page will never load — tell the renderer so the tab shows why
       // instead of sitting on a placeholder that reads like a prompt.
       for (const [id, view] of views) if (view.webContents.id === webContentsId) { send('core:navigation-blocked', { id, url, type }); break; }
+      // A commit inspector's main frame was cancelled: the open dies here,
+      // before any chip exists — surface it as a blocked popup.
+      if (inspectors.has(webContentsId)) noticePopupBlocked(url, inspectors.get(webContentsId).sourceUrl, 'listed-destination');
     },
   });
   // The bundled baseline is already active; this upgrades it to the full
@@ -667,6 +938,6 @@ app.whenReady().then(() => {
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => {
-  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer); clearInterval(settleTimer);
+  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer); clearInterval(settleTimer); clearInterval(fullscreenVerifyTimer);
   if (storePath) { try { fs.writeFileSync(storePath, JSON.stringify(state)); } catch (error) { console.warn('Could not save workspace:', error.message); } }
 });

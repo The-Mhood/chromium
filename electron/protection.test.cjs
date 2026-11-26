@@ -135,11 +135,21 @@ test('the popup policy is wired to the same engines', () => {
   });
   assert.equal(listed.allowed, false);
   assert.equal(listed.reason, 'listed-destination');
+  // Default deny: the same clean URL with NO observed gesture is blocked...
+  const unobserved = policy.classifyWindowOpen({
+    url: 'https://docs.example.com/new', sourceUrl: 'https://example.com/page',
+    disposition: 'foreground-tab', tabCount: 1, pageState: null, contentsId: 98,
+  });
+  assert.equal(unobserved.allowed, false);
+  assert.equal(unobserved.reason, 'no-gesture');
+  // ...and a real click right before it is allowed (then commit-verified).
+  policy.observeInput(98, 'mouseDown');
   const clean = policy.classifyWindowOpen({
     url: 'https://docs.example.com/new', sourceUrl: 'https://example.com/page',
     disposition: 'foreground-tab', tabCount: 1, pageState: null, contentsId: 98,
   });
   assert.equal(clean.allowed, true);
+  assert.equal(clean.needsCommit, true);
 });
 
 test('refresh persists the engine to the cache and a new core loads from it without fetching', async () => {

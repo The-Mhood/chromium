@@ -37,6 +37,11 @@ const calls = {
   permissions: null,
 };
 
+// Controllable CDP view of the page's isolated popup world. Off by default:
+// most hostile scenarios test the degraded path (no CDP, no page report),
+// which is exactly where the real app used to fail.
+const cdpStub = { pageStateEnabled: false, stateValue: null };
+
 const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chromiumcore-wiring-'));
 
 function makeWebContents(id) {
@@ -64,10 +69,19 @@ function makeWebContents(id) {
     on: (event, fn) => { listeners.set(event, [...(listeners.get(event) || []), fn]); },
     emit: (event, ...args) => { for (const fn of listeners.get(event) || []) fn(...args); },
     debugger: {
-      isAttached: () => false,
+      // attach() still throws (the document-start script path stays
+      // degraded); the test toggles the READ side to feed realistic
+      // isolated-world state ({ age, open }) to readPagePopupState.
+      isAttached: () => cdpStub.pageStateEnabled,
       attach: () => { throw new Error('CDP unavailable in wiring smoke (degraded path)'); },
       on: () => {},
-      sendCommand: () => Promise.reject(new Error('no CDP')),
+      sendCommand: (method) => {
+        if (!cdpStub.pageStateEnabled) return Promise.reject(new Error('no CDP'));
+        if (method === 'Page.getFrameTree') return Promise.resolve({ frameTree: { frame: { id: 'frame-0' }, childFrames: [] } });
+        if (method === 'Runtime.getIsolatedContext') return Promise.resolve({ contextId: 1 });
+        if (method === 'Runtime.evaluate') return Promise.resolve({ result: { value: cdpStub.stateValue } });
+        return Promise.reject(new Error('no CDP: ' + method));
+      },
     },
     navigationHistory: {
       canGoBack: () => false,
@@ -250,16 +264,19 @@ test('main process wiring (Electron stub)', async t => {
     assert.equal(notices.at(-1).payload.source, 'example.com');
   });
 
-  await t.test('an unlisted destination opens a tab (degraded mode never breaks sites)', async () => {
+  await t.test('an unlisted destination without any input is blocked (default deny)', async () => {
     const view = winStub().contentView.__views[0];
-    // No CDP in this smoke: the page cannot report activation and no input
-    // event was observed, so the policy runs in degraded mode — it allows the
-    // open (never breaking ordinary sites) and arms the popunder watch.
+    // No CDP in this smoke and no input event was observed on this page.
+    // The old "degraded mode" allowed such opens and watched them after the
+    // fact; that is how ad tabs slipped through. Default deny: a page the
+    // user never touched gets no browsing context. (With a real click, the
+    // open is verified in a hidden inspector — see the hostile suite below.)
+    const viewsBefore = winStub().contentView.__views.length;
     view.webContents.__openHandler({ url: 'https://docs.example.com/new', disposition: 'default' });
     await new Promise(resolve => setTimeout(resolve, 300));
     const opens = calls.sends.filter(s => s.channel === 'core:open-tab');
-    assert.ok(opens.some(s => s.payload.url === 'https://docs.example.com/new'), 'the tab open was published to the renderer');
-    assert.equal(winStub().contentView.__views.length, 1, 'the main process does not create the view itself');
+    assert.ok(!opens.some(s => s.payload.url === 'https://docs.example.com/new'), 'no unobserved open is published');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
   });
 
   await t.test('switching tabs re-bounds the visible view even without a window resize', async () => {
@@ -365,40 +382,293 @@ test('main process wiring (Electron stub)', async t => {
     await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-3');
   });
 
+  // Shared helpers for the hostile-page scenarios below. The layout keeps
+  // the ACTIVE tab view as the last child (z-order), so views are identified
+  // by exclusion — the inspector is the one view the test did not create.
+  const clickOn = wc => wc.emit('before-input-event', {}, { type: 'mouseDown' });
+  const settle = () => new Promise(resolve => setTimeout(resolve, 300)); // handleWindowOpen is async
+  const openPublished = url => calls.sends.some(s => s.channel === 'core:open-tab' && s.payload.url === url);
+  const freshTab = async (tabId, url) => {
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), tabId, true);
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), tabId, url);
+    const view = winStub().contentView.__views.at(-1); // makeTab just added it
+    return { view, known: new Set([view]) };
+  };
+  const findInspector = known => winStub().contentView.__views.find(v => !known.has(v));
+  const closeTabs = async (...ids) => { for (const id of ids) await calls.ipcHandles.get('core:close')(fakeEvent(), id); };
+
+  // The vivarium-style burst: a page that fires one popup per click. The
+  // first popup is verified in the hidden inspector (the user did click);
+  // the second is a repeat offender and takes the first tab down with it.
   await t.test('a page firing repeated popups loses its first tab too', async () => {
-    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-9', true);
-    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-9', 'https://burst-source.example.com/');
-    const source = winStub().contentView.__views[0];
-    // First script popup (no CDP, no observed input -> degraded allow).
+    const { view: source, known } = await freshTab('tab-9', 'https://burst-source.example.com/');
+    const beforeViews = winStub().contentView.__views.length;
+    // First script popup, right after a real click.
+    clickOn(source.webContents);
     source.webContents.__openHandler({ url: 'https://first-popup.example.com/', disposition: 'default' });
-    await new Promise(resolve => setTimeout(resolve, 300)); // handleWindowOpen is async
-    let opens = calls.sends.filter(s => s.channel === 'core:open-tab');
-    assert.ok(opens.some(s => s.payload.url === 'https://first-popup.example.com/'), 'the first popup tab was published');
+    await settle();
+    assert.ok(!openPublished('https://first-popup.example.com/'), 'no chip before the destination is verified');
+    assert.equal(winStub().contentView.__views.length, beforeViews + 1, 'a hidden inspector appeared');
+    const inspector = findInspector(known);
+    assert.ok(inspector, 'the extra view is the inspector');
+    assert.equal(inspector.__visible, false, 'the inspector is never visible');
+    // The inspector commits to the URL it was given (no redirect): pass.
+    inspector.webContents.emit('did-commit-navigation');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(openPublished('https://first-popup.example.com/'), 'the verified popup tab was published');
+    assert.equal(winStub().contentView.__views.length, beforeViews, 'the inspector was destroyed');
     // The renderer opens that tab; the main process learns the tab->popup link.
-    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'tab-p1', true);
-    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'tab-p1', 'https://first-popup.example.com/');
-    assert.equal(winStub().contentView.__views.length, 2, 'the popup tab has a view');
+    const popup = await freshTab('tab-p1', 'https://first-popup.example.com/');
+    known.add(popup.view);
+    assert.equal(winStub().contentView.__views.length, beforeViews + 1, 'the popup tab has a view');
     // The page fires a second popup shortly after (fresh click, new tab).
+    clickOn(source.webContents);
     source.webContents.__openHandler({ url: 'https://second-popup.example.com/', disposition: 'default' });
-    await new Promise(resolve => setTimeout(resolve, 300));
-    opens = calls.sends.filter(s => s.channel === 'core:open-tab');
-    assert.ok(!opens.some(s => s.payload.url === 'https://second-popup.example.com/'), 'the second popup tab was not created');
+    await settle();
+    assert.ok(!openPublished('https://second-popup.example.com/'), 'the second popup tab was not created');
+    assert.equal(findInspector(known), undefined, 'no inspector for the blocked open');
     const closed = calls.sends.filter(s => s.channel === 'core:tab-closed');
     assert.equal(closed.length, 1, 'the renderer was told the first popup tab was closed');
     assert.equal(closed.at(-1).payload.id, 'tab-p1');
-    assert.equal(winStub().contentView.__views.length, 1, 'only the source tab remains');
-    await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-9');
+    assert.equal(winStub().contentView.__views.length, beforeViews, 'only the source tab remains');
+    await closeTabs('tab-9');
+  });
+
+  // -----------------------------------------------------------------------
+  // Hostile-page regression suite: the exact failure modes reported in the
+  // field, driven against the real main process. "No advertising tab" means:
+  // no core:open-tab is ever published for it AND no visible view is created.
+  // -----------------------------------------------------------------------
+
+  await t.test('hostile: a clicked window.open to a listed ad domain opens nothing', async () => {
+    const { view: page, known } = await freshTab('h-1', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents); // a real click on the deceptive icon
+    page.webContents.__openHandler({ url: 'https://pagead2.googlesyndication.com/pagead/landing', disposition: 'default' });
+    await settle();
+    assert.ok(!openPublished('https://pagead2.googlesyndication.com/pagead/landing'), 'no ad tab was published');
+    assert.equal(findInspector(known), undefined, 'no view (tab or inspector) was created');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'view count unchanged');
+    await closeTabs('h-1');
+  });
+
+  await t.test('hostile: a target=_blank link to a listed ad domain opens nothing', async () => {
+    const { view: page, known } = await freshTab('h-2', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url: 'https://pagead2.googlesyndication.com/clk', disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(!openPublished('https://pagead2.googlesyndication.com/clk'), 'no ad tab was published');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'no view was created');
+    await closeTabs('h-2');
+  });
+
+  await t.test('hostile: a popup that redirects to an ad domain dies in the inspector', async () => {
+    const { view: page, known } = await freshTab('h-3', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents);
+    // The first URL looks innocent; the server 302s to the ad network.
+    page.webContents.__openHandler({ url: 'https://offers.example.com/claim', disposition: 'default' });
+    await settle();
+    const inspector = findInspector(known);
+    assert.ok(inspector, 'an inspector appeared');
+    assert.equal(winStub().contentView.__views.length, viewsBefore + 1, 'exactly one extra view');
+    assert.equal(inspector.__visible, false, 'the inspector is invisible');
+    // The redirect lands on a listed ad host.
+    inspector.webContents.__url = 'https://pagead2.googlesyndication.com/redirect/land';
+    inspector.webContents.emit('did-commit-navigation');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(!openPublished('https://offers.example.com/claim'), 'no chip for the ad, not even briefly');
+    assert.ok(!openPublished('https://pagead2.googlesyndication.com/redirect/land'), 'no chip for the ad destination');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'the inspector was destroyed');
+    await closeTabs('h-3');
+  });
+
+  await t.test('hostile: a popup that jumps domains (popunder scheme) dies in the inspector', async () => {
+    const { view: page, known } = await freshTab('h-4', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents);
+    // window.open('') style: starts on the opener's own domain...
+    page.webContents.__openHandler({ url: 'https://victim.example.com/', disposition: 'default' });
+    await settle();
+    const inspector = findInspector(known);
+    assert.ok(inspector, 'an inspector appeared');
+    // ...then the script points it at an unlisted ad domain on a DIFFERENT
+    // registrable domain (a blocklist alone cannot name this one — the
+    // domain-jump rule must catch it).
+    inspector.webContents.__url = 'https://jump-elsewhere.test/ad?ref=victim';
+    inspector.webContents.emit('did-commit-navigation');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(!openPublished('https://jump-elsewhere.test/ad?ref=victim'), 'the domain jump was blocked');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'the inspector was destroyed');
+    await closeTabs('h-4');
+  });
+
+  await t.test('hostile: scrolling while popup scripts run opens nothing', async () => {
+    const { view: page, known } = await freshTab('h-5', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    page.webContents.emit('before-input-event', {}, { type: 'mouseWheel' }); // scroll, not a click
+    page.webContents.__openHandler({ url: 'https://scroll-popup.example.com/', disposition: 'default' });
+    await settle();
+    assert.ok(!openPublished('https://scroll-popup.example.com/'), 'scroll-firing popups are blocked');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+    await closeTabs('h-5');
+  });
+
+  await t.test('hostile: a delayed popup (long after the click) opens nothing', async () => {
+    const { view: page, known } = await freshTab('h-6', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents);
+    await new Promise(resolve => setTimeout(resolve, 1700)); // the timer fires 1.7 s later
+    page.webContents.__openHandler({ url: 'https://delayed-popup.example.com/', disposition: 'default' });
+    await settle();
+    assert.ok(!openPublished('https://delayed-popup.example.com/'), 'the stale gesture did not count');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+    await closeTabs('h-6');
+  });
+
+  await t.test('hostile: a cross-domain popup chain stops after the first hop', async () => {
+    const { view: source, known } = await freshTab('h-7', 'https://chain-source.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    // Hop 1: the user clicks; the first popup verifies and opens.
+    clickOn(source.webContents);
+    source.webContents.__openHandler({ url: 'https://chain-hop.example.com/', disposition: 'default' });
+    await settle();
+    const inspector = findInspector(known);
+    assert.ok(inspector, 'an inspector appeared for the first hop');
+    inspector.webContents.emit('did-commit-navigation');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(openPublished('https://chain-hop.example.com/'), 'the first hop opened');
+    const hop = await freshTab('tab-h7', 'https://chain-hop.example.com/');
+    known.add(hop.view);
+    // Hop 2: the hop page fires its own popup. The user never interacted
+    // with the hop page — no gesture, no CDP report — so it dies.
+    hop.view.webContents.__openHandler({ url: 'https://chain-hop2.example.com/', disposition: 'default' });
+    await settle();
+    assert.ok(!openPublished('https://chain-hop2.example.com/'), 'the chain was cut at the second hop');
+    assert.equal(winStub().contentView.__views.length, viewsBefore + 1, 'only source + first hop exist');
+    await closeTabs('h-7', 'tab-h7');
+  });
+
+  await t.test('hostile: a hidden background window is never created', async () => {
+    const { view: page, known } = await freshTab('h-8', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents); // even a fresh click
+    page.webContents.__openHandler({ url: 'https://background-ad.example.com/', disposition: 'background-tab' });
+    await settle();
+    assert.ok(!openPublished('https://background-ad.example.com/'), 'background opens are blocked outright');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'no context was created');
+    await closeTabs('h-8');
+  });
+
+  await t.test('hostile: an external-protocol ad attempt opens nothing', async () => {
+    const { view: page, known } = await freshTab('h-9', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url: 'intent://install?item=ad#Intent;action=ad;end', disposition: 'default' });
+    await settle();
+    assert.ok(!openPublished('intent://install?item=ad#Intent;action=ad;end'), 'privileged schemes never open a context');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+    await closeTabs('h-9');
+  });
+
+  await t.test('hostile: without CDP and without any input, an open is blocked (no degraded mode)', async () => {
+    const { view: page, known } = await freshTab('h-10', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    // No click, no scroll, no CDP read: the old "degraded allow" let this
+    // straight through. It must not.
+    page.webContents.__openHandler({ url: 'https://silent-popup.example.com/', disposition: 'default' });
+    await settle();
+    assert.ok(!openPublished('https://silent-popup.example.com/'), 'unobserved opens are denied by default');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+    await closeTabs('h-10');
+  });
+
+  await t.test('hostile: an open from a cross-origin ad iframe is blocked even on a fresh click', async () => {
+    const { view: page, known } = await freshTab('h-11', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    cdpStub.pageStateEnabled = true;
+    try {
+      cdpStub.stateValue = { age: 50, open: { isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com', t: Date.now() } };
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://ad-landing.example.com/', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!openPublished('https://ad-landing.example.com/'), 'the ad-iframe open was blocked');
+      assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+    } finally {
+      cdpStub.pageStateEnabled = false;
+      cdpStub.stateValue = null;
+    }
+    await closeTabs('h-11');
+  });
+
+  await t.test('legitimate: a clicked link to an honest site still opens a working tab', async () => {
+    const { view: page, known } = await freshTab('h-12', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url: 'https://docs.example.com/guide', disposition: 'foreground-tab' });
+    await settle();
+    const inspector = findInspector(known);
+    assert.ok(inspector, 'an inspector appeared');
+    assert.equal(inspector.__visible, false, 'verification stays invisible');
+    // The destination holds: no redirect, no jump.
+    inspector.webContents.emit('did-commit-navigation');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate link was published');
+    // The renderer opens it; the tab is a real, visible, navigated tab.
+    const tab = await freshTab('tab-h12', 'https://docs.example.com/guide');
+    known.add(tab.view);
+    assert.equal(winStub().contentView.__views.length, viewsBefore + 1, 'exactly one new view');
+    assert.equal(tab.view.__visible, true, 'the tab view is on screen');
+    assert.equal(tab.view.webContents.__url, 'https://docs.example.com/guide', 'the page was loaded');
+    assert.deepEqual(tab.view.__bounds, { x: 0, y: 96, width: 1440, height: 904 }, 'the tab is laid out below the chrome');
+    await closeTabs('h-12', 'tab-h12');
+    await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-h12');
   });
 
   await t.test('the window control and F11 toggle true browser fullscreen', async () => {
     calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
     assert.equal(winStub().__fullscreen, true, 'the OS window entered fullscreen');
-    const state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
-    assert.deepEqual(state.payload, { media: false, window: true });
+    let state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(state.payload, { media: false, window: true }, 'the button state follows the window');
+
+    // The button must work repeatedly: enter, exit, enter — no stuck state.
+    for (let round = 0; round < 2; round += 1) {
+      calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
+      assert.equal(winStub().__fullscreen, false, `round ${round}: exited`);
+      state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+      assert.deepEqual(state.payload, { media: false, window: false }, `round ${round}: icon back to inactive`);
+      calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
+      assert.equal(winStub().__fullscreen, true, `round ${round}: re-entered`);
+      state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+      assert.deepEqual(state.payload, { media: false, window: true }, `round ${round}: icon purple again`);
+    }
 
     // F11 from the app renderer exits again.
     winStub().webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'F11' });
     assert.equal(winStub().__fullscreen, false, 'F11 exited browser fullscreen');
+
+    // Escape exits while the app renderer has focus (address bar, etc.).
+    calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
+    assert.equal(winStub().__fullscreen, true, 'entered fullscreen again');
+    winStub().webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'Escape' });
+    assert.equal(winStub().__fullscreen, false, 'Escape exited browser fullscreen');
+    state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(state.payload, { media: false, window: false }, 'the icon left the active state');
+  });
+
+  await t.test('media fullscreen never flips the browser-fullscreen button state', async () => {
+    await calls.ipcHandles.get('core:focus')(fakeEvent(), 'fs-tab', true);
+    await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'fs-tab', 'https://video.example.com/');
+    const view = winStub().contentView.__views[0];
+    view.webContents.emit('enter-html-full-screen');
+    const duringMedia = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(duringMedia.payload, { media: true, window: false }, 'media is maximise, not OS fullscreen');
+    view.webContents.emit('leave-html-full-screen');
+    const afterMedia = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(afterMedia.payload, { media: false, window: false }, 'state fully restored after media exit');
+    assert.equal(winStub().__fullscreen, false, 'no OS transition leaked into or out of media fullscreen');
+    await calls.ipcHandles.get('core:close')(fakeEvent(), 'fs-tab');
   });
 
   await t.test('quitting persists the workspace atomically', () => {
