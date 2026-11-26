@@ -365,3 +365,55 @@ too.
   redirect/domain jump cannot be identified client-side (true for any
   browser); list freshness + the commit inspector + gesture rules are the
   mitigation. Server-side and in-stream media ads are out of scope.
+
+## 15. Round 4 — the real-runtime ad-iframe click hole + silver marker (2026-11-26)
+
+### Why the real app "didn't change"
+The round-3 frame attribution recorded only **`window.open`** calls per
+frame. A `target="_blank"` anchor click does **not** call `window.open` —
+the browser opens the new tab directly. So when the user clicked a
+"sponsored" element inside a cross-origin ad iframe, the main process saw
+*exactly* the evidence it was designed to trust: a fresh, real click, no
+script-popup record, destination not in any list — and it (correctly, by
+its own rules) let the tab through. The unit and wiring tests never
+covered that path because the test fixtures modelled the ad as a scripted
+`window.open`.
+
+### The fix
+- `shared/popup-support.js` (isolated world, every frame) now also records
+  the most recent **click** per frame — capture phase, before the page's
+  own handlers — with the frame's origin, its cross-origin flag, and the
+  href of the anchor the click landed on (shadow-DOM piercing via
+  `composedPath`).
+- `popup-blocker.cjs` v3.1 attributes every open to its initiating frame:
+  a click whose anchor href **matches** the destination is exact
+  attribution; otherwise the freshest of the window.open/click records
+  wins. Cross-origin iframe attribution ⇒ `ad-iframe` block, whether the
+  frame opened the tab via `window.open` or a `target=_blank` click.
+  Top-frame and same-origin-iframe clicks are unaffected.
+- `main.cjs` aggregates the click records across all frames (same CDP path
+  as before) and the `[popup]` log line now states the initiating frame
+  and mechanism (`via: "window.open" | "click"`), so the console log is
+  direct proof of who opened what.
+
+### Silver build marker
+The app icon (dock/taskbar, favicon, download zips) is now **silver** —
+same shape, metallic gradient — so a fixed build is unmistakable at a
+glance. Any ChromiumCore with the orange icon is an old build.
+
+### Tests
+Staged suite **111/111** (+6): unit tests for click attribution (href
+match; non-matching href still blocks a cross-origin click; top-frame
+clicks not blocked; a stale ad-iframe click cannot shadow a fresh
+top-frame click) and wiring subtests for the exact reported scenario —
+a `target="_blank"` click inside a cross-origin ad iframe to an *unlisted*
+destination opens **nothing** — plus a legitimate top-frame `target=_blank`
+click that still opens a working tab.
+
+### Still honest about
+- If CDP itself is unavailable (devtools open on the page) and no
+  main-process input was observed, default-deny still applies; with a
+  real click but no CDP, the open is allowed *and* commit-verified —
+  frame attribution needs the isolated-world read, and we would rather
+  keep legitimate links working than break the page.
+- In-stream media ads and server-side content remain out of scope.
