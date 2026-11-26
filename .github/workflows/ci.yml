@@ -46,12 +46,15 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
       - uses: android-actions/setup-android@v3
         with:
           packages: ''
       - run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
-      - name: Run Android TV unit tests
-        working-directory: android-tv
-        run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon --console=plain testDebugUnitTest
+      - run: npm ci
+      # This project stores a base64 recovery copy of gradle-wrapper.jar; the
+      # packaging script restores it, runs unit tests, assembles and verifies the APK.
+      - run: node scripts/package-android.mjs
