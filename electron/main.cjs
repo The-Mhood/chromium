@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, ipcMain, session, Menu } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, session, Menu, screen } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -11,6 +11,11 @@ let engine;
 let browsingSession;
 let activeId;
 let showExternal = false;
+let htmlFullscreen = false;
+let chromeVisible = true;
+let lastActivityAt = Date.now();
+let lastCursorPoint = null;
+let chromeIdleTimer;
 let persistTimer;
 let broadcastTimer;
 const views = new Map();
@@ -49,8 +54,16 @@ function bounds() {
   const [width, height] = win.getContentSize();
   for (const [id, view] of views) {
     view.setVisible(showExternal && activeId === id);
-    view.setBounds({ x: 0, y: 96, width, height: Math.max(0, height - 96) });
+    const top = htmlFullscreen || !chromeVisible ? 0 : 96;
+    view.setBounds({ x: 0, y: top, width, height: Math.max(0, height - top) });
   }
+}
+
+function setChromeVisible(visible) {
+  if (chromeVisible === visible) return;
+  chromeVisible = visible;
+  send('core:chrome-visibility', visible);
+  bounds();
 }
 
 function publishTab(id, contents) {
@@ -75,6 +88,25 @@ function makeTab(id) {
   });
   contents.on('will-navigate', (event, url) => { try { browsingUrl(url); } catch { event.preventDefault(); } });
   contents.on('will-redirect', (event, url) => { try { browsingUrl(url); } catch { event.preventDefault(); } });
+  contents.on('enter-html-full-screen', () => {
+    if (activeId !== id || !win || win.isDestroyed()) return;
+    htmlFullscreen = true;
+    setChromeVisible(false);
+    win.setFullScreen(true);
+    send('core:fullscreen-state', true);
+    bounds();
+  });
+  contents.on('leave-html-full-screen', () => {
+    if (activeId !== id || !win || win.isDestroyed()) return;
+    htmlFullscreen = false;
+    win.setFullScreen(false);
+    setChromeVisible(true);
+    send('core:fullscreen-state', false);
+    bounds();
+  });
+  contents.on('before-input-event', (_event, input) => {
+    if (input.type === 'keyDown' && !htmlFullscreen) { lastActivityAt = Date.now(); setChromeVisible(true); }
+  });
   contents.on('page-title-updated', () => publishTab(id, contents));
   contents.on('did-navigate', () => publishTab(id, contents));
   contents.on('did-navigate-in-page', () => publishTab(id, contents));
@@ -154,7 +186,7 @@ function registerIPC() {
       catch (error) { if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Navigation failed:', error.message); }
     }
   });
-  handle('core:focus', (id, external) => { activeId = id; showExternal = external === true; bounds(); });
+  handle('core:focus', (id, external) => { activeId = id; showExternal = external === true; lastActivityAt = Date.now(); setChromeVisible(true); bounds(); });
   handle('core:close', id => { const view = views.get(id); if (view) { win.contentView.removeChildView(view); view.webContents.close(); views.delete(id); } });
   handle('core:tab-action', (id, action) => {
     const contents = views.get(id)?.webContents;
@@ -197,9 +229,28 @@ function createWindow() {
   });
   win.webContents.on('will-navigate', event => event.preventDefault());
   win.on('resize', bounds);
+  win.on('focus', () => { lastActivityAt = Date.now(); if (!htmlFullscreen) setChromeVisible(true); });
   win.on('closed', () => { for (const view of views.values()) if (!view.webContents.isDestroyed()) view.webContents.close(); views.clear(); win = null; });
   win.once('ready-to-show', () => win.show());
+  win.webContents.on('before-input-event', (_event, input) => {
+    if (input.type === 'keyDown' && !htmlFullscreen) { lastActivityAt = Date.now(); setChromeVisible(true); }
+  });
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
+  clearInterval(chromeIdleTimer);
+  chromeIdleTimer = setInterval(() => {
+    if (!win || win.isDestroyed() || !win.isFocused() || !showExternal || htmlFullscreen) return;
+    const point = screen.getCursorScreenPoint();
+    const rect = win.getBounds();
+    const inside = point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height;
+    const moved = !lastCursorPoint || point.x !== lastCursorPoint.x || point.y !== lastCursorPoint.y;
+    lastCursorPoint = point;
+    if (inside && moved) {
+      lastActivityAt = Date.now();
+      setChromeVisible(true);
+    } else if (chromeVisible && Date.now() - lastActivityAt >= 7000) {
+      setChromeVisible(false);
+    }
+  }, 250);
 }
 
 app.setName('ChromiumCore');
@@ -224,6 +275,6 @@ app.whenReady().then(() => {
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => {
-  clearTimeout(persistTimer); clearTimeout(broadcastTimer);
+  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer);
   if (storePath) { try { fs.writeFileSync(storePath, JSON.stringify(state)); } catch (error) { console.warn('Could not save workspace:', error.message); } }
 });
