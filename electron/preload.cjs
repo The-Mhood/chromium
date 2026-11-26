@@ -26,4 +26,6 @@ contextBridge.exposeInMainWorld('chromiumCore', {
   onChromeVisibility: subscribe('core:chrome-visibility'),
   onFullscreenState: subscribe('core:fullscreen-state'),
   onPopupBlocked: subscribe('core:popup-blocked'),
+  onNavigationBlocked: subscribe('core:navigation-blocked'),
+  onLoadFailed: subscribe('core:load-failed'),
 });

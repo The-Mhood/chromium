@@ -80,6 +80,14 @@ export interface FullscreenState {
   window: boolean;
 }
 
+/** Why a tab's page is not on screen: blocked by protection, or the host
+ *  could not be reached. Drives the honest placeholder states. */
+export interface TabIssue {
+  kind: 'blocked' | 'failed';
+  url: string;
+  type?: 'Ad' | 'Tracker' | 'Pop-up' | 'Threat';
+}
+
 export interface DesktopBridge {
   platform: string;
   navigate: (id: string, url: string) => Promise<void>;
@@ -100,6 +108,8 @@ export interface DesktopBridge {
   onChromeVisibility: (callback: (visible: boolean) => void) => () => void;
   onFullscreenState: (callback: (state: FullscreenState) => void) => () => void;
   onPopupBlocked: (callback: (info: { url: string; source: string }) => void) => () => void;
+  onNavigationBlocked: (callback: (info: { id: string; url: string; type: TabIssue['type'] }) => void) => () => void;
+  onLoadFailed: (callback: (info: { id: string; url: string }) => void) => () => void;
 }
 
 declare global {

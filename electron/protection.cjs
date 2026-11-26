@@ -338,7 +338,7 @@ function createProtectionCore({ getSettings, engineFactory, loadBaseline = null,
  * Electron adapter. Requires Electron-only modules lazily so the rest of this
  * file stays loadable in plain Node (unit tests).
  */
-function createProtectionEngine({ browsingSession, cacheDir, getSettings, recordBlocked, log = console.warn }) {
+function createProtectionEngine({ browsingSession, cacheDir, getSettings, recordBlocked, onMainframeBlocked, log = console.warn }) {
   const { ElectronBlocker } = require('@ghostery/adblocker-electron');
   const { webContents } = require('electron');
   const resourcesDir = path.join(__dirname, 'resources');
@@ -364,6 +364,12 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
     const decision = core.decide({ url: details.url, resourceType: details.resourceType, sourceUrl, referrer: details.referrer, method: details.method });
     if (decision.cancel || decision.redirectURL) {
       if (recordBlocked && decision.type) recordBlocked(decision.type, details.url, sourceUrl);
+      // A cancelled MAIN FRAME is a navigation the user will never see
+      // explained anywhere else: report it so the tab can show why the
+      // page did not load (instead of sitting on a "loading" placeholder).
+      if (decision.cancel && details.resourceType === 'mainFrame' && decision.type && onMainframeBlocked) {
+        onMainframeBlocked(details.webContentsId, details.url, decision.type);
+      }
       return callback(decision.redirectURL ? { redirectURL: decision.redirectURL } : { cancel: true });
     }
     callback({});

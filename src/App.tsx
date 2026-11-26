@@ -16,7 +16,7 @@ import { Downloads } from './pages/Downloads';
 import { useBrowser } from './store/browser';
 
 export default function App() {
-  const { tabs, activeTabId, protection, setProtection, filters, allowlist, theme, doNotTrack, nativeStats, setNativeStats, updateTab, newTab, notify, navigatePage, fullscreenState, setFullscreenState } = useBrowser();
+  const { tabs, activeTabId, protection, setProtection, filters, allowlist, theme, doNotTrack, nativeStats, setNativeStats, updateTab, newTab, notify, navigatePage, fullscreenState, setFullscreenState, tabIssues, setTabIssue } = useBrowser();
   const active = tabs.find(tab => tab.id === activeTabId) || tabs[0];
   const page = getPage(active.url);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -41,8 +41,10 @@ export default function App() {
     const offChrome = bridge.onChromeVisibility(setChromeVisible);
     const offFullscreen = bridge.onFullscreenState(setFullscreenState);
     const offPopup = bridge.onPopupBlocked(() => notify('Blocked an unwanted popup.', 'info'));
-    return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); };
-  }, [setNativeStats, updateTab, newTab, notify, setFullscreenState]);
+    const offNavBlocked = bridge.onNavigationBlocked(info => setTabIssue(info.id, { kind: 'blocked', url: info.url, type: info.type }));
+    const offLoadFailed = bridge.onLoadFailed(info => setTabIssue(info.id, { kind: 'failed', url: info.url }));
+    return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); offNavBlocked(); offLoadFailed(); };
+  }, [setNativeStats, updateTab, newTab, notify, setFullscreenState, setTabIssue]);
   useEffect(() => {
     const bridge = window.chromiumCore;
     if (!bridge) return;
@@ -55,7 +57,7 @@ export default function App() {
   useEffect(() => { window.chromiumCore?.setFilters(filters).catch(() => notify('Filter lists could not be applied.', 'error')); }, [filters, notify]);
   useEffect(() => { window.chromiumCore?.setPrivacy(doNotTrack).catch(() => notify('Privacy preference could not be applied.', 'error')); }, [doNotTrack, notify]);
 
-  const pages = { overview: <Overview />, activity: <Activity />, filters: <Filters />, allowlist: <Allowlist />, youtube: <YouTubeProtection />, bookmarks: <Bookmarks />, downloads: <Downloads />, settings: <Settings />, newtab: <NewTab />, external: <ExternalPage url={page === 'external' ? active.url : 'https://example.com'} title={active.title} /> };
+  const pages = { overview: <Overview />, activity: <Activity />, filters: <Filters />, allowlist: <Allowlist />, youtube: <YouTubeProtection />, bookmarks: <Bookmarks />, downloads: <Downloads />, settings: <Settings />, newtab: <NewTab />, external: <ExternalPage url={page === 'external' ? active.url : 'https://example.com'} title={active.title} issue={tabIssues[active.id]} /> };
 
   return <div className={`app-shell ${!chromeVisible || fullscreenState.media ? "chrome-hidden" : ""}`}><Chrome /><div className={`workspace ${simplePage ? 'simple-workspace' : ''}`}>
     {!simplePage && <Sidebar page={page} mobileOpen={mobileOpen} closeMobile={() => setMobileOpen(false)} />}
