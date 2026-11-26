@@ -1,54 +1,63 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// ChromiumCore popup / popunder policy.
+// ChromiumCore popup / popunder policy (v3 — default-deny).
 //
 // Pure module: no Electron imports, so the entire classification and state
 // machine is unit tested in plain Node (popup-blocker.test.cjs). The main
 // process feeds it:
 //   - a `matchRequest(url, sourceUrl, type, group?)` predicate built from the
 //     ad / threat engines,
-//   - the page's user-activation age read from an *isolated* JavaScript world
-//     (shared/popup-support.js, injected with a CDP worldName so pages cannot
-//     observe or tamper with it),
+//   - the page's user-activation age and per-frame window.open records read
+//     from *isolated* JavaScript worlds (shared/popup-support.js, injected
+//     with a CDP worldName so pages cannot observe or tamper with them),
 //   - the disposition Chromium reports for each window.open request.
+//
+// Product requirement: an advertising tab or window must never become
+// visible. So the policy never "allows and closes later" — an allowed open
+// still has to pass commit verification in the main process (a hidden
+// inspector navigates to the destination, follows redirects, and only the
+// verified final URL is handed to the renderer as a tab).
 //
 // Trust model: pages can lie about anything inside their own world, so the
 // decision never relies on page-visible state alone:
 //   * activation age = min(isolated-world age, main-process input age);
 //   * the per-gesture quota is counted by the main process (one script-driven
-//     window.open per user activation) and cannot be reset from the page.
+//     window.open per user activation) and cannot be reset from the page;
+//   * when there is NO activation evidence at all, the open is BLOCKED.
+//     (There is no "degraded allow": a page the user never touched cannot
+//     legitimately open a browsing context, and unlisted ad domains cannot
+//     be told apart from legitimate ones by a blocklist anyway.)
 //
-// Rules (mirror a real browser popup blocker, not a domain blocklist):
-//   1. Protection off / site allowlisted            -> allow.
+// Rules:
+//   1. Protection off / site allowlisted            -> allow (no verification
+//      hold: the user explicitly paused protection for that site).
 //   2. Destination matches an ad/threat filter       -> block.
-//   3. A genuine link click (disposition "foreground-tab") -> allow.
-//   4. Tab budget exhausted                           -> block.
-//   5. Script-driven window.open ("default" / "background-tab"):
-//        allowed only with a recent user activation and within the per-gesture
-//        quota. "background-tab" (window.open 'background' — the classic
-//        popunder primitive) needs a near-synchronous gesture. Activation is
-//        key/click input only — scrolling (mouseWheel) grants none.
+//   3. "background-tab" (window.open 'background' — the classic popunder
+//      primitive) -> block, even with a fresh gesture.
+//   4. An open initiated from a cross-origin iframe (the standard ad-embed
+//      pattern) -> block, even on a real click. Same-origin iframe opens are
+//      treated like top-frame opens.
+//   5. Tab budget exhausted                           -> block.
 //   6. A second script popup from the same page within REPEAT_WINDOW_MS
-//        (even with a fresh gesture each time) -> block, and report the
-//        earlier popup's URL so the main process can close that tab.
-// This stops timer popups, popup chains and popunders to *unlisted*
-// destinations, which a domain blocklist alone cannot catch.
-//
-// Popunder watching: when a script-opened tab is allowed, its *first*
-// committed main-frame navigation is inspected. If it jumps to a
-// filter-listed ad host, or to a different registrable domain than the page
-// that opened it (the window.open('')-then-location=ad scheme), the tab is
-// closed and the attempt recorded. Legit same-domain redirects pass.
+//      (even with a fresh gesture each time) -> block, and report the
+//      earlier popup's URL so the main process can close that tab.
+//   7. Everything else requires a FRESH user gesture (real key/click input
+//      within GESTURE_WINDOW_MS — scrolling never counts) and, for
+//      script-driven opens, stays within the per-gesture quota.
+//   8. Every other allowed open returns needsCommit: the main process
+//      verifies the first committed main frame (after redirects) before the
+//      tab chip is ever shown.
+// This stops timer popups, popup chains, popunders and click-to-ad redirects
+// to *unlisted* destinations, which a domain blocklist alone cannot catch.
 // ---------------------------------------------------------------------------
 
 const GESTURE_WINDOW_MS = 1500;
-const BACKGROUND_GESTURE_WINDOW_MS = 500;
-const OPENS_PER_ACTIVATION = 1;
 // A page that fires more than one script popup inside this window — even
 // with a fresh click for each — is an ad redirector, not a user workflow.
 // The second open is blocked and the first one is closed by the main process.
 const REPEAT_WINDOW_MS = 8000;
+const OPENS_PER_ACTIVATION = 1;
 const WATCH_TTL_MS = 30000;
 const NO_ACTIVATION_MS = 999999999;
 
@@ -78,13 +87,11 @@ function createPopupPolicy(options = {}) {
   // Main-process input tracking (unspoofable: it reflects OS-level input
   // events, and doubles as the per-gesture quota counter).
   const pageInput = new Map();
-  // Popunder watches: webContents id -> watch.
-  const watches = new Map();
   // Repeat-popup tracking: webContents id -> { url, firstAt } of the last
   // allowed script popup from that page.
   const repeatOpeners = new Map();
 
-  function settings() {
+  function settingsOf() {
     const s = getSettings();
     return { protection: s.protection || {}, allowlist: s.allowlist || [] };
   }
@@ -101,8 +108,6 @@ function createPopupPolicy(options = {}) {
     pageInput.set(contentsId, entry);
   }
 
-  function settingsOf() { return settings(); }
-
   /**
    * Classify a window.open / target=_blank request.
    * @param {object} p
@@ -110,21 +115,35 @@ function createPopupPolicy(options = {}) {
    * @param {string} p.sourceUrl    the page that opened it
    * @param {string} p.disposition  "default" | "foreground-tab" | "background-tab"
    * @param {number} p.tabCount     external tabs currently open
-   * @param {object|null} p.pageState { ageMs } from the isolated world, or null
+   * @param {object|null} p.pageState { ageMs, open } from the isolated worlds,
+   *                                   or null when CDP is unavailable.
+   *                                   `open` = { isTop, crossOrigin, ... } of
+   *                                   the freshest window.open record.
    * @param {number} p.contentsId
+   * @returns {{ allowed: boolean, reason: string, needsCommit?: boolean, earlierUrl?: string }}
    */
   function classifyWindowOpen(p) {
     const { url, sourceUrl, disposition, tabCount, pageState, contentsId } = p;
     const { protection, allowlist } = settingsOf();
 
-    if (!protection.enabled || protection.popups === false) return { allowed: true, reason: 'protection-off', needsWatch: false };
-    if (isAllowedDomain(sourceUrl, allowlist)) return { allowed: true, reason: 'allowlisted', needsWatch: false };
+    if (!protection.enabled || protection.popups === false) return { allowed: true, reason: 'protection-off', needsCommit: false };
+    if (isAllowedDomain(sourceUrl, allowlist)) return { allowed: true, reason: 'allowlisted', needsCommit: false };
 
     if (matchRequest(url, sourceUrl, 'popup') || matchRequest(url, sourceUrl, 'main_frame')) {
-      return { allowed: false, reason: 'listed-destination', needsWatch: false };
+      return { allowed: false, reason: 'listed-destination', needsCommit: false };
     }
-    if (disposition === 'foreground-tab') return { allowed: true, reason: 'link-click', needsWatch: false };
-    if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsWatch: false };
+    // A hidden background tab is never a user workflow.
+    if (disposition === 'background-tab') {
+      return { allowed: false, reason: 'background-tab', needsCommit: false };
+    }
+    // Cross-origin iframe opens are the canonical ad-embed pattern: a
+    // third-party ad unit inside the page opens a tab "on" the user's click.
+    // A same-origin iframe is part of the page the user is looking at.
+    const openRecord = pageState && pageState.open;
+    if (openRecord && openRecord.crossOrigin === true) {
+      return { allowed: false, reason: 'ad-iframe', needsCommit: false };
+    }
+    if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsCommit: false };
 
     // Repeat rule: this page already got a script popup through inside the
     // window. Ad redirectors fire one popup per user action, so a second
@@ -132,91 +151,86 @@ function createPopupPolicy(options = {}) {
     // earlier popup's URL so the main process can close that tab too.
     const repeat = repeatOpeners.get(contentsId);
     if (repeat && now() - repeat.firstAt < REPEAT_WINDOW_MS) {
-      return { allowed: false, reason: 'repeat-popup', needsWatch: false, earlierUrl: repeat.url };
+      return { allowed: false, reason: 'repeat-popup', needsCommit: false, earlierUrl: repeat.url };
     }
 
     const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
-    entry.opens += 1; // every script-driven attempt consumes quota until a fresh gesture
+    const isLinkClick = disposition === 'foreground-tab';
+    if (!isLinkClick) entry.opens += 1; // every script-driven attempt consumes quota until a fresh gesture
     pageInput.set(contentsId, entry);
 
-    const limit = disposition === 'background-tab' ? BACKGROUND_GESTURE_WINDOW_MS : GESTURE_WINDOW_MS;
+    // Activation evidence: the freshest of the isolated-world clock (any
+    // frame) and the unspoofable main-process input observation.
     let age = NO_ACTIVATION_MS;
     if (pageState && typeof pageState.ageMs === 'number') age = Math.min(age, pageState.ageMs);
     if (entry.lastInputAt) age = Math.min(age, now() - entry.lastInputAt);
 
     if (age >= NO_ACTIVATION_MS) {
-      // Neither the isolated world nor the main process saw any activation
-      // for this page: no proof this is user-driven. Block — except when we
-      // have no observation at all (script not installed / CDP degraded),
-      // where blocking would break ordinary sites: degraded mode allows.
-      const observed = (pageState !== null) || entry.observed;
-      if (!observed) {
-        log('popup: degraded allow (no activation data)', { url, disposition });
-        repeatOpeners.set(contentsId, { url, firstAt: now() });
-        return { allowed: true, reason: 'degraded', needsWatch: true };
-      }
-      return { allowed: false, reason: 'no-gesture', needsWatch: false };
+      // No input seen by the main process, no activation seen in the page:
+      // there is no proof this is user-driven. Default to deny — a page the
+      // user never interacted with does not get browsing contexts, whether
+      // or not the destination looks familiar.
+      return { allowed: false, reason: 'no-gesture', needsCommit: false };
     }
 
-    if (age <= limit && entry.opens <= OPENS_PER_ACTIVATION) {
-      repeatOpeners.set(contentsId, { url, firstAt: now() });
-      return { allowed: true, reason: 'user-gesture', needsWatch: true };
+    if (age <= GESTURE_WINDOW_MS && entry.opens <= OPENS_PER_ACTIVATION) {
+      if (!isLinkClick) repeatOpeners.set(contentsId, { url, firstAt: now() });
+      // The allow is provisional: the main process verifies the first
+      // committed main frame (following redirects) before any tab chip is
+      // created, so a redirect-to-ad can never flash on screen.
+      return { allowed: true, reason: isLinkClick ? 'link-click' : 'user-gesture', needsCommit: true };
     }
-    return { allowed: false, reason: age <= limit ? 'popup-chain' : 'no-gesture', needsWatch: false };
-  }
-
-  function registerPopup(contentsId, { url, sourceUrl }) {
-    const intendedDomain = getRegistrableDomain(url);
-    const openerDomain = getRegistrableDomain(sourceUrl);
-    watches.set(contentsId, {
-      intendedUrl: url,
-      intendedDomain,
-      openerDomain,
-      intendedWasOpener: intendedDomain !== '' && intendedDomain === openerDomain,
-      createdAt: now(),
-    });
-  }
-
-  /**
-   * Inspect the first committed main-frame navigation of a watched tab.
-   * @returns {{block: boolean, reason: string, type: 'Ad'|'Threat'|'Pop-up'|null}}
-   */
-  function checkFirstNavigation(contentsId, url) {
-    const watch = watches.get(contentsId);
-    watches.delete(contentsId);
-    if (!watch) return { block: false, reason: 'no-watch', type: null };
-    if (now() - watch.createdAt > WATCH_TTL_MS) return { block: false, reason: 'expired', type: null };
-
-    if (matchRequest(url, watch.intendedUrl, 'main_frame')) {
-      const threat = matchRequest(url, watch.intendedUrl, 'main_frame', 'threats');
-      return { block: true, reason: 'listed-redirect', type: threat ? 'Threat' : 'Ad' };
-    }
-    const destinationDomain = getRegistrableDomain(url);
-    if (watch.intendedWasOpener && destinationDomain !== '' && destinationDomain !== watch.openerDomain) {
-      return { block: true, reason: 'popunder', type: 'Pop-up' };
-    }
-    return { block: false, reason: 'accepted', type: null };
+    return { allowed: false, reason: age <= GESTURE_WINDOW_MS ? 'popup-chain' : 'no-gesture', needsCommit: false };
   }
 
   function forget(contentsId) {
     pageInput.delete(contentsId);
-    watches.delete(contentsId);
     repeatOpeners.delete(contentsId);
   }
 
   return {
     GESTURE_WINDOW_MS,
-    BACKGROUND_GESTURE_WINDOW_MS,
-    OPENS_PER_ACTIVATION,
     REPEAT_WINDOW_MS,
+    OPENS_PER_ACTIVATION,
     WATCH_TTL_MS,
     classifyWindowOpen,
-    registerPopup,
-    checkFirstNavigation,
     observeInput,
     forget,
     getRegistrableDomain,
   };
 }
 
-module.exports = { createPopupPolicy, getRegistrableDomain };
+/**
+ * Verdict for a committed main frame, used by the hidden inspector in the
+ * main process (and as a fallback watch for opens that could not be
+ * verified in time). Pure: no state, fed by the caller.
+ *
+ * @param {object} p
+ * @param {string} p.intendedUrl   the URL the open originally requested
+ * @param {string} p.openerUrl     the page that opened it
+ * @param {string} p.finalUrl      the URL the main frame actually committed to
+ * @param {function} p.matchRequest (url, sourceUrl, type, group?) => bool
+ * @param {number} p.nowMs
+ * @param {number} p.createdAt     when the open was requested
+ * @returns {{ block: boolean, reason: string, type: 'Ad'|'Threat'|'Pop-up'|null }}
+ */
+function committedNavigationVerdict(p) {
+  const { intendedUrl, openerUrl, finalUrl, matchRequest, nowMs, createdAt } = p;
+  if (nowMs - createdAt > WATCH_TTL_MS) return { block: false, reason: 'expired', type: null };
+
+  if (matchRequest(finalUrl, intendedUrl, 'main_frame') || matchRequest(finalUrl, openerUrl, 'main_frame')) {
+    const threat = matchRequest(finalUrl, intendedUrl, 'main_frame', 'threats') || matchRequest(finalUrl, openerUrl, 'main_frame', 'threats');
+    return { block: true, reason: 'listed-redirect', type: threat ? 'Threat' : 'Ad' };
+  }
+  // window.open('') / location=ad popunder scheme: the open started on the
+  // opener's own domain and the committed frame jumped to another one.
+  const intendedDomain = getRegistrableDomain(intendedUrl);
+  const openerDomain = getRegistrableDomain(openerUrl);
+  const finalDomain = getRegistrableDomain(finalUrl);
+  if (intendedDomain !== '' && intendedDomain === openerDomain && finalDomain !== '' && finalDomain !== openerDomain) {
+    return { block: true, reason: 'popunder', type: 'Pop-up' };
+  }
+  return { block: false, reason: 'accepted', type: null };
+}
+
+module.exports = { createPopupPolicy, getRegistrableDomain, committedNavigationVerdict };

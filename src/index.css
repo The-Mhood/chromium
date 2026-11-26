@@ -14,6 +14,8 @@
   --accent: #ed7545;
   --accent-strong: #df6638;
   --accent-soft: #fff0e8;
+  /* Product purple: the active state of the fullscreen control only. */
+  --accent-purple: #8f6fd0;
   --text: #292b30;
   --muted: #8c909a;
   --secondary: #6f747e;
@@ -58,8 +60,13 @@ h1, h2, h3, h4, p { margin: 0; }
 .window-dot.minimize { background: #efc16a; }
 .window-dot.maximize { background: #91bf8c; }
 .window-dot.fullscreen { background: #7f9fc9; }
-.window-dot.fullscreen.active { background: #4d6fa8; box-shadow: inset 0 0 0 .5px #00000030; }
+/* Active = the window is REALLY in native fullscreen (state arrives from the
+   main process, which verifies the OS transition) -> product purple. The
+   hover/focus treatments never change the fill colour, so they can't be
+   confused with the active purple state. */
+.window-dot.fullscreen.active { background: var(--accent-purple); box-shadow: inset 0 0 0 .5px #00000030; }
 .window-dot:hover { filter: brightness(.92); }
+.window-dot:focus-visible { outline: 2px solid var(--accent-purple); outline-offset: 3px; }
 .browser-tabs { display: flex; align-items: end; min-width: 0; height: 100%; gap: 4px; overflow: hidden; }
 .browser-tab { width: 209px; min-width: 110px; height: 34px; display: flex; align-items: center; border-radius: 9px 9px 0 0; position: relative; color: #717580; }
 .browser-tab:not(.selected):after { position: absolute; right: -3px; top: 10px; height: 14px; width: 1px; background: #d5d8de; content: ''; }

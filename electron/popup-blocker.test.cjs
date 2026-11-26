@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createPopupPolicy, getRegistrableDomain } = require('./popup-blocker.cjs');
+const { createPopupPolicy, getRegistrableDomain, committedNavigationVerdict } = require('./popup-blocker.cjs');
 const { isAllowedDomain } = require('./security.cjs');
 
 const ADS = new Set(['adnet.test', 'popads.net', 'trafficjunky.net']);
@@ -40,9 +40,13 @@ function makePolicy({ protection = { enabled: true, network: true, popups: true 
 
 test('protection off or paused popups allow everything', () => {
   const off = makePolicy({ protection: { enabled: false, popups: true } });
-  assert.equal(off.classify().allowed, true);
+  const d1 = off.classify();
+  assert.equal(d1.allowed, true);
+  assert.equal(d1.needsCommit, false);
   const paused = makePolicy({ protection: { enabled: true, popups: false } });
-  assert.equal(paused.classify().allowed, true);
+  const d2 = paused.classify();
+  assert.equal(d2.allowed, true);
+  assert.equal(d2.needsCommit, false);
 });
 
 test('allowlisted sites are exempt from popup blocking', () => {
@@ -50,6 +54,7 @@ test('allowlisted sites are exempt from popup blocking', () => {
   const decision = classify({ pageState: { ageMs: 999999999 } });
   assert.equal(decision.allowed, true);
   assert.equal(decision.reason, 'allowlisted');
+  assert.equal(decision.needsCommit, false);
 });
 
 test('listed ad or threat destinations are blocked even on a real gesture', () => {
@@ -62,16 +67,49 @@ test('listed ad or threat destinations are blocked even on a real gesture', () =
     assert.equal(decision.reason, 'listed-destination', url);
   }
   // A link click to a listed ad domain is blocked too (the navigation itself is the ad).
-  const link = policy.classifyWindowOpen({ url: 'https://adnet.test/landing', sourceUrl: 'https://site.test/page', disposition: 'foreground-tab', tabCount: 1, pageState: null, contentsId: 1 });
+  const link = policy.classifyWindowOpen({ url: 'https://adnet.test/landing', sourceUrl: 'https://site.test/page', disposition: 'foreground-tab', tabCount: 1, pageState: { ageMs: 10 }, contentsId: 1 });
   assert.equal(link.allowed, false);
+  assert.equal(link.reason, 'listed-destination');
 });
 
-test('link clicks (foreground-tab) are always allowed for unlisted destinations', () => {
-  const { classify } = makePolicy();
-  const decision = classify({ disposition: 'foreground-tab' });
+test('background-tab opens are blocked even with a fresh gesture', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  const decision = classify({ disposition: 'background-tab', pageState: { ageMs: 100 } });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'background-tab');
+});
+
+test('an open from a cross-origin iframe (ad embed) is blocked even on a real click', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  const decision = classify({ pageState: { ageMs: 100, open: { isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' } } });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'ad-iframe');
+});
+
+test('an open from a same-origin iframe is treated like a top-frame open', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  const decision = classify({ pageState: { ageMs: 100, open: { isTop: false, crossOrigin: false, frameHost: 'site.test', topHost: 'site.test' } } });
   assert.equal(decision.allowed, true);
-  assert.equal(decision.reason, 'link-click');
-  assert.equal(decision.needsWatch, false);
+  assert.equal(decision.needsCommit, true);
+});
+
+test('a top-frame open with no frame record falls back to the gesture check', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  const decision = classify({ pageState: { ageMs: 100, open: { isTop: true, crossOrigin: false } } });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'user-gesture');
 });
 
 test('tab budget blocks further popups', () => {
@@ -81,7 +119,7 @@ test('tab budget blocks further popups', () => {
   assert.equal(decision.reason, 'tab-budget');
 });
 
-test('scripted window.open with a fresh activation is allowed once', () => {
+test('scripted window.open with a fresh activation is allowed once, then verified', () => {
   const { policy, at, classify } = makePolicy();
   at(1_000_000);
   policy.observeInput(1, 'mouseDown');
@@ -89,7 +127,27 @@ test('scripted window.open with a fresh activation is allowed once', () => {
   const first = classify({ pageState: { ageMs: 400 } });
   assert.equal(first.allowed, true);
   assert.equal(first.reason, 'user-gesture');
-  assert.equal(first.needsWatch, true);
+  assert.equal(first.needsCommit, true, 'the main process verifies the committed URL before any tab chip');
+});
+
+test('a genuine link click (foreground-tab) with a fresh gesture is allowed', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_120);
+  const decision = classify({ disposition: 'foreground-tab', pageState: { ageMs: 120 } });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'link-click');
+  assert.equal(decision.needsCommit, true, 'redirect-to-ad must be caught before the chip appears');
+});
+
+test('a target=_blank open with NO gesture is blocked (click-to-ad defence)', () => {
+  const { classify } = makePolicy();
+  // A deceptive ad element with target="_blank" firing without any observed
+  // input on this page: there is no proof of a click, so deny.
+  const decision = classify({ disposition: 'foreground-tab', pageState: { ageMs: 999999999 } });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'no-gesture');
 });
 
 test('scripted window.open without any activation is blocked', () => {
@@ -110,6 +168,16 @@ test('a stale activation (older than the gesture window) is blocked', () => {
   assert.equal(decision.reason, 'no-gesture');
 });
 
+test('a delayed popup (fires long after the click) is blocked', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_004_000); // the click is 4 s old; the timer fires now
+  const decision = classify({ pageState: { ageMs: 4000 } });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'no-gesture');
+});
+
 test('a popup chain is cut off after the first open', () => {
   const { policy, at, classify } = makePolicy();
   at(1_000_000);
@@ -122,21 +190,6 @@ test('a popup chain is cut off after the first open', () => {
   // The repeat rule catches this: a second script open from the same page
   // inside the window is unwanted, regardless of the per-gesture quota.
   assert.equal(second.reason, 'repeat-popup');
-});
-
-test('background-tab opens need a near-synchronous gesture', () => {
-  const { policy, at } = makePolicy();
-  at(1_000_000);
-  policy.observeInput(1, 'mouseDown');
-  at(1_000_400);
-  assert.equal(policy.classifyWindowOpen({ url: 'https://popup-target.test/open', sourceUrl: 'https://site.test/page', disposition: 'background-tab', tabCount: 1, pageState: { ageMs: 400 }, contentsId: 1 }).allowed, true);
-  // A stale gesture on a fresh tab (no earlier popup) is refused outright.
-  at(1_000_000);
-  policy.observeInput(2, 'mouseDown');
-  at(1_001_200);
-  const stale = policy.classifyWindowOpen({ url: 'https://popup-target.test/open', sourceUrl: 'https://site.test/page', disposition: 'background-tab', tabCount: 1, pageState: { ageMs: 1200 }, contentsId: 2 });
-  assert.equal(stale.allowed, false);
-  assert.equal(stale.reason, 'no-gesture');
 });
 
 test('the page report and the main observation corroborate (min age wins)', () => {
@@ -153,12 +206,14 @@ test('the page report and the main observation corroborate (min age wins)', () =
   assert.equal(fallback.allowed, true);
 });
 
-test('with no observation at all the policy degrades to allow (never break sites)', () => {
+test('with no observation at all the policy BLOCKS (no degraded mode)', () => {
   const { classify } = makePolicy();
+  // No CDP read, no input ever seen on this page: default to deny. A page
+  // the user never touched cannot legitimately open a browsing context —
+  // and unlisted ad domains cannot be told apart from real ones anyway.
   const decision = classify(); // pageState null, no input ever seen
-  assert.equal(decision.allowed, true);
-  assert.equal(decision.reason, 'degraded');
-  assert.equal(decision.needsWatch, true);
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'no-gesture');
 });
 
 test('scrolling does not grant popup activation', () => {
@@ -214,68 +269,65 @@ test('repeat-popup state is per tab and cleared by forget', () => {
 
 test('a page cannot spoof the isolated-world clock to open without a gesture', () => {
   const { classify } = makePolicy();
-  // Malicious page fakes a fresh activation in its own world, but the main
-  // process never saw input and the isolated world (the trusted source) says
-  // there was none. The spoofed value would arrive as a *trusted* read only
-  // if it came from the isolated world — which the page cannot write.
+  // The isolated world is the trusted clock source and it says there was no
+  // activation; the main process saw nothing either. Block.
   const decision = classify({ pageState: { ageMs: 999999999 } });
   assert.equal(decision.allowed, false);
 });
 
-test('popunder: blank/same-page open that jumps to another domain is closed', () => {
-  const { policy, at } = makePolicy();
-  at(1_000_000);
-  policy.registerPopup(7, { url: 'https://site.test/page', sourceUrl: 'https://site.test/page' });
-  const verdict = policy.checkFirstNavigation(7, 'https://elsewhere.test/ad');
-  assert.equal(verdict.block, true);
-  assert.equal(verdict.reason, 'popunder');
-  assert.equal(verdict.type, 'Pop-up');
+// ---------------------------------------------------------------------------
+// Commit verification verdicts (the hidden inspector in the main process)
+// ---------------------------------------------------------------------------
+
+const verdict = (over = {}) => committedNavigationVerdict({
+  intendedUrl: 'https://intended.test/open',
+  openerUrl: 'https://site.test/page',
+  finalUrl: 'https://final.test/landed',
+  matchRequest: (url, _s, _t, group) => {
+    let host = '';
+    try { host = new URL(url).hostname; } catch { return false; }
+    if (group === 'threats') return THREATS.has(host);
+    return ADS.has(host) || THREATS.has(host);
+  },
+  nowMs: 1_000_200,
+  createdAt: 1_000_000,
+  ...over,
 });
 
-test('popunder: first navigation to a listed ad domain is blocked as an ad', () => {
-  const { policy } = makePolicy();
-  policy.registerPopup(8, { url: 'https://site.test/page', sourceUrl: 'https://site.test/page' });
-  const verdict = policy.checkFirstNavigation(8, 'https://adnet.test/takeover');
-  assert.equal(verdict.block, true);
-  assert.equal(verdict.reason, 'listed-redirect');
-  assert.equal(verdict.type, 'Ad');
+test('commit: a redirect into a listed ad domain is blocked before the tab exists', () => {
+  const v = verdict({ finalUrl: 'https://adnet.test/takeover' });
+  assert.equal(v.block, true);
+  assert.equal(v.reason, 'listed-redirect');
+  assert.equal(v.type, 'Ad');
 });
 
-test('popunder: threat destinations are classified as threats', () => {
-  const { policy } = makePolicy();
-  policy.registerPopup(9, { url: 'https://site.test/page', sourceUrl: 'https://site.test/page' });
-  const verdict = policy.checkFirstNavigation(9, 'https://malware.test/payload.exe');
-  assert.equal(verdict.block, true);
-  assert.equal(verdict.type, 'Threat');
+test('commit: a redirect into a listed threat domain is classified as a threat', () => {
+  const v = verdict({ finalUrl: 'https://malware.test/payload.exe' });
+  assert.equal(v.block, true);
+  assert.equal(v.type, 'Threat');
 });
 
-test('popunder: legitimate same-domain redirects and explicit targets pass', () => {
-  const { policy } = makePolicy();
-  policy.registerPopup(10, { url: 'https://site.test/page', sourceUrl: 'https://site.test/page' });
-  assert.equal(policy.checkFirstNavigation(10, 'https://site.test/page?step=2').block, false);
-
-  policy.registerPopup(11, { url: 'https://login.other.test/', sourceUrl: 'https://site.test/page' });
-  assert.equal(policy.checkFirstNavigation(11, 'https://login.other.test/auth/callback').block, false);
-  // The watch is one-shot: a later navigation is not inspected twice.
-  assert.equal(policy.checkFirstNavigation(11, 'https://elsewhere.test/x').block, false);
+test('commit: the window.open("")-then-location=ad popunder scheme is blocked', () => {
+  // The open was requested on the opener\'s own domain and the committed
+  // frame jumped to a different registrable domain.
+  const v = verdict({ intendedUrl: 'https://site.test/page', openerUrl: 'https://site.test/page', finalUrl: 'https://elsewhere.test/ad' });
+  assert.equal(v.block, true);
+  assert.equal(v.reason, 'popunder');
+  assert.equal(v.type, 'Pop-up');
 });
 
-test('popunder watches expire after the TTL', () => {
-  const { policy, at } = makePolicy();
-  at(1_000_000);
-  policy.registerPopup(12, { url: 'https://site.test/page', sourceUrl: 'https://site.test/page' });
-  at(1_000_000 + 31_000);
-  const verdict = policy.checkFirstNavigation(12, 'https://elsewhere.test/ad');
-  assert.equal(verdict.block, false);
-  assert.equal(verdict.reason, 'expired');
+test('commit: legitimate same-domain redirects and explicit targets pass', () => {
+  assert.equal(verdict({ intendedUrl: 'https://site.test/page', openerUrl: 'https://site.test/page', finalUrl: 'https://site.test/page?step=2' }).block, false);
+  // An explicit cross-site destination that stays where it was pointed.
+  assert.equal(verdict({ intendedUrl: 'https://login.other.test/', openerUrl: 'https://site.test/page', finalUrl: 'https://login.other.test/auth/callback' }).block, false);
+  // www and subdomain rewrites within the same registrable domain pass.
+  assert.equal(verdict({ intendedUrl: 'https://example.com/', openerUrl: 'https://example.com/', finalUrl: 'https://www.example.com/start' }).block, false);
 });
 
-test('forget clears all per-tab state', () => {
-  const { policy } = makePolicy();
-  policy.observeInput(13, 'mouseDown');
-  policy.registerPopup(13, { url: 'https://site.test/', sourceUrl: 'https://site.test/' });
-  policy.forget(13);
-  assert.equal(policy.checkFirstNavigation(13, 'https://elsewhere.test/x').reason, 'no-watch');
+test('commit: an expired watch does not block (slow legitimate sites keep working)', () => {
+  const v = verdict({ finalUrl: 'https://elsewhere.test/ad', nowMs: 1_000_000 + 31_000 });
+  assert.equal(v.block, false);
+  assert.equal(v.reason, 'expired');
 });
 
 test('registrable domains handle public suffixes and www', () => {
