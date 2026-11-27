@@ -50,6 +50,14 @@ const views = new Map();
 // "blocked" / "couldn't reach" card is the thing on screen.
 const firstCommitted = new Set(); // webContents ids with a document
 const issueHidden = new Set();    // tab ids with a blocked/failed card showing
+// Tabs the USER explicitly navigated (address bar, quick link, an admitted
+// link click, the home page): their content paints LIVE from the first
+// frame, like an ordinary browser — the loading card would blank the page
+// on every link. Scripted opens are NOT marked live: they stay hidden until
+// their first commit is verified (the round-9 ad-flash protection applies
+// exactly where the risk is), and their redirects are still checked by the
+// open watches the moment the tab materialises.
+const liveTabs = new Set(); // tab ids with live (ungated) content
 // Fail-open timers: the gate must never hold a user on the card forever. If
 // a document neither commits nor finishes within this window, the view is
 // released anyway (worst case: a short white frame instead of a hard hang).
@@ -182,7 +190,7 @@ function applyLayout() {
   for (const [id, view] of views) if (view !== activeView) view.setVisible(false);
   if (activeView) {
     const contents = activeView.webContents;
-    const ready = firstCommitted.has(contents.id) && !issueHidden.has(activeId);
+    const ready = (firstCommitted.has(contents.id) || liveTabs.has(activeId)) && !issueHidden.has(activeId);
     if (!ready && !issueHidden.has(activeId) && !gateForceTimers.has(activeId)) {
       // No blocked/failed card is involved, yet no document signal has
       // arrived: arm the fail-open (see GATE_FAIL_OPEN_MS).
@@ -316,8 +324,15 @@ fsCtl.onEffect(effect => {
 const MEDIA_PAUSE_CHECK_MS = 500;
 const MEDIA_PAUSE_STATE_EXPR = '(() => { const el = document.fullscreenElement; if (!el) return null; const v = (el.querySelector && el.querySelector("video,audio")) || null; return { paused: v ? v.paused : null, ended: v ? v.ended : null }; })()';
 let mediaPauseTimer = null;
+// Two consecutive polls must agree the media is paused before the session
+// is released. A single "paused" reading is not proof: YouTube remounts
+// its <video> on quality changes, players show a brief paused state on
+// seek, and one stray reading used to drop the user out of fullscreen for
+// no reason ("works sometimes, doesn't work sometimes").
+let mediaPauseStrikes = 0;
 function armMediaPausePoll() {
   if (mediaPauseTimer) return;
+  mediaPauseStrikes = 0;
   mediaPauseTimer = setInterval(() => {
     if (!win || win.isDestroyed() || !fsCtl.mediaActive) { disarmMediaPausePoll(); return; }
     const view = views.get(activeId);
@@ -325,8 +340,15 @@ function armMediaPausePoll() {
     if (!contents || contents.isDestroyed()) return;
     contents.executeJavaScript(MEDIA_PAUSE_STATE_EXPR, true)
       .then(state => {
-        if (!state || !fsCtl.mediaActive) return;
-        if (state.paused !== true && state.ended !== true) return;
+        if (!state || !fsCtl.mediaActive) { mediaPauseStrikes = 0; return; }
+        // "ended" is final — no confirmation needed. A pause must hold for
+        // the next poll too (player remounts / seeks are transient).
+        if (state.ended !== true) {
+          if (state.paused !== true) { mediaPauseStrikes = 0; return; }
+          mediaPauseStrikes += 1;
+          if (mediaPauseStrikes < 2) return;
+        }
+        mediaPauseStrikes = 0;
         console.log('[fullscreen] media paused/ended in fullscreen; releasing the fullscreen session');
         // End the document fullscreen first (its leave handler releases the
         // browser fullscreen); release directly as well in case the leave
@@ -340,6 +362,7 @@ function armMediaPausePoll() {
 }
 function disarmMediaPausePoll() {
   if (mediaPauseTimer) { clearInterval(mediaPauseTimer); mediaPauseTimer = null; }
+  mediaPauseStrikes = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +385,7 @@ function destroyTab(id) {
   navigationLocks.delete(contents.id);
   lastRequested.delete(contents.id);
   firstCommitted.delete(contents.id);
+  liveTabs.delete(id);
   issueHidden.delete(id);
   if (gateForceTimers.has(id)) { clearTimeout(gateForceTimers.get(id)); gateForceTimers.delete(id); }
   popunderWatches.delete(contents.id);
@@ -492,7 +516,7 @@ async function readPagePopupState(contents, atMs, options = {}) {
 
 const LINK_DEDUP_MS = 1500;              // repeat clicks on the same destination are dropped within this window
 const LINK_PAGESTATE_BUDGET_MS = 150;    // the frame-attribution read on the click path must never hold the click up
-const LINK_SECOND_CLICK_MS = 600;        // a second fresh click this soon after the first is the double-click (matches the in-page window)
+const LINK_SECOND_CLICK_MS = 1000;       // a second fresh click this soon after the first is the double-click (matches the in-page window; a manual "double" at TV/trackpad distances is slower than an OS double-click)
 const pendingLinkOpens = new Map();      // `${contentsId}\u001f${url}` -> { atMs } of the FIRST request
 const pendingImmediateOpens = [];        // { url, sourceUrl, sourceContentsId, sourceTabId, at } — matched when the tab materialises
 const immediateOpenWatches = new Map();  // new tab contents id -> { intendedUrl, sourceUrl, createdAt, viaLinkClick }
@@ -1559,6 +1583,13 @@ function registerIPC() {
     if (typeof id !== 'string' || id.length > 100) throw new Error('Invalid tab');
     const url = browsingUrl(input);
     const view = views.get(id) || makeTab(id);
+    // User-initiated navigation: the content shows live (no loading card).
+    // This covers the address bar, the home page, quick links, and the
+    // materialising tab of an admitted link click. The view may have been
+    // created hidden by the gate (first document not committed yet) — with
+    // a live tab the gate no longer applies, so re-run the layout now.
+    liveTabs.add(id);
+    applyLayout();
     // Remember which tab a verified popup became (repeat rule: the earlier
     // popup's tab is closed when its page repeats), and arm the popunder
     // fallback watch for tabs whose commit verification timed out.

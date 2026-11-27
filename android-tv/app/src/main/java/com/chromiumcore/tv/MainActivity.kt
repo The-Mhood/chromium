@@ -48,6 +48,7 @@ import androidx.webkit.WebViewFeature
 import com.chromiumcore.tv.core.BlockType
 import com.chromiumcore.tv.core.BrowserSettings
 import com.chromiumcore.tv.core.Cosmetics
+import com.chromiumcore.tv.core.PointerAction
 import com.chromiumcore.tv.core.Direction
 import com.chromiumcore.tv.core.DomainBlocker
 import com.chromiumcore.tv.core.Html
@@ -166,6 +167,10 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        // Hidden with a video in fullscreen: tear the session down. A custom view left
+        // attached across a background/resolution change comes back frozen, or it blocks
+        // the next fullscreen request — the "fullscreen is inconsistent" report.
+        if (customView != null) exitFullscreen()
         webView.onPause()
         flushTotals()
         super.onPause()
@@ -481,10 +486,12 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- fullscreen video
 
     private fun enterFullscreen(view: View, callback: WebChromeClient.CustomViewCallback) {
-        if (customView != null) {
-            callback.onCustomViewHidden()
-            return
-        }
+        // A page can request fullscreen again while our session is still up (it toggled it,
+        // or the previous hide never reported). REPLACE the old session: the previous code
+        // dropped the new request and kept showing the old — possibly already-detached —
+        // video element, which is the "fullscreen works sometimes, doesn't work sometimes"
+        // report.
+        teardownFullscreenView()
         customView = view
         customCallback = callback
         previousSystemUiVisibility = window.decorView.systemUiVisibility
@@ -503,16 +510,23 @@ class MainActivity : Activity() {
         updatePointerVisibility()
     }
 
-    private fun exitFullscreen() {
+    /** Removes the video view from the fullscreen container and releases the page's callback.
+     *  No-op when there is no active session. */
+    private fun teardownFullscreenView() {
         val view = customView ?: return
         val callback = customCallback
         customView = null
         customCallback = null
         fullscreenContainer.removeView(view)
+        callback?.onCustomViewHidden()
+    }
+
+    private fun exitFullscreen() {
+        if (customView == null) return
+        teardownFullscreenView()
         fullscreenContainer.visibility = View.GONE
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.decorView.systemUiVisibility = previousSystemUiVisibility
-        callback?.onCustomViewHidden()
         clampPointer()
         webView.requestFocus()
         updatePointerVisibility()
@@ -544,6 +558,16 @@ class MainActivity : Activity() {
             KeyEvent.KEYCODE_SEARCH -> {
                 if (down && event.repeatCount == 0) focusAddressBar()
                 return true
+            }
+            KeyEvent.KEYCODE_BACK -> {
+                // In sticky-immersive fullscreen the FRAMEWORK swallows the first Back press to
+                // reveal the system bars, so leaving video fullscreen took two presses (or the
+                // press seemed dead) — the "fullscreen is inconsistent" report. Intercepting
+                // here, before the framework's immersive handling, makes every Back press exit.
+                if (down && event.repeatCount == 0 && customView != null) {
+                    exitFullscreen()
+                    return true
+                }
             }
         }
         if (pointerActive(event) && handlePointerKey(event)) return true
@@ -594,25 +618,32 @@ class MainActivity : Activity() {
     }
 
     private fun movePointer(direction: Direction, repeat: Int) {
-        if (customView == null &&
-            PointerMath.inScrollBand(pointerX, pointerY, direction, pointerBounds(), PointerMath.SCROLL_ZONE_DP * density)
+        // SCROLL ZONE: the page scrolls while the pointer is inside the top or bottom quarter
+        // of the page (see PointerMath.scrollDecision) — it no longer has to travel to the very
+        // edge first (half a screen away on a TV, which is what made YouTube feel unscrollable,
+        // and what the old 48dp band still failed to fix). The pointer stays put while the page
+        // moves, so keeping the key held scrolls steadily at one line per repeat.
+        val bounds = pointerBounds()
+        val zone = PointerMath.scrollZonePx(bounds.bottom - bounds.top, density)
+        when (PointerMath.scrollDecision(pointerX, pointerY, direction, bounds, zone,
+            webView.canScrollVertically(-1), webView.canScrollVertically(1))
         ) {
-            // SCROLL BAND: the page scrolls while the pointer is still inside the top or bottom
-            // band — it no longer has to travel to the very edge first (half a screen away on a
-            // TV, which is what made YouTube feel unscrollable). The pointer stays put while the
-            // page moves, so keeping the key held scrolls steadily at one line per repeat.
-            when (direction) {
-                Direction.DOWN -> scrollLines(PointerMath.EDGE_SCROLL_LINES)
-                Direction.UP -> when {
-                    webView.canScrollVertically(-1) -> scrollLines(-PointerMath.EDGE_SCROLL_LINES)
-                    repeat == 0 -> focusToolbar() // at the top of the page: the next press up reaches the toolbar
-                }
-                else -> Unit
+            PointerAction.SCROLL_DOWN -> {
+                scrollLines(PointerMath.EDGE_SCROLL_LINES)
+                return
             }
-            return
+            PointerAction.SCROLL_UP -> {
+                scrollLines(-PointerMath.EDGE_SCROLL_LINES)
+                return
+            }
+            PointerAction.FOCUS_TOOLBAR -> {
+                if (repeat == 0) focusToolbar() // at the top of the page: the next press up reaches the toolbar
+                return
+            }
+            PointerAction.MOVE_POINTER -> Unit
         }
         val step = PointerMath.step(PointerMath.BASE_STEP_DP * density, repeat, PointerMath.speedFactor(settings.pointerSpeed))
-        val move = PointerMath.move(pointerX, pointerY, direction, step, pointerBounds())
+        val move = PointerMath.move(pointerX, pointerY, direction, step, bounds)
         pointerX = move.x
         pointerY = move.y
         overlay.moveTo(pointerX, pointerY)

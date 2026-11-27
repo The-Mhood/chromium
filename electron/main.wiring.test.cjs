@@ -519,49 +519,76 @@ test('main process wiring (Electron stub)', async t => {
   const findInspector = known => winStub().contentView.__views.find(v => !known.has(v));
   const closeTabs = async (...ids) => { for (const id of ids) await calls.ipcHandles.get('core:close')(fakeEvent(), id); };
 
-  await t.test('the loading gate releases on did-finish-load (no hard hang if the commit signal is missing)', async () => {
-    // Field failure (v1.0.17): a page whose commit event never reached the
-    // gate sat on the loading card forever even though the document fully
-    // loaded (title + URL published). Any proof-of-document signal must
-    // release the gate.
-    const { view } = await freshTab('gate-1', 'https://slowdoc.example.com/', { holdCommit: true });
-    assert.equal(view.__visible, false, 'the tab stays on the loading card while the load is in flight');
+  await t.test('user-navigated tabs paint live: no loading card blanks the page between a click and its document', async () => {
+    // Field report: every link first blanked to the loading card ("I need
+    // links to load without blanking"). User-initiated navigation (the
+    // address bar, quick links, admitted link clicks) must paint live from
+    // the first frame, like an ordinary browser. Scripted opens are still
+    // gated until their first commit is verified — that is where the ad
+    // flash risk lives, and the hidden-inspector tests above cover it.
+    const { view } = await freshTab('live-1', 'https://slowdoc.example.com/', { holdCommit: true });
+    assert.equal(view.__visible, true, 'the user-navigated tab is visible while its load is in flight');
     view.webContents.emit('did-finish-load');
-    assert.equal(view.__visible, true, 'did-finish-load released the gate');
-    await closeTabs('gate-1');
+    assert.equal(view.__visible, true, 'still visible after the load finishes');
+    await closeTabs('live-1');
   });
 
-  await t.test('the loading gate fails open when no document signal ever arrives', async () => {
-    const { view } = await freshTab('gate-2', 'https://stalled.example.com/', { holdCommit: true });
-    assert.equal(view.__visible, false, 'the tab is on the loading card');
-    // Nothing commits, finishes or retitles: the fail-open must let the
-    // page through rather than hold the user on the card forever.
-    await new Promise(resolve => setTimeout(resolve, 6600));
-    assert.equal(view.__visible, true, 'the gate failed open after the timeout');
-    await closeTabs('gate-2');
-  });
-
-  await t.test('hostile: a captcha-gated ad popup (click in a third-party iframe, open from the top frame) is blocked', async () => {
-    // Field bug: the user checks a reCAPTCHA box inside a third-party
-    // iframe; the ad script then window.opens its landing page from the
-    // TOP frame. The click is genuine and fresh, but it landed in a
-    // different frame than the scripted open — a third-party-widget click
-    // must not authorize a top-frame scripted open.
+  await t.test('hostile: a gated ad popup (click in a third-party ad iframe, open from the top frame) is blocked', async () => {
+    // Field bug: the user interacts with a third-party ad widget (a
+    // genuine fresh click recorded in the cross-origin iframe); the ad
+    // script then window.opens its landing page from the TOP frame. The
+    // click must not authorize the top-frame scripted open — but note the
+    // click frame is an AD NETWORK: a known captcha provider's click is
+    // exempt (the post-captcha continuation test below covers that).
     cdpStub.pageStateEnabled = true;
     try {
       const { view: page } = await freshTab('gate-3', 'https://victim.example.com/');
       const viewsBefore = winStub().contentView.__views.length;
       const now = Date.now();
       cdpStub.stateValue = {
-        click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'accounts.google.com', topHost: 'victim.example.com' },
+        click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com' },
         open: { t: now, isTop: true, crossOrigin: false, frameHost: 'victim.example.com', topHost: 'victim.example.com' },
       };
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://promo.example.com/landing', disposition: 'foreground-tab' });
       await settle();
-      assert.ok(!openPublished('https://promo.example.com/landing'), 'the captcha-gated popup was blocked');
+      assert.ok(!openPublished('https://promo.example.com/landing'), 'the gated popup was blocked');
       assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
       await closeTabs('gate-3');
+    } finally {
+      cdpStub.pageStateEnabled = false;
+      cdpStub.stateValue = null;
+    }
+  });
+
+  await t.test('captcha: a top-frame open right after solving a captcha opens (and is commit-verified)', async () => {
+    // Field report: "the captcha doesn't open a new tab" — the round-11
+    // gated-popup rule blocked the site's OWN continuation (sign-in /
+    // verify age) that opens from the top frame right after the user's
+    // click in the captcha provider's iframe. Known captcha providers are
+    // exempt from the gated-popup DENY; the open is still a top-frame
+    // SCRIPTED open, so it pays the hidden-inspector verification like any
+    // other scripted open (and this test commits that inspector — an
+    // abandoned inspector would leak into the later suites' findInspector).
+    cdpStub.pageStateEnabled = true;
+    try {
+      const { view: page, known } = await freshTab('cap-1', 'https://gated.example.com/verify');
+      const now = Date.now();
+      cdpStub.stateValue = {
+        click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'www.google.com', topHost: 'gated.example.com' },
+        open: { t: now, isTop: true, crossOrigin: false, frameHost: 'gated.example.com', topHost: 'gated.example.com' },
+      };
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://continue.example.com/next', disposition: 'foreground-tab' });
+      await settle();
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'the continuation is verified in the hidden inspector');
+      assert.ok(!openPublished('https://continue.example.com/next'), 'no chip before the destination is verified');
+      // The site commits to its own continuation page (no redirect): pass.
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(openPublished('https://continue.example.com/next'), 'the post-captcha continuation opened');
+      await closeTabs('cap-1');
     } finally {
       cdpStub.pageStateEnabled = false;
       cdpStub.stateValue = null;
@@ -588,6 +615,30 @@ test('main process wiring (Electron stub)', async t => {
     assert.deepEqual(state.payload, { media: false, window: false }, 'the media session ended too');
     wc.__mediaState = null;
     await closeTabs('fs-p');
+  });
+
+  await t.test('media: a transient pause (player remount / seek) does not end the fullscreen session', async () => {
+    // Inconsistent-fullscreen report: one stray "paused" reading used to
+    // drop the user out of fullscreen. Players remount their <video> on
+    // quality changes and read "paused" briefly on seek — the session may
+    // only end when the pause HOLDS across two consecutive polls.
+    const { view } = await freshTab('fs-t', 'https://video.example.com/watch-2');
+    const wc = view.webContents;
+    calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
+    wc.emit('enter-html-full-screen');
+    wc.__mediaState = { paused: false, ended: false };
+    // A pause blip shorter than one poll period: at most one poll sees it.
+    wc.__mediaState = { paused: true, ended: false };
+    await new Promise(resolve => setTimeout(resolve, 60));
+    wc.__mediaState = { paused: false, ended: false };
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(winStub().__fullscreen, true, 'the transient pause did not end the session');
+    // A sustained pause (held across two polls) still ends the session.
+    wc.__mediaState = { paused: true, ended: false };
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(winStub().__fullscreen, false, 'a sustained pause ends the session');
+    wc.__mediaState = null;
+    await closeTabs('fs-t');
   });
 
   await t.test('fullscreen: going back on the media tab releases the fullscreen session', async () => {
