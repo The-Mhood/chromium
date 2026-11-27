@@ -50,7 +50,6 @@ import com.chromiumcore.tv.core.BrowserSettings
 import com.chromiumcore.tv.core.Cosmetics
 import com.chromiumcore.tv.core.Direction
 import com.chromiumcore.tv.core.DomainBlocker
-import com.chromiumcore.tv.core.Edge
 import com.chromiumcore.tv.core.Html
 import com.chromiumcore.tv.core.PointerBounds
 import com.chromiumcore.tv.core.PointerMath
@@ -79,6 +78,7 @@ class MainActivity : Activity() {
     private lateinit var store: SettingsStore
     private lateinit var webView: WebView
     private lateinit var overlay: PointerOverlayView
+    private lateinit var newWindowHost: ViewGroup
     private lateinit var toolbar: View
     private lateinit var urlField: EditText
     private lateinit var counter: TextView
@@ -127,6 +127,7 @@ class MainActivity : Activity() {
         counter = findViewById(R.id.counter)
         progress = findViewById(R.id.progress)
         webView = findViewById(R.id.web_view)
+        newWindowHost = findViewById(R.id.new_window_host)
         overlay = findViewById(R.id.pointer)
         fullscreenContainer = findViewById(R.id.fullscreen_container)
         defaultUserAgent = WebSettings.getDefaultUserAgent(this)
@@ -285,27 +286,55 @@ class MainActivity : Activity() {
                     return false
                 }
                 val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
-                // User-initiated links may open in this tab, but known advertising destinations
-                // are rejected even when the popup was triggered by a click.
+                // The new window is a real, hidden but ATTACHED WebView. An unattached carrier
+                // is never laid out on many devices, its first navigation never starts, and the
+                // user's "open in new tab" click died silently — the reported "new pages don't
+                // open". A 1dp attached host is enough for the load to begin so it can be
+                // intercepted and handed to the visible tab.
                 val carrier = WebView(this@MainActivity)
-                carrier.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
-                        val scheme = request.url.scheme?.lowercase()
-                        val host = request.url.host
+                var handedOff = false
+                val handoff: (String) -> Unit = { rawUrl ->
+                    if (!handedOff) {
+                        handedOff = true
+                        // User-initiated links open in this tab, but known advertising
+                        // destinations are rejected even when the popup was triggered by a click.
                         val latest = settings
+                        val host = runCatching { Uri.parse(rawUrl).host }.getOrNull()
                         val blockedAd = latest.protection && latest.popups && !latest.isAllowlisted(pageHost) &&
-                            blocker.classify(host, pageHost) == BlockType.AD
+                            host != null && blocker.classify(host, pageHost) == BlockType.AD
                         if (blockedAd) {
                             sessionPopups.incrementAndGet()
                             scheduleCounterUpdate()
-                        } else if (scheme == "http" || scheme == "https") {
-                            webView.loadUrl(request.url.toString())
+                        } else {
+                            val scheme = rawUrl.substringBefore("://").lowercase()
+                            if (scheme == "http" || scheme == "https") webView.loadUrl(rawUrl)
                         }
-                        handler.post { runCatching { v.destroy() } }
-                        return true
+                        handler.post {
+                            newWindowHost.removeView(carrier)
+                            runCatching { carrier.destroy() }
+                        }
                     }
                 }
-                handler.postDelayed({ runCatching { carrier.destroy() } }, 15000)
+                carrier.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
+                        handoff(request.url.toString())
+                        return true
+                    }
+
+                    // Fallback for WebView builds where the initial load of a transported window
+                    // does not offer an override: onPageStarted still sees the destination.
+                    override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                        if (url != null) handoff(url)
+                    }
+                }
+                newWindowHost.addView(carrier)
+                // Safety net: a window that never navigates (blocked or dead URL) still goes away.
+                handler.postDelayed({
+                    if (!handedOff) runCatching {
+                        newWindowHost.removeView(carrier)
+                        carrier.destroy()
+                    }
+                }, 15000)
                 transport.webView = carrier
                 resultMsg.sendToTarget()
                 return true
@@ -565,22 +594,29 @@ class MainActivity : Activity() {
     }
 
     private fun movePointer(direction: Direction, repeat: Int) {
+        if (customView == null &&
+            PointerMath.inScrollBand(pointerX, pointerY, direction, pointerBounds(), PointerMath.SCROLL_ZONE_DP * density)
+        ) {
+            // SCROLL BAND: the page scrolls while the pointer is still inside the top or bottom
+            // band — it no longer has to travel to the very edge first (half a screen away on a
+            // TV, which is what made YouTube feel unscrollable). The pointer stays put while the
+            // page moves, so keeping the key held scrolls steadily at one line per repeat.
+            when (direction) {
+                Direction.DOWN -> scrollLines(PointerMath.EDGE_SCROLL_LINES)
+                Direction.UP -> when {
+                    webView.canScrollVertically(-1) -> scrollLines(-PointerMath.EDGE_SCROLL_LINES)
+                    repeat == 0 -> focusToolbar() // at the top of the page: the next press up reaches the toolbar
+                }
+                else -> Unit
+            }
+            return
+        }
         val step = PointerMath.step(PointerMath.BASE_STEP_DP * density, repeat, PointerMath.speedFactor(settings.pointerSpeed))
         val move = PointerMath.move(pointerX, pointerY, direction, step, pointerBounds())
         pointerX = move.x
         pointerY = move.y
         overlay.moveTo(pointerX, pointerY)
         wakePointer()
-        if (customView == null) {
-            when (move.edge) {
-                Edge.TOP -> when {
-                    webView.canScrollVertically(-1) -> scrollLines(-PointerMath.scrollSteps(repeat))
-                    move.wasAtEdge && repeat == 0 -> focusToolbar()
-                }
-                Edge.BOTTOM -> scrollLines(PointerMath.scrollSteps(repeat))
-                else -> Unit
-            }
-        }
         dispatchHover()
     }
 
@@ -794,7 +830,7 @@ class MainActivity : Activity() {
             .setMessage(
                 "Arrow keys: move the pointer. Hold to move faster.\n" +
                     "OK / Select: click at the pointer.\n" +
-                    "Pointer at the top or bottom edge: keep pressing to scroll.\n" +
+                    "Pointer near the top or bottom edge: keep pressing to scroll the page.\n" +
                     "Channel or Page Up / Down: scroll the page.\n" +
                     "Pointer at the top of a page: press Up again to reach the toolbar.\n" +
                     "Menu or Info: open this menu. Search: edit the address.\n" +

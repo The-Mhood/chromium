@@ -47,6 +47,19 @@ class PointerMathTest {
         assertTrue(held > first)
         assertEquals(capped, PointerMath.step(10f, 500, 1f), 0.001f)
         assertEquals(10f, first, 0.001f)
+        // The cap is 3x the base step: a held key gains momentum but never zooms
+        // across the screen (the old ramp reached about 6.6x).
+        assertEquals(30f, capped, 0.001f)
+    }
+
+    @Test
+    fun theDefaultStepStartsNormalAndHeldCapsAtThreeTimes() {
+        // 10dp base at density 2, speed level 1 (Normal): one press moves 20px,
+        // a held key tops out at 60px/press.
+        val base = PointerMath.step(PointerMath.BASE_STEP_DP * 2f, 0, PointerMath.speedFactor(1))
+        assertEquals(20f, base, 0.001f)
+        val held = PointerMath.step(PointerMath.BASE_STEP_DP * 2f, PointerMath.MAX_RAMP_REPEATS, PointerMath.speedFactor(1))
+        assertEquals(60f, held, 0.001f)
     }
 
     @Test
@@ -57,10 +70,29 @@ class PointerMathTest {
     }
 
     @Test
-    fun scrollStepsGrowWithRepeatsButStayBounded() {
-        assertEquals(1, PointerMath.scrollSteps(0))
-        assertTrue(PointerMath.scrollSteps(8) > PointerMath.scrollSteps(0))
-        assertEquals(4, PointerMath.scrollSteps(400))
+    fun edgeScrollIsConstantSoAHeldKeyNeverAcceleratesOutOfControl() {
+        // The OS repeats a held key faster and faster; if the per-press scroll
+        // amount also grew with the repeat count, the page first crawled and
+        // then zoomed. One line per press keeps the speed steady.
+        assertEquals(1, PointerMath.EDGE_SCROLL_LINES)
+    }
+
+    @Test
+    fun theScrollBandStartsBeforeTheEdge() {
+        val zone = 48f
+        // Bottom band: the band starts 48px above the bottom (600 - 48 = 552).
+        assertTrue(PointerMath.inScrollBand(500f, 560f, Direction.DOWN, bounds, zone))
+        assertTrue(PointerMath.inScrollBand(500f, 552f, Direction.DOWN, bounds, zone))
+        assertFalse(PointerMath.inScrollBand(500f, 551f, Direction.DOWN, bounds, zone))
+        // Top band: it ends 48px below the top (48).
+        assertTrue(PointerMath.inScrollBand(500f, 40f, Direction.UP, bounds, zone))
+        assertTrue(PointerMath.inScrollBand(500f, 0f, Direction.UP, bounds, zone))
+        assertFalse(PointerMath.inScrollBand(500f, 49f, Direction.UP, bounds, zone))
+        // Mid-screen is never in a band, and sideways keys never scroll.
+        assertFalse(PointerMath.inScrollBand(500f, 300f, Direction.DOWN, bounds, zone))
+        assertFalse(PointerMath.inScrollBand(500f, 300f, Direction.UP, bounds, zone))
+        assertFalse(PointerMath.inScrollBand(40f, 300f, Direction.LEFT, bounds, zone))
+        assertFalse(PointerMath.inScrollBand(960f, 300f, Direction.RIGHT, bounds, zone))
     }
 
     @Test

@@ -135,4 +135,14 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:focusable="false" />
+
+    <!-- Host for window.open / target=_blank carriers: a WebView must be attached to a laid-out
+         view before its first navigation starts, so hidden new windows live here for the brief
+         moment needed to hand their destination over to the visible tab. -->
+    <FrameLayout
+        android:id="@+id/new_window_host"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:clickable="false"
+        android:focusable="false" />
 </FrameLayout>
