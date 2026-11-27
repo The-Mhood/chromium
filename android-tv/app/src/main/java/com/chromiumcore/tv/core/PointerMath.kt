@@ -6,6 +6,9 @@ enum class Direction { UP, DOWN, LEFT, RIGHT }
 
 enum class Edge { NONE, TOP, BOTTOM, LEFT, RIGHT }
 
+/** What one direction-key press should do at the pointer's current position. */
+enum class PointerAction { MOVE_POINTER, SCROLL_UP, SCROLL_DOWN, FOCUS_TOOLBAR }
+
 /** The rectangle, in overlay coordinates, that the pointer may move inside. */
 data class PointerBounds(val left: Float, val top: Float, val right: Float, val bottom: Float) {
     fun clampX(value: Float): Float = value.coerceIn(left, max(left, right))
@@ -33,6 +36,19 @@ object PointerMath {
      *  key faster and faster, so a per-press amount that grew with repeat count made the page
      *  crawl at first and then zoom out of control. One line per press = steady speed. */
     const val EDGE_SCROLL_LINES = 1
+    /** Fraction of the page height (top or bottom) where a direction press scrolls the page
+     *  instead of moving the pointer. The old fixed 48dp band sat so close to the edge that
+     *  the pointer first had to travel half the TV screen before scrolling could begin —
+     *  which is why YouTube still felt unscrollable after the band was added. A quarter of
+     *  the page means a press from the middle of the screen reaches the zone in one or two
+     *  steps, and a held key starts scrolling almost immediately. */
+    const val SCROLL_ZONE_FRACTION = 0.25f
+    /** Floor so the zone stays usable on very short viewports — the old fixed 48dp width. */
+    const val MIN_SCROLL_ZONE_DP = 48f
+
+    /** Scroll-zone width in px for a page of [viewportPx] (fraction, with a dp floor). */
+    fun scrollZonePx(viewportPx: Float, density: Float): Float =
+        (viewportPx * SCROLL_ZONE_FRACTION).coerceAtLeast(MIN_SCROLL_ZONE_DP * density)
 
     /** Holding a direction key speeds the pointer up gradually, from 1x to a capped 3x. The cap
      *  (old: about 6.6x) keeps a held key from zooming across the screen — the ramp should feel
@@ -56,6 +72,41 @@ object PointerMath {
         Direction.DOWN -> bounds.bottom >= bounds.top && y >= bounds.bottom - zonePx
         Direction.UP -> bounds.bottom >= bounds.top && y <= bounds.top + zonePx
         Direction.LEFT, Direction.RIGHT -> false
+    }
+
+    /**
+     * Decide what ONE direction-key press does at the pointer's position. The zones are
+     * deliberately asymmetric:
+     *  - DOWN in the bottom zone scrolls down (when the page can); at the very bottom of the
+     *    page it just moves the pointer, so the press is never swallowed;
+     *  - UP in the bottom zone scrolls the page back up when it can — the "get back up
+     *    YouTube" path — and otherwise lets the pointer leave the zone;
+     *  - UP in the top zone scrolls up when the page can, otherwise the press is aimed at
+     *    the toolbar (the caller applies its fresh-press rule);
+     *  - DOWN in the top zone ALWAYS moves the pointer: the pointer must be able to travel
+     *    from the top into the page, that is where every navigation starts.
+     * LEFT/RIGHT never scroll (horizontal pages are rare on a TV).
+     */
+    fun scrollDecision(
+        x: Float,
+        y: Float,
+        direction: Direction,
+        bounds: PointerBounds,
+        zonePx: Float,
+        canScrollUp: Boolean,
+        canScrollDown: Boolean
+    ): PointerAction {
+        val topZone = bounds.bottom >= bounds.top && y <= bounds.top + zonePx
+        val bottomZone = bounds.bottom >= bounds.top && y >= bounds.bottom - zonePx
+        return when (direction) {
+            Direction.DOWN -> if (bottomZone && canScrollDown) PointerAction.SCROLL_DOWN else PointerAction.MOVE_POINTER
+            Direction.UP -> when {
+                topZone -> if (canScrollUp) PointerAction.SCROLL_UP else PointerAction.FOCUS_TOOLBAR
+                bottomZone -> if (canScrollUp) PointerAction.SCROLL_UP else PointerAction.MOVE_POINTER
+                else -> PointerAction.MOVE_POINTER
+            }
+            Direction.LEFT, Direction.RIGHT -> PointerAction.MOVE_POINTER
+        }
     }
 
     fun move(x: Float, y: Float, direction: Direction, step: Float, bounds: PointerBounds): PointerMove {

@@ -114,6 +114,14 @@
 // made "site links refuse to click".
 // ---------------------------------------------------------------------------
 
+// Known captcha / challenge providers (registrable domains). A click recorded
+// in one of these frames is the user solving a challenge, and the top-frame
+// scripted open that follows is (usually) the site's own continuation —
+// sign-in, age check, payment — not the ad network borrowing the gesture.
+// Those continuations must open; their destinations still pay the full commit
+// verification, so an ad landing that borrows a real captcha is still caught
+// when it commits.
+const CAPTCHA_PROVIDERS = new Set(['google.com', 'recaptcha.net', 'hcaptcha.com', 'cloudflare.com', 'arkoselabs.com', 'challenge-platform.com']);
 const GESTURE_WINDOW_MS = 1500;
 // A page that fires more than one script popup inside this window — even
 // with a fresh click for each — is an ad redirector, not a user workflow.
@@ -356,7 +364,13 @@ function createPopupPolicy(options = {}) {
     if (!isLinkClick) {
       const openRecord = pageState && pageState.open;
       const clickRecord = pageState && pageState.click;
-      if (openRecord && openRecord.crossOrigin !== true &&
+      // The click frame is a known captcha provider: the user just solved a
+      // challenge and this open is the site's own continuation. Not gated —
+      // but the normal activation + commit-verification rules still apply
+      // below, so an ad landing that borrowed the captcha is caught there.
+      const captchaFrame = !!(clickRecord && typeof clickRecord.frameHost === 'string' &&
+        CAPTCHA_PROVIDERS.has(getRegistrableDomain('https://' + clickRecord.frameHost)));
+      if (openRecord && openRecord.crossOrigin !== true && !captchaFrame &&
           clickRecord && clickRecord.crossOrigin === true &&
           typeof clickRecord.t === 'number' && typeof openRecord.t === 'number' &&
           clickRecord.t <= openRecord.t + 2000) {

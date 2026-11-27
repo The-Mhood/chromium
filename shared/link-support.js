@@ -44,8 +44,15 @@
     Object.defineProperty(window, '__ccLinkState', { value: {} });
 
     var MAGIC = '%CC-LINK% ';
-    var COMMIT_DELAY_MS = 300;  // how long a single click waits before it commits
-    var SECOND_CLICK_MS = 600;  // a second click on the same anchor within this span is a double-click
+    // A single click on a same-frame link waits this long before it commits,
+    // leaving room for the SECOND click of a double-click to cancel it and
+    // open the options dialog. This IS the effective double window for
+    // same-frame links (the pending record only lives until the commit), so
+    // it must cover a MANUAL double — 300 ms was an OS-double-click window
+    // and a deliberate "double click" at desk or TV distance simply never
+    // registered, which is the "double click doesn't work" report.
+    var COMMIT_DELAY_MS = 600;
+    var SECOND_CLICK_MS = 1000; // a second click/tap on the same anchor within this span is a double-click
 
     var state = { pending: null, last: null, lastBlank: null, rightTap: null, cooldownUntil: 0 };
 
@@ -175,6 +182,7 @@
           state.last = { anchor: anchor, href: href, at: Date.now() };
           state.rightTap = null;
           state.cooldownUntil = Date.now() + 400;
+          event.preventDefault(); // the click is the double, not a fresh navigation
           openDialog();
           return;
         }
@@ -196,6 +204,7 @@
           if (state.lastBlank && state.lastBlank.anchor === anchor && Date.now() - state.lastBlank.at < SECOND_CLICK_MS) {
             state.lastBlank = null;
             state.cooldownUntil = Date.now() + 400;
+            event.preventDefault(); // do not open a SECOND new-tab for the double-click
             openDialog();
             return;
           }
@@ -210,6 +219,7 @@
           state.last = { anchor: anchor, href: href, at: Date.now() };
           cancelPending();
           state.cooldownUntil = Date.now() + 400;
+          event.preventDefault(); // the page must NOT navigate on a double-click
           openDialog();
           return;
         }
@@ -224,6 +234,10 @@
         // browser navigate immediately on the first click — the deferred
         // commit then raced the real navigation and a second click could
         // never cancel anything, so the double-click dialog never won.
+        // A previous click's deferral is superseded by this one: clear its
+        // timer, or it would commit the OLD anchor early (and the user's
+        // latest click — the one that should win — would be lost).
+        cancelPending();
         state.pending = { anchor: anchor, href: href, at: Date.now(), urlBefore: location.href, timer: null };
         state.last = { anchor: anchor, href: href, at: Date.now() };
         event.preventDefault();
@@ -293,10 +307,17 @@
         var blankHit = state.lastBlank && state.lastBlank.anchor === anchor && now - state.lastBlank.at < SECOND_CLICK_MS;
         var rightHit = state.rightTap && state.rightTap.anchor === anchor && now - state.rightTap.at < SECOND_CLICK_MS;
         if (!pendingHit && !blankHit && !rightHit) {
-          // A lone tap on a link: keep the native context menu (copy link
-          // address & co.) but remember it, so a following click within the
-          // double window still counts as the second click.
+          // A lone tap on a link: remember it, and do NOT show the native
+          // menu. The menu can't be kept: on Windows/Mac trackpads the
+          // follow-up two-finger tap lands on the OPEN menu, which it only
+          // dismisses — no second contextmenu ever fires and the dialog
+          // never opens ("two-finger tap doesn't work"). We can't tell a
+          // two-finger tap from a right click on the FIRST tap, so both get
+          // the same treatment: the follow-up tap within the double window
+          // opens the options dialog, which offers everything the menu's
+          // link actions did (open in tab/window, copy, download).
           state.rightTap = { anchor: anchor, href: href, at: now };
+          event.preventDefault();
           return;
         }
         // Second tap of a double: the dialog, and no context menu.

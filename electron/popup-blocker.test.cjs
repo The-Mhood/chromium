@@ -704,15 +704,17 @@ test('registrable domains handle public suffixes and www', () => {
   assert.equal(getRegistrableDomain('not a url'), '');
 });
 
-test('gated popup: fresh click in a third-party (captcha) iframe + top-frame scripted open is blocked', () => {
-  // The shape of the field bug: the user checks a reCAPTCHA box (a
-  // trusted click recorded in the third-party iframe) and the ad script
-  // immediately window.opens its landing page from the TOP frame. The
-  // open record is top-frame + fresh, the input is genuine and fresh —
-  // the only thing separating this from a real user action is WHERE the
-  // click landed versus WHERE the open came from. The main process
-  // routes this open as scripted (a window.open record, no anchor href),
-  // so treatAsScripted is true — the disposition alone is not evidence.
+test('gated popup: fresh click in a third-party ad iframe + top-frame scripted open is blocked', () => {
+  // The shape of the field bug: the user interacts with a third-party
+  // widget (a trusted click recorded in the cross-origin iframe) and the
+  // ad script immediately window.opens its landing page from the TOP
+  // frame. The open record is top-frame + fresh, the input is genuine and
+  // fresh — the only thing separating this from a real user action is
+  // WHERE the click landed versus WHERE the open came from. The main
+  // process routes this open as scripted (a window.open record, no anchor
+  // href), so treatAsScripted is true — the disposition alone is not
+  // evidence. (The click frame is a plain ad network, NOT a known captcha
+  // provider — a real captcha continuation is exempt, see below.)
   const { classify } = makePolicy();
   const now = 1_000_000;
   const decision = classify({
@@ -724,11 +726,36 @@ test('gated popup: fresh click in a third-party (captcha) iframe + top-frame scr
     pageState: {
       ageMs: 0,
       open: { t: now, isTop: true, crossOrigin: false, frameHost: 'victim.test', topHost: 'victim.test' },
-      click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'accounts.google.com', topHost: 'victim.test' },
+      click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.test' },
     },
   });
-  assert.equal(decision.allowed, false, 'the captcha-gated popup is blocked');
+  assert.equal(decision.allowed, false, 'the gated popup is blocked');
   assert.equal(decision.reason, 'gated-popup');
+});
+
+test('gated popup: a click from a known captcha provider frame is exempt (continuation is commit-verified)', () => {
+  // Field report: "the captcha doesn't open a new tab". After the user
+  // solves a Google challenge, the page's own continuation (sign-in, age
+  // check, payment) opens a tab from the top frame right after the
+  // cross-origin captcha click. That is not the ad pattern — but its
+  // destination must still pay the full commit verification.
+  const { classify } = makePolicy();
+  const now = 1_000_000;
+  const decision = classify({
+    url: 'https://gated.test/continue',
+    sourceUrl: 'https://gated.test/verify',
+    disposition: 'foreground-tab',
+    treatAsScripted: true,
+    atMs: now,
+    pageState: {
+      ageMs: 0,
+      open: { t: now, isTop: true, crossOrigin: false, frameHost: 'gated.test', topHost: 'gated.test' },
+      click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'www.google.com', topHost: 'gated.test' },
+    },
+  });
+  assert.notEqual(decision.reason, 'gated-popup', 'a captcha-provider click is not gated');
+  assert.equal(decision.allowed, true, 'the post-captcha continuation opens');
+  assert.equal(decision.needsCommit, true, 'and its committed URL is still verified');
 });
 
 test('gated popup rule does not fire for same-origin clicks or opens that preceded the click', () => {
