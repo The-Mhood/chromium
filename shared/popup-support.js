@@ -9,15 +9,18 @@
  * popup it fires).
  *
  * It records, per frame:
- *   - when the frame last had a real user activation (pointer, key, touch);
+ *   - when the frame last had a REAL user activation (pointer, key, touch;
+ *     isTrusted events only — page-dispatched synthetic events count for
+ *     nothing, so a page cannot fake its own activation);
  *   - the details of the most recent window.open call made FROM THAT FRAME
  *     (scripted opens);
- *   - the details of the most recent CLICK in that frame: whether the frame
- *     is the top document or a cross-origin iframe, and the href of the
- *     anchor the click landed on. That is how a target=_blank click inside
- *     an ad iframe (the "sponsored link" pattern) is attributed to the
- *     frame that caused it — no window.open call is involved at all, which
- *     is why this had to be recorded separately.
+ *   - the details of the most recent REAL CLICK in that frame (isTrusted):
+ *     whether the frame is the top document or a cross-origin iframe, and
+ *     the href of the anchor the click landed on. That is how a
+ *     target=_blank click inside an ad iframe (the "sponsored link"
+ *     pattern) is attributed to the frame that caused it — no window.open
+ *     call is involved at all, which is why this had to be recorded
+ *     separately.
  *
  * The main process reads these through Runtime.evaluate in this world for
  * every frame of the page and compares them against its own (unspoofable)
@@ -33,7 +36,13 @@
     var state = { t: 0, lastOpen: null, lastClick: null };
     Object.defineProperty(window, '__ccPopupState', { value: state });
 
-    function noteActivity() {
+    // Only REAL user input counts as activation. The isolated world sees
+    // every DOM event, including the synthetic ones a page can dispatch on
+    // its own (element.click() & co.) — counting those would let any page
+    // refresh its own "I was just used" clock at will and open popups
+    // without a human. isTrusted is engine-set and unforgeable.
+    function noteActivity(event) {
+      if (!event.isTrusted) return;
       state.t = Date.now();
     }
     var events = ['pointerdown', 'keydown', 'touchstart', 'mousedown'];
@@ -90,6 +99,9 @@
     try {
       document.addEventListener('click', function (event) {
         try {
+          // Same isTrusted rule as the clock: a synthetic click is not a
+          // click the user made, and must not become click attribution.
+          if (!event.isTrusted) return;
           var record = { t: Date.now() };
           for (var key in frameInfo()) record[key] = frameInfo()[key];
           record.href = '';

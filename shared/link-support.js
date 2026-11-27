@@ -180,6 +180,12 @@
         // page's own handlers still run), and commit after the double
         // window. Everything above is pure, so preventDefault here can only
         // ever apply to a link this script knows how to re-perform.
+        //
+        // The listener MUST be non-passive: a passive listener's
+        // preventDefault() is a no-op (the engine ignores it), which let the
+        // browser navigate immediately on the first click — the deferred
+        // commit then raced the real navigation and a second click could
+        // never cancel anything, so the double-click dialog never won.
         state.pending = { anchor: anchor, href: href, at: Date.now(), urlBefore: location.href, timer: null };
         state.last = { anchor: anchor, href: href, at: Date.now() };
         event.preventDefault();
@@ -187,7 +193,7 @@
       } catch (error) {
         state.pending = null; // fail open: the page must never break because of this
       }
-    }, { capture: true, passive: true });
+    }, { capture: true, passive: false });
 
     // The native dblclick is the browser's own double-click detection and
     // fires right after the second click's dispatch. The plain click path

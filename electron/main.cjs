@@ -280,13 +280,14 @@ function destroyTab(id) {
   applyLayout();
 }
 
-// The activation clock and the per-frame window.open records live in the
-// isolated "cc-popup" world; the page's own world cannot touch them. The
-// open is classified as coming from whichever frame recorded the freshest
-// window.open call — that is how an ad *iframe* is distinguished from the
-// top page. A failed read degrades to the main-process input observation
-// (see popup-blocker.classifyWindowOpen), which still requires a real,
-// recent gesture.
+// The activation clock and the per-frame window.open / click records live in
+// the isolated "cc-popup" world: the page's own world cannot read, reset or
+// fake them, and their listeners accept isTrusted events only (a page that
+// dispatches synthetic input refreshes nothing). An ad *iframe* is
+// distinguished from the top page by its records. The PRIMARY evidence is
+// the main process's own input observation (before-mouse-event /
+// before-input-event on the browser's input pipeline) — it works even when
+// this CDP read fails, which is what a real link click relies on now.
 // The isolated world reports RAW timestamps (same machine clock as the main
 // process). The ages are computed HERE, against the moment the open was
 // requested — never against the moment this read finishes. That read is an
@@ -363,6 +364,12 @@ async function handleWindowOpen(details, contents) {
     logPopup({ source: safeHost(sourceUrl), url: details.url, disposition, decision: 'deny', reason: 'scheme', created: false });
     return;
   }
+  // Page state (isolated-world records) is read for EVERY open: it carries
+  // the cross-origin attribution that rate-limits sponsored links in ad
+  // iframes, and corroborates the main-process input observation. The
+  // gesture decision itself rests on the main-process observation
+  // (before-mouse-event / before-input-event), so a slow or failed read
+  // degrades to pageState=null without blocking an ordinary, real click.
   const pageState = await readPagePopupState(contents, atMs);
   if (contents.isDestroyed()) return;
   const decision = engine.popupPolicy.classifyWindowOpen({
@@ -642,8 +649,31 @@ function wireBrowsingContents(contents, id, opts = {}) {
     contents.on('leave-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaLeave(id); });
   }
 
+  // Input evidence for the popup policy and the fullscreen activity clock.
+  // The two channels are different and both are needed:
+  //   * before-mouse-event — fires in the browser's INPUT PIPELINE before a
+  //     real mouse event is dispatched to the page. Every genuine click
+  //     that can open a link necessarily passes through here, so it is an
+  //     unspoofable, CDP-independent record of the gesture. A synthetic
+  //     element.click() is generated inside the renderer and never passes
+  //     through the browser's input pipeline — it leaves no trace here.
+  //     (This is the split that tells a user's link click apart from an
+  //     ad's scripted click-through.)
+  //   * before-input-event — keyboard ONLY. The engine emits it solely
+  //     from the keyboard dispatch path (verified against Electron's
+  //     PreHandleKeyboardEvent); its `input.type` is keyDown/keyUp. The
+  //     old handler's mouseDown/mouseWheel branches could never fire,
+  //     which is why a real mouse click used to leave the main process
+  //     blind: its popup evidence then depended on the isolated-world CDP
+  //     read alone, and on ad-heavy pages that read fails — the user's
+  //     genuine click was denied as "no-gesture" and links "refused to
+  //     click".
+  contents.on('before-mouse-event', (_event, mouse) => {
+    if (onF11) fsCtl.activity(); // ANY mouse activity reveals the chrome (media fullscreen)
+    engine.popupPolicy.observeInput(contents.id, mouse.type);
+  });
   contents.on('before-input-event', (_event, input) => {
-    if (input.type === 'keyDown' || input.type === 'char' || input.type === 'mouseDown' || input.type === 'mouseWheel') {
+    if (input.type === 'keyDown' || input.type === 'char') {
       if (onF11) fsCtl.activity(); // secondary windows do not drive the main window's chrome
       engine.popupPolicy.observeInput(contents.id, input.type);
     }
@@ -738,12 +768,15 @@ function handleLinkCommit(contents, payload) {
     return;
   }
   // target: 'blank' — the browser would have opened a new tab here. Route it
-  // through the same policy a native open gets: a real click on a real anchor
-  // means a fresh gesture (the mouseDown was observed milliseconds ago) and
-  // an href-matched click attribution.
+  // through the same policy a native open gets. A commit can only come from
+  // the isolated link world reacting to a REAL (isTrusted) click, and that
+  // real click passed through the browser's input pipeline — the main
+  // process observed it via before-mouse-event milliseconds ago, so the
+  // gesture check below passes on that evidence. The synthesized click
+  // record (href = destination) exists for attribution and the log line.
   const atMs = Date.now();
   const pageState = {
-    ageMs: 999999999, // the main-process input observation is the gesture source here
+    ageMs: 999999999, // the main-process mouse observation is the gesture source
     open: null,
     click: { t: atMs, isTop: isTop, crossOrigin, frameHost: '', topHost: '', href: url },
   };
@@ -839,6 +872,15 @@ function openLinkDialog({ url, title, media = false, x, y, sourceTabId }) {
   });
   linkDialogWin.setAlwaysOnTop(true, 'screen-saver');
   linkDialogWin.setMenu(null);
+  // The window is created hidden (show: false) to avoid a white flash: it
+  // becomes visible only once its first frame is ready. Forgetting this
+  // show() is the "double-click does nothing" defect — the dialog is built,
+  // loads its page, and then simply never appears on screen.
+  linkDialogWin.once('ready-to-show', () => {
+    if (!linkDialogWin || linkDialogWin.isDestroyed()) return;
+    linkDialogWin.show();
+    linkDialogWin.focus();
+  });
   // Leave on any focus loss: an outside click dismisses the dialog.
   linkDialogWin.on('blur', () => { if (linkDialogWin && !linkDialogWin.isDestroyed()) linkDialogWin.close(); });
   linkDialogWin.webContents.on('before-input-event', (_event, input) => {
@@ -1212,8 +1254,12 @@ function createWindow() {
     try { createdWindow.close(); } catch { /* already gone */ }
   });
   win.webContents.on('new-window', (event) => { event.preventDefault(); });
+  // before-input-event is keyboard-only in Electron (see the
+  // wireBrowsingContents note); mouse activity arrives via
+  // before-mouse-event. Both feed the fullscreen activity clock.
+  win.webContents.on('before-mouse-event', () => fsCtl.activity());
   win.webContents.on('before-input-event', (_event, input) => {
-    if (input.type === 'keyDown' || input.type === 'char' || input.type === 'mouseDown' || input.type === 'mouseWheel') fsCtl.activity();
+    if (input.type === 'keyDown' || input.type === 'char') fsCtl.activity();
     if (input.type === 'keyDown') {
       if (input.key === 'F11') fsCtl.userToggle();
       else if (input.key === 'Escape' && fsCtl.userFullscreen && !fsCtl.mediaActive) fsCtl.setUserFullscreen(false);
