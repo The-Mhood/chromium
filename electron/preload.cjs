@@ -8,7 +8,7 @@ const subscribe = channel => callback => {
 
 contextBridge.exposeInMainWorld('chromiumCore', {
   platform: process.platform,
-  navigate: (id, url) => ipcRenderer.invoke('core:navigate', id, url),
+  navigate: (id, url, seq) => ipcRenderer.invoke('core:navigate', id, url, seq),
   focusTab: (id, external) => ipcRenderer.invoke('core:focus', id, external),
   closeTab: id => ipcRenderer.invoke('core:close', id),
   tabAction: (id, action) => ipcRenderer.invoke('core:tab-action', id, action),

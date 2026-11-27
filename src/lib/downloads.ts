@@ -12,7 +12,7 @@ export function isRelease(value: unknown): value is Release {
     && typeof release.name === 'string'
     && typeof release.size === 'string'
     && typeof release.file === 'string'
-    && /^ChromiumCore-[\d.]+-(win32|darwin|android)-(x64|arm64|universal)\.(zip|apk)$/.test(release.file)
+    && /^ChromiumCore-[\d.]+-(win32|darwin|android)-(x64|arm64|universal)\.(zip|apk|exe)$/.test(release.file)
     && typeof release.sha256 === 'string'
     && /^[a-f\d]{64}$/i.test(release.sha256);
 }

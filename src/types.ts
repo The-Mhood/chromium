@@ -90,7 +90,12 @@ export interface TabIssue {
 
 export interface DesktopBridge {
   platform: string;
-  navigate: (id: string, url: string) => Promise<void>;
+  // `seq` is the navigation sequence (a monotonic counter bumped on every
+  // user navigation). The main process uses it to tell a fresh navigation
+  // apart from a re-focus of an already-loaded tab: a fresh nav reloads even
+  // when the url string is unchanged (the "Try again" retry), while a plain
+  // tab switch (same seq) must not reload the page.
+  navigate: (id: string, url: string, seq?: number) => Promise<void>;
   focusTab: (id: string, external: boolean) => Promise<void>;
   closeTab: (id: string) => Promise<void>;
   tabAction: (id: string, action: 'back' | 'forward' | 'reload') => Promise<void>;

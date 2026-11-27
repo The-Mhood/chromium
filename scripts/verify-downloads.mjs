@@ -22,7 +22,12 @@ for (const directory of roots) {
       try {
         const header = Buffer.alloc(4);
         await handle.read(header, 0, 4, 0);
-        if (!header.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) throw new Error(`Not a ZIP archive: ${file}`);
+        // .zip and .apk are ZIP containers (PK\x03\x04 magic); the Windows
+        // NSIS installer (.exe) is a native PE binary, so only the archives
+        // are asserted to be real ZIPs.
+        if (release.file.endsWith('.zip') || release.file.endsWith('.apk')) {
+          if (!header.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) throw new Error(`Not a ZIP archive: ${file}`);
+        }
       } finally { await handle.close(); }
       const hash = crypto.createHash('sha256');
       for await (const chunk of createReadStream(file)) hash.update(chunk);

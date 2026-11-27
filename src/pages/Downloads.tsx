@@ -62,7 +62,7 @@ const PLATFORM_COPY: Record<
     name: "Windows",
     tagline: "A fresh window on your internet.",
     madeFor: "Windows 10 or later",
-    extension: ".zip",
+    extension: ".exe",
     badge: "Unsigned preview",
     iconClass: "windows-icon",
   },
@@ -91,19 +91,19 @@ const INSTRUCTIONS: Record<
   win32: {
     title: "A fresh window is a few clicks away.",
     description:
-      "This is an unsigned, portable preview. No account or setup wizard is needed.",
+      "This is an unsigned installer preview. No account is needed — the setup wizard takes a minute.",
     steps: [
       {
-        title: "Extract the ZIP file.",
-        body: "Right-click the archive and choose Extract All. Keep all application files together.",
+        title: "Run the installer.",
+        body: "Double-click the ChromiumCore Setup .exe file. Because the preview is unsigned, Windows SmartScreen may warn — choose More info, then Run.",
       },
       {
-        title: "Open ChromiumCore.exe.",
-        body: "Launch the application from the extracted ChromiumCore folder.",
+        title: "Follow the prompts.",
+        body: "The installer sets up ChromiumCore and adds a Start menu shortcut.",
       },
       {
-        title: "Review any security warning.",
-        body: "The preview is not code-signed. Verify the checksum and only proceed if you trust the source.",
+        title: "Launch the browser.",
+        body: "Open ChromiumCore from the Start menu when the install finishes. Verify the checksum if you want to be thorough.",
       },
     ],
   },
