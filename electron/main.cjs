@@ -260,10 +260,17 @@ function verifyWindowFullscreen(expected) {
       return;
     }
     // Still stuck: the window cannot honour the request. Reflect reality so
-    // the button, Escape handling and media fullscreen all agree again.
-    console.warn('[fullscreen] transition stuck; reconciling state to actual', { expected, actual });
-    fsCtl.windowFullscreenChanged(actual);
-    if (fsCtl.userFullscreen !== actual) fsCtl.setUserFullscreen(actual);
+    // the button, Escape handling and media fullscreen all agree again —
+    // EXCEPT a "not fullscreen" report while a document is in media
+    // fullscreen: mid-playback that is a transition glitch, and dropping
+    // the browser fullscreen while the video plays is the regression the
+    // session contract forbids. The state is reconciled for real when the
+    // session ends (pause / back / exit), which releases it on purpose.
+    console.warn('[fullscreen] transition stuck; reconciling state to actual', { expected, actual, heldForMedia: fsCtl.mediaActive });
+    if (!(actual === false && fsCtl.mediaActive)) {
+      fsCtl.windowFullscreenChanged(actual);
+      if (fsCtl.userFullscreen !== actual) fsCtl.setUserFullscreen(actual);
+    }
     syncFullscreenState();
   }, 200);
 }
@@ -295,6 +302,45 @@ fsCtl.onEffect(effect => {
   if (effect.type === 'layout' || effect.type === 'chrome') applyLayout();
   syncFullscreenState();
 });
+
+// ---------------------------------------------------------------------------
+// Media pause → end the fullscreen session.
+// The contract for a media session: media fullscreen + browser fullscreen
+// persist THROUGHOUT playback, and end together when the user pauses the
+// media or goes back. Pause is page-level state the browser process cannot
+// see as an event, so while the controller is presenting media fullscreen
+// we poll the media element under the document's fullscreen element; on a
+// real pause (or ended) we end the document fullscreen — whose leave
+// handler releases the browser fullscreen as part of the same session.
+// ---------------------------------------------------------------------------
+const MEDIA_PAUSE_CHECK_MS = 500;
+const MEDIA_PAUSE_STATE_EXPR = '(() => { const el = document.fullscreenElement; if (!el) return null; const v = (el.querySelector && el.querySelector("video,audio")) || null; return { paused: v ? v.paused : null, ended: v ? v.ended : null }; })()';
+let mediaPauseTimer = null;
+function armMediaPausePoll() {
+  if (mediaPauseTimer) return;
+  mediaPauseTimer = setInterval(() => {
+    if (!win || win.isDestroyed() || !fsCtl.mediaActive) { disarmMediaPausePoll(); return; }
+    const view = views.get(activeId);
+    const contents = view ? view.webContents : null;
+    if (!contents || contents.isDestroyed()) return;
+    contents.executeJavaScript(MEDIA_PAUSE_STATE_EXPR, true)
+      .then(state => {
+        if (!state || !fsCtl.mediaActive) return;
+        if (state.paused !== true && state.ended !== true) return;
+        console.log('[fullscreen] media paused/ended in fullscreen; releasing the fullscreen session');
+        // End the document fullscreen first (its leave handler releases the
+        // browser fullscreen); release directly as well in case the leave
+        // event is late or lost.
+        contents.executeJavaScript('document.exitFullscreen && document.exitFullscreen().catch(() => {})', true)
+          .catch(() => { /* document mid-navigation */ });
+        if (fsCtl.userFullscreen) fsCtl.setUserFullscreen(false);
+      })
+      .catch(() => { /* navigating or destroyed — the poll retries or disarms */ });
+  }, MEDIA_PAUSE_CHECK_MS);
+}
+function disarmMediaPausePoll() {
+  if (mediaPauseTimer) { clearInterval(mediaPauseTimer); mediaPauseTimer = null; }
+}
 
 // ---------------------------------------------------------------------------
 // Tabs (WebContentsViews for external pages)
@@ -1045,8 +1091,34 @@ function wireBrowsingContents(contents, id, opts = {}) {
     // itself decides (background tabs are presented when focused). Guarding
     // on activeId here was a real bug: a stale activeId (focus IPC not yet
     // run) left the header visible during a video's fullscreen.
-    contents.on('enter-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaEnter(id); });
-    contents.on('leave-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaLeave(id); });
+    contents.on('enter-html-full-screen', () => {
+      if (contents.isDestroyed()) return;
+      fsCtl.mediaEnter(id);
+      armMediaPausePoll();
+    });
+    contents.on('leave-html-full-screen', () => {
+      if (contents.isDestroyed()) return;
+      const owned = fsCtl.mediaTabId === id;
+      fsCtl.mediaLeave(id);
+      disarmMediaPausePoll();
+      // The browser fullscreen rides the media session: when the document
+      // leaves media fullscreen (Esc, the player's exit control, a
+      // pause-driven exit, or navigating away) and the user had also taken
+      // the browser fullscreen, release that too — the two enter and exit
+      // as one session, so a stuck-fullscreen state cannot re-form.
+      // "owned" matters: a hidden tab's video ending must not release the
+      // user's browser fullscreen on the tab they are actually looking at.
+      if (owned && fsCtl.userFullscreen) fsCtl.setUserFullscreen(false);
+    });
+    contents.on('did-navigate', () => {
+      // A committed navigation to a different document tears down any media
+      // fullscreen (the leave event usually follows, but it has been lost
+      // in the field before) — reconcile the session explicitly on "back".
+      if (fsCtl.mediaTabId === id) {
+        fsCtl.mediaLeave(id);
+        if (fsCtl.userFullscreen) fsCtl.setUserFullscreen(false);
+      }
+    });
   }
 
   // Input evidence for the popup policy and the fullscreen activity clock.
@@ -1804,6 +1876,6 @@ app.whenReady().then(() => {
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => {
-  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer); clearInterval(settleTimer); clearInterval(fullscreenVerifyTimer);
+  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer); clearInterval(settleTimer); clearInterval(fullscreenVerifyTimer); disarmMediaPausePoll();
   if (storePath) { try { fs.writeFileSync(storePath, JSON.stringify(state)); } catch (error) { console.warn('Could not save workspace:', error.message); } }
 });

@@ -703,3 +703,66 @@ test('registrable domains handle public suffixes and www', () => {
   assert.equal(getRegistrableDomain('https://example.com'), 'example.com');
   assert.equal(getRegistrableDomain('not a url'), '');
 });
+
+test('gated popup: fresh click in a third-party (captcha) iframe + top-frame scripted open is blocked', () => {
+  // The shape of the field bug: the user checks a reCAPTCHA box (a
+  // trusted click recorded in the third-party iframe) and the ad script
+  // immediately window.opens its landing page from the TOP frame. The
+  // open record is top-frame + fresh, the input is genuine and fresh —
+  // the only thing separating this from a real user action is WHERE the
+  // click landed versus WHERE the open came from. The main process
+  // routes this open as scripted (a window.open record, no anchor href),
+  // so treatAsScripted is true — the disposition alone is not evidence.
+  const { classify } = makePolicy();
+  const now = 1_000_000;
+  const decision = classify({
+    url: 'https://promo-landing.test/offer',
+    sourceUrl: 'https://victim.test/page',
+    disposition: 'foreground-tab',
+    treatAsScripted: true,
+    atMs: now,
+    pageState: {
+      ageMs: 0,
+      open: { t: now, isTop: true, crossOrigin: false, frameHost: 'victim.test', topHost: 'victim.test' },
+      click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'accounts.google.com', topHost: 'victim.test' },
+    },
+  });
+  assert.equal(decision.allowed, false, 'the captcha-gated popup is blocked');
+  assert.equal(decision.reason, 'gated-popup');
+});
+
+test('gated popup rule does not fire for same-origin clicks or opens that preceded the click', () => {
+  const { classify } = makePolicy();
+  const now = 1_000_000;
+  // (a) Same-origin top-frame click + top-frame open: the ordinary
+  // user-click path must be untouched.
+  const sameOrigin = classify({
+    url: 'https://example.test/page',
+    sourceUrl: 'https://example.test/home',
+    disposition: 'foreground-tab',
+    treatAsScripted: true,
+    atMs: now,
+    pageState: {
+      ageMs: 0,
+      open: { t: now, isTop: true, crossOrigin: false, frameHost: 'example.test', topHost: 'example.test' },
+      click: { t: now - 50, isTop: true, crossOrigin: false, frameHost: 'example.test', topHost: 'example.test' },
+    },
+  });
+  assert.notEqual(sameOrigin.reason, 'gated-popup', 'a same-origin click is never gated');
+  assert.equal(sameOrigin.allowed, true, 'a real top-frame click still opens');
+  // (b) The open happened BEFORE the third-party click — the click cannot
+  // be its cause, so it must not veto the open.
+  const openFirst = classify({
+    url: 'https://promo-landing.test/offer',
+    sourceUrl: 'https://victim.test/page',
+    disposition: 'foreground-tab',
+    treatAsScripted: true,
+    atMs: now,
+    pageState: {
+      ageMs: 0,
+      open: { t: now - 3000, isTop: true, crossOrigin: false, frameHost: 'victim.test', topHost: 'victim.test' },
+      click: { t: now, isTop: false, crossOrigin: true, frameHost: 'accounts.google.com', topHost: 'victim.test' },
+    },
+  });
+  assert.notEqual(openFirst.reason, 'gated-popup', 'an open that preceded the click is not gated');
+});
