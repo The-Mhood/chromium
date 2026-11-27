@@ -214,14 +214,15 @@ test('an OS-initiated fullscreen is adopted, not fought', () => {
   assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: false }]);
 });
 
-test('chrome hides after seven idle seconds while browsing', () => {
+test('the idle timeout is exactly ten seconds', () => {
+  assert.equal(IDLE_MS, 10000, 'the inactivity timeout is 10 s');
   const { ctl, at } = makeController();
   at(1_000_000 + IDLE_MS - 1);
   ctl.tick({ windowFocused: true, showingExternal: true });
-  assert.equal(ctl.chromeVisible, true);
+  assert.equal(ctl.chromeVisible, true, 'still visible at 9.999 s');
   at(1_000_000 + IDLE_MS);
   ctl.tick({ windowFocused: true, showingExternal: true });
-  assert.equal(ctl.chromeVisible, false);
+  assert.equal(ctl.chromeVisible, false, 'hidden exactly at 10 s');
   assert.equal(ctl.viewTop(), 0);
 });
 
@@ -242,16 +243,32 @@ test('activity reveals the chrome and resets the idle clock', () => {
   assert.equal(ctl.chromeVisible, false);
 });
 
-test('the idle timer never touches the chrome while media is active', () => {
+test('media hides the chrome IMMEDIATELY (no 10 s wait) and re-hides it after inactivity', () => {
   const { ctl, at, effects } = makeController();
+  // The media is still well inside the idle window: the header must already
+  // be gone the moment the document enters fullscreen.
+  at(1_000_000 + 1000);
   ctl.mediaEnter('tab-a');
-  const chromeEffectsAfterEnter = effects.filter(e => e.type === 'chrome').length;
-  at(1_000_000 + IDLE_MS + 5000);
+  assert.equal(ctl.chromeVisible, false, 'the header is hidden immediately, not after the timeout');
+  assert.ok(effects.some(e => e.type === 'chrome' && e.visible === false), 'a hide effect was emitted on entry');
+  // A mouse movement during media restores the header (consistent rule:
+  // any activity reveals + restarts the 10 s clock)...
+  at(1_000_000 + 5000);
+  ctl.activity();
+  assert.equal(ctl.chromeVisible, true, 'activity reveals the header even while media is fullscreen');
+  // ...and the idle rule hides it again once 10 s of inactivity elapse.
+  at(1_000_000 + 5000 + IDLE_MS - 1);
   ctl.tick({ windowFocused: true, showingExternal: true });
-  assert.equal(ctl.chromeVisible, false);
-  assert.equal(effects.filter(e => e.type === 'chrome').length, chromeEffectsAfterEnter); // no new chrome events
-  ctl.activity(); // activity during media must not reveal the chrome over the player
-  assert.equal(ctl.chromeVisible, false);
+  assert.equal(ctl.chromeVisible, true, 'still visible before the ten seconds');
+  at(1_000_000 + 5000 + IDLE_MS);
+  ctl.tick({ windowFocused: true, showingExternal: true });
+  assert.equal(ctl.chromeVisible, false, 'hidden again after ten idle seconds of media');
+  // Exiting media restores the header and the clock immediately.
+  ctl.mediaLeave('tab-a');
+  assert.equal(ctl.chromeVisible, true);
+  at(1_000_000 + 5000 + IDLE_MS + IDLE_MS - 1); // a full 10 s after the exit
+  ctl.tick({ windowFocused: true, showingExternal: true });
+  assert.equal(ctl.chromeVisible, true, 'the clock restarted with the media exit');
 });
 
 test('the idle timer pauses while the window is unfocused', () => {
@@ -324,6 +341,50 @@ test('a destroyed owner cannot re-enter media fullscreen through stale events', 
   ctl.tabFocused('tab-b', { mediaIsFullscreen: false });
   assert.equal(ctl.mediaTabId, null);
   assert.equal(ctl.wantsWindowFullscreen, false);
+});
+
+test('repeated media enter/exit cycles stay consistent (no stale state)', () => {
+  const { ctl, at, maximizeEffects } = makeController();
+  // Enter, interact, hide, exit — three full cycles with activity in each.
+  for (let round = 0; round < 3; round += 1) {
+    at(1_000_000 + round * 50_000);
+    ctl.mediaEnter('tab-a');
+    assert.equal(ctl.chromeVisible, false, `round ${round}: immediate hide`);
+    at(1_000_000 + round * 50_000 + 2000);
+    ctl.activity();
+    assert.equal(ctl.chromeVisible, true, `round ${round}: activity reveals`);
+    at(1_000_000 + round * 50_000 + 2000 + IDLE_MS);
+    ctl.tick({ windowFocused: true, showingExternal: true });
+    assert.equal(ctl.chromeVisible, false, `round ${round}: idle re-hides`);
+    ctl.mediaLeave('tab-a');
+    assert.equal(ctl.chromeVisible, true, `round ${round}: exit restores`);
+  }
+  assert.equal(maximizeEffects().length, 6, 'each cycle maximises and restores exactly once');
+  assert.deepEqual(maximizeEffects(), [
+    { type: 'window-maximize', on: true }, { type: 'window-maximize', on: false },
+    { type: 'window-maximize', on: true }, { type: 'window-maximize', on: false },
+    { type: 'window-maximize', on: true }, { type: 'window-maximize', on: false },
+  ]);
+  // A late leave from a previous cycle must be a no-op.
+  ctl.mediaLeave('tab-a');
+  assert.equal(ctl.chromeVisible, true);
+  assert.equal(ctl.mediaTabId, null);
+});
+
+test('fullscreen enter/exit and idle hide interleave without inconsistent state', () => {
+  const { ctl, at } = makeController();
+  // Browser fullscreen ON, idle hide, activity reveal, browser fullscreen OFF.
+  ctl.userToggle();
+  at(1_000_000 + IDLE_MS);
+  ctl.tick({ windowFocused: true, showingExternal: true });
+  assert.equal(ctl.chromeVisible, false, 'idle hide works in browser fullscreen');
+  at(1_000_000 + IDLE_MS + 500);
+  ctl.activity();
+  assert.equal(ctl.chromeVisible, true, 'mouse movement restores the header');
+  ctl.userToggle(); // back to windowed; internal page keeps the header anyway
+  at(1_000_000 + IDLE_MS + IDLE_MS);
+  ctl.tick({ windowFocused: true, showingExternal: false });
+  assert.equal(ctl.chromeVisible, true, 'windowed + internal page: header stays (context left)');
 });
 
 test('media maximize is not re-emitted when it is already in effect', () => {

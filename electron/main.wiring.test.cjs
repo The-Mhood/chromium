@@ -35,17 +35,30 @@ const calls = {
   sends: [],
   onBeforeRequest: null,
   permissions: null,
+  clipboard: [],
+  willDownload: null,
+  downloadOpts: [],
+  downloadCancelled: 0,
 };
 
-// Controllable CDP view of the page's isolated popup world. Off by default:
+// Controllable CDP view of the page's isolated worlds. Off by default:
 // most hostile scenarios test the degraded path (no CDP, no page report),
 // which is exactly where the real app used to fail.
-const cdpStub = { pageStateEnabled: false, stateValue: null };
+//   attachEnabled  attach() succeeds (document-start scripts install)
+//   stateValue     the Runtime.evaluate result in the cc-popup world
+//   delayMs        artificial latency on evaluate (the ad-heavy-page case)
+//   worldContexts  context ids reported for each isolated world
+const cdpStub = { pageStateEnabled: false, stateValue: null, attachEnabled: false, delayMs: 0 };
+cdpStub.worldContexts = new Map(); // worldName -> nextContextId
+let cdpMessageListener = null; // the main process' CDP 'message' listener
+const emitCdp = (method, params) => { if (cdpMessageListener) cdpMessageListener(method, params); };
+let nextPopupContext = 100;
 
 const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chromiumcore-wiring-'));
 
 function makeWebContents(id) {
   const listeners = new Map();
+  let debuggerAttached = false;
   const wc = {
     id,
     mainFrame: { id },
@@ -69,17 +82,31 @@ function makeWebContents(id) {
     on: (event, fn) => { listeners.set(event, [...(listeners.get(event) || []), fn]); },
     emit: (event, ...args) => { for (const fn of listeners.get(event) || []) fn(...args); },
     debugger: {
-      // attach() still throws (the document-start script path stays
-      // degraded); the test toggles the READ side to feed realistic
-      // isolated-world state ({ age, open }) to readPagePopupState.
-      isAttached: () => cdpStub.pageStateEnabled,
-      attach: () => { throw new Error('CDP unavailable in wiring smoke (degraded path)'); },
-      on: () => {},
-      sendCommand: (method) => {
-        if (!cdpStub.pageStateEnabled) return Promise.reject(new Error('no CDP'));
+      // attach() throws by default (the document-start script path stays
+      // degraded — the real app's failure mode); scenarios that need the
+      // isolated worlds flip cdpStub.attachEnabled. The evaluate side feeds
+      // realistic raw-timestamp state ({ t, open, click }) and can be made
+      // slow (cdpStub.delayMs) to model ad-heavy pages.
+      isAttached: () => debuggerAttached,
+      attach: () => {
+        if (!cdpStub.attachEnabled && !cdpStub.pageStateEnabled) throw new Error('CDP unavailable in wiring smoke (degraded path)');
+        debuggerAttached = true;
+      },
+      on: (event, fn) => { if (event === 'message') cdpMessageListener = fn; },
+      sendCommand: (method, params) => {
+        if (!cdpStub.attachEnabled && !cdpStub.pageStateEnabled) return Promise.reject(new Error('no CDP'));
+        const later = promise => (cdpStub.delayMs > 0 ? new Promise(resolve => setTimeout(() => resolve(promise), cdpStub.delayMs)) : Promise.resolve(promise));
+        if (method === 'Page.enable' || method === 'Runtime.enable') return Promise.resolve({});
+        if (method === 'Page.addScriptToEvaluateOnNewDocument') return Promise.resolve({ identifier: `script-${Math.random().toString(36).slice(2)}` });
+        if (method === 'Page.removeScriptToEvaluateOnNewDocument') return Promise.resolve({});
         if (method === 'Page.getFrameTree') return Promise.resolve({ frameTree: { frame: { id: 'frame-0' }, childFrames: [] } });
-        if (method === 'Runtime.getIsolatedContext') return Promise.resolve({ contextId: 1 });
-        if (method === 'Runtime.evaluate') return Promise.resolve({ result: { value: cdpStub.stateValue } });
+        if (method === 'Runtime.getIsolatedContext') {
+          const world = (params && params.worldName) || 'cc-popup';
+          let next = cdpStub.worldContexts.get(world);
+          if (next === undefined) { next = world === 'cc-links' ? 4000 : nextPopupContext += 1; cdpStub.worldContexts.set(world, next); }
+          return Promise.resolve({ contextId: next });
+        }
+        if (method === 'Runtime.evaluate') return later({ result: { value: cdpStub.stateValue } });
         return Promise.reject(new Error('no CDP: ' + method));
       },
     },
@@ -94,10 +121,17 @@ function makeWebContents(id) {
   return wc;
 }
 
+let extraWindowWc = 500;
 class BrowserWindowStub {
   static windows = [];
-  constructor(_options) {
-    this.webContents = makeWebContents(1);
+  constructor(options = {}) {
+    // The FIRST window (the app shell) keeps webContents id 1 — the rest of
+    // the suite's fakeEvent() depends on it. Later windows (the link dialog,
+    // "open in new window") get unique ids.
+    this.__wcId = BrowserWindowStub.windows.length === 0 ? 1 : ++extraWindowWc;
+    this.webContents = makeWebContents(this.__wcId);
+    this.__options = options;
+    this.__dialog = !!(options && options.dialog === true);
     this.__listeners = new Map();
     this.__once = new Map();
     this.__fullscreen = false;
@@ -120,8 +154,8 @@ class BrowserWindowStub {
     const onceFn = this.__once.get(event);
     if (onceFn) { this.__once.delete(event); onceFn(...args); }
   }
-  show() { this.emit('ready-to-show'); }
-  close() { this.emit('closed'); }
+  show() { this.__shown = true; }
+  close() { this.__destroyed = true; this.emit('closed'); }
   isDestroyed() { return this.__destroyed; }
   getContentSize() { return [1440, 1000]; }
   setFullScreen(value) { this.__fullscreen = value; }
@@ -132,7 +166,18 @@ class BrowserWindowStub {
   maximize() { this.__maximized = true; }
   isMaximized() { return this.__maximized; }
   unmaximize() { this.__maximized = false; }
-  loadFile() {}
+  setAlwaysOnTop() {}
+  setMenu() {}
+  setTitle() {}
+  // A real BrowserWindow fires did-finish-load on its webContents after
+  // loadFile, then ready-to-show on the window. The loaded file URL (with
+  // its query string) becomes the contents' URL, as in a real window.
+  loadFile(file, options = {}) {
+    const query = options.query ? '?' + Object.entries(options.query).map(([k, v]) => `${k}=${v}`).join('&') : '';
+    this.webContents.__url = 'file://' + file + query;
+    this.webContents.emit('did-finish-load');
+    this.emit('ready-to-show');
+  }
 }
 BrowserWindowStub.getAllWindows = () => BrowserWindowStub.windows;
 
@@ -177,8 +222,11 @@ const electronStub = {
         onBeforeSendHeaders: () => {},
         onBeforeRequest: (_filter, fn) => { calls.onBeforeRequest = fn; },
       },
-      on: () => {},
+      on: (event, fn) => { if (event === 'will-download') calls.willDownload = fn; },
     }),
+  },
+  clipboard: {
+    writeText: text => { calls.clipboard.push(text); },
   },
 };
 
@@ -328,15 +376,15 @@ test('main process wiring (Electron stub)', async t => {
     assert.equal(calls.sends.filter(s => s.channel === 'core:load-failed').length, before + 1, 'sub-resource failures are ignored');
   });
 
-  await t.test('the chrome hides after seven idle seconds and reveals on activity', async () => {
+  await t.test('the chrome hides after ten idle seconds and reveals on activity', async () => {
     const view = tab1View; // tab-1 is the active tab, so its view gets laid out
     const hiddenBefore = calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === false).length;
 
     // The idle timer ticks every 250 ms with a static cursor; the last
-    // activity was at startup, so the chrome must hide within ~7.3 s.
-    await new Promise(resolve => setTimeout(resolve, 7500));
+    // activity was at startup, so the chrome must hide within ~10.3 s.
+    await new Promise(resolve => setTimeout(resolve, 10600));
     const hiddenAfter = calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === false).length;
-    assert.ok(hiddenAfter > hiddenBefore, 'the chrome was hidden after seven idle seconds');
+    assert.ok(hiddenAfter > hiddenBefore, 'the chrome was hidden after ten idle seconds');
     await new Promise(resolve => setTimeout(resolve, 400));
     assert.deepEqual(view.__bounds, { x: 0, y: 0, width: 1440, height: 1000 },
       'the page view expanded to the full window while the chrome is hidden');
@@ -584,63 +632,81 @@ test('main process wiring (Electron stub)', async t => {
     await closeTabs('h-10');
   });
 
-  await t.test('hostile: an open from a cross-origin ad iframe is blocked even on a fresh click', async () => {
-    const { view: page, known } = await freshTab('h-11', 'https://victim.example.com/');
-    const viewsBefore = winStub().contentView.__views.length;
+  await t.test('hostile: a scripted open from a cross-origin ad iframe is blocked even on a fresh click', async () => {
+    // CDP must be available before the tab is created: syncPageScripts
+    // attaches DevTools (and installs the isolated worlds) at document start.
     cdpStub.pageStateEnabled = true;
     try {
-      cdpStub.stateValue = { age: 50, open: { isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com', t: Date.now() } };
+      const { view: page, known } = await freshTab('h-11', 'https://victim.example.com/');
+      const viewsBefore = winStub().contentView.__views.length;
+      // The ad iframe's SCRIPT called window.open. The isolated world reports
+      // the raw timestamp; main measures its age against the request time.
+      cdpStub.stateValue = { open: { t: Date.now(), isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com' } };
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://ad-landing.example.com/', disposition: 'foreground-tab' });
       await settle();
-      assert.ok(!openPublished('https://ad-landing.example.com/'), 'the ad-iframe open was blocked');
+      assert.ok(!openPublished('https://ad-landing.example.com/'), 'the scripted ad-iframe open was blocked');
       assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+      await closeTabs('h-11');
     } finally {
       cdpStub.pageStateEnabled = false;
       cdpStub.stateValue = null;
     }
-    await closeTabs('h-11');
   });
 
-  await t.test('hostile: a target=_blank click inside a cross-origin ad iframe opens nothing', async () => {
-    const { view: page, known } = await freshTab('h-13', 'https://victim.example.com/');
-    const viewsBefore = winStub().contentView.__views.length;
+  await t.test('cross-origin iframe link clicks: the first is verified, the second is blocked', async () => {
     cdpStub.pageStateEnabled = true;
     try {
-      // The user clicks the "sponsored" link. The click lands in the ad
-      // IFRAME's document and the anchor is target=_blank, so NO window.open
-      // is ever called — the browser opens the tab directly. The only record
-      // of who initiated it is the click record: cross-origin frame, and its
-      // href is exactly the destination. This is the hole a window.open-only
-      // check lets through.
+      const { view: page, known } = await freshTab('h-13', 'https://victim.example.com/');
+      // The user clicks a target=_blank link in a cross-origin iframe. No
+      // window.open is ever called — the browser opens the tab directly and
+      // the only record of who initiated it is the click record (cross-origin
+      // frame, href = the destination). First such click-open: allowed with
+      // commit verification (the destination is still vetted)...
       cdpStub.stateValue = {
-        age: 40,
         open: null,
         click: { t: Date.now(), isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com', href: 'https://sponsored-offers.example.org/deal' },
       };
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://sponsored-offers.example.org/deal', disposition: 'foreground-tab' });
       await settle();
-      assert.ok(!openPublished('https://sponsored-offers.example.org/deal'), 'the ad-iframe link click was blocked');
-      assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'the first cross-origin link click is verified, not blocked');
+      assert.ok(!openPublished('https://sponsored-offers.example.org/deal'), 'no chip before the commit');
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(openPublished('https://sponsored-offers.example.org/deal'), 'the verified destination was published');
+      // An ad unit firing a SECOND cross-origin click-through within the
+      // repeat window (same tab!) is blocked outright — the rate limit still
+      // catches the click-to-paywall pattern a window.open-only check misses.
+      cdpStub.stateValue = {
+        open: null,
+        click: { t: Date.now(), isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com', href: 'https://sponsored-offers.example.org/deal-3' },
+      };
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://sponsored-offers.example.org/deal-3', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!findInspector(known), 'the second cross-origin click was blocked (no verification, nothing created)');
+      assert.ok(!openPublished('https://sponsored-offers.example.org/deal-3'), 'no chip for the repeat');
     } finally {
+      await closeTabs('h-13');
       cdpStub.pageStateEnabled = false;
       cdpStub.stateValue = null;
     }
-    await closeTabs('h-13');
   });
 
   await t.test('legitimate: a top-frame target=_blank click is not misattributed to an ad iframe', async () => {
-    const { view: page, known } = await freshTab('h-14', 'https://victim.example.com/');
-    const viewsBefore = winStub().contentView.__views.length;
     cdpStub.pageStateEnabled = true;
     try {
+      const { view: page, known } = await freshTab('h-14', 'https://victim.example.com/');
       // Same page, but the user clicked the page's OWN target=_blank link in
-      // the top document: the click record is top-frame / same-origin. The
-      // new attribution rule must not treat this as an ad-iframe open.
+      // the top document: the click record is top-frame / same-origin and its
+      // href is the destination. The attribution rule must not treat this as
+      // an ad-iframe open — even though an ad iframe's stale window.open
+      // record from 2 s earlier is still in the page state (the real fmhy
+      // situation).
       cdpStub.stateValue = {
-        age: 40,
-        open: null,
+        open: { t: Date.now() - 2000, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com' },
         click: { t: Date.now(), isTop: true, crossOrigin: false, frameHost: 'victim.example.com', topHost: 'victim.example.com', href: 'https://docs.example.com/guide' },
       };
       clickOn(page.webContents);
@@ -651,8 +717,8 @@ test('main process wiring (Electron stub)', async t => {
       inspector.webContents.emit('did-commit-navigation');
       await new Promise(resolve => setTimeout(resolve, 50));
       assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate top-frame link was published');
-      await closeTabs('h-14');
     } finally {
+      await closeTabs('h-14');
       cdpStub.pageStateEnabled = false;
       cdpStub.stateValue = null;
     }
@@ -680,6 +746,184 @@ test('main process wiring (Electron stub)', async t => {
     assert.deepEqual(tab.view.__bounds, { x: 0, y: 96, width: 1440, height: 904 }, 'the tab is laid out below the chrome');
     await closeTabs('h-12', 'tab-h12');
     await calls.ipcHandles.get('core:close')(fakeEvent(), 'tab-h12');
+  });
+
+  await t.test('media fullscreen: the header hides immediately, reveals on activity, re-hides after ten idle seconds', async () => {
+    const { view, known } = await freshTab('m-1', 'https://video.example.com/');
+    const hiddenSends = () => calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === false).length;
+    const visibleSends = () => calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === true).length;
+    try {
+    const h0 = hiddenSends();
+    view.webContents.emit('enter-html-full-screen');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.ok(hiddenSends() > h0, 'the header hid IMMEDIATELY, not after the inactivity timeout');
+    assert.equal(winStub().__maximized, true, 'media maximises the window for a stable transition');
+    assert.deepEqual(calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1).payload, { media: true, window: false });
+
+    const v0 = visibleSends();
+    view.webContents.emit('before-input-event', {}, { type: 'mouseDown' });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.ok(visibleSends() > v0, 'mouse movement revealed the header over the player');
+
+    const h1 = hiddenSends();
+    await new Promise(resolve => setTimeout(resolve, 10600));
+    assert.ok(hiddenSends() > h1, 'ten idle seconds re-hid the header while media was fullscreen');
+
+    const v1 = visibleSends();
+    view.webContents.emit('leave-html-full-screen');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.ok(visibleSends() > v1, 'media exit restored the header');
+    assert.equal(winStub().__maximized, false, 'the window unmaximised with the media');
+    assert.equal(winStub().__fullscreen, false, 'no OS fullscreen transition leaked in or out');
+    assert.deepEqual(calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1).payload, { media: false, window: false });
+    assert.ok(known.has(view), 'the tab view survived the whole cycle');
+    } finally {
+      await closeTabs('m-1');
+    }
+  });
+
+  await t.test('site links (the fmhy.net failure): a fresh click opens even when the destination redirects across domains', async () => {
+    // No CDP at all — the exact degraded path the packaged app was on.
+    cdpStub.pageStateEnabled = false;
+    cdpStub.attachEnabled = false;
+    try {
+      const { view: page, known } = await freshTab('fmhy-1', 'https://fmhy.net/');
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://fmhy.net/movie/watch-123', disposition: 'foreground-tab' });
+      await settle();
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'a fresh link click is allowed for verification, not blocked');
+      assert.ok(!openPublished('https://fmhy.net/movie/watch-123'), 'no chip before the destination commits');
+      // The site's 302 hops to its player/CDN domain. For a link click this
+      // is the user following the site's redirects — NOT a popunder — so the
+      // verified open is published (the chip carries the FINAL url: where
+      // the tab actually lands).
+      inspector.webContents.__url = 'https://player-cdn.example.net/embed/123';
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(openPublished('https://player-cdn.example.net/embed/123'), 'the link click that redirected across domains was published');
+    } finally {
+      await closeTabs('fmhy-1');
+    }
+  });
+
+  await t.test('a scripted popup that redirects across domains is STILL blocked (the popunder rule keeps working)', async () => {
+    cdpStub.pageStateEnabled = false;
+    cdpStub.attachEnabled = false;
+    try {
+      const { view: page, known } = await freshTab('fu-1', 'https://victim.example.com/');
+      clickOn(page.webContents);
+      // A click exists (gesture) but the OPEN is scripted window.open (no
+      // matching click record): viaLinkClick stays false.
+      page.webContents.__openHandler({ url: 'https://victim.example.com/empty', disposition: 'default' });
+      await settle();
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'the scripted open is verified');
+      inspector.webContents.__url = 'https://totally-different-domain.example.net/capture';
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(!openPublished('https://victim.example.com/empty'), 'the cross-domain scripted open was not published');
+      assert.ok(calls.sends.some(s => s.channel === 'core:popup-blocked'), 'the block was logged');
+    } finally {
+      await closeTabs('fu-1');
+    }
+  });
+
+  await t.test('double-click pipeline: the isolated link world opens the options dialog', async () => {
+    cdpStub.pageStateEnabled = true;
+    cdpStub.attachEnabled = true;
+    try {
+      const { view: page, known } = await freshTab('l-1', 'https://site.test/page');
+      // Wait for syncPageScripts to attach CDP and register the message
+      // listener (attach happens asynchronously in the sync queue).
+      const started = Date.now();
+      while (!cdpMessageListener && Date.now() - started < 2000) await new Promise(resolve => setTimeout(resolve, 25));
+      assert.ok(cdpMessageListener, 'CDP is attached and listening');
+      // The isolated "cc-links" world gets its own execution context.
+      const linkContextId = 4000;
+      emitCdp('Runtime.executionContextCreated', { context: { id: linkContextId, name: 'cc-links' } });
+      // A double-clicked anchor reports through the magic console channel.
+      const link = { t: 'dialog', url: 'https://site.test/destination?x=1', text: 'The long article title', media: false, isTop: true, crossOrigin: false, target: 'blank' };
+      emitCdp('Runtime.consoleAPICalled', { type: 'log', executionContextId: linkContextId, args: [{ type: 'string', value: '%CC-LINK% ' + JSON.stringify(link) }] });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const dialogsNow = BrowserWindowStub.windows.filter(w => w.__dialog);
+      assert.equal(dialogsNow.length, 1, 'exactly one link-options window was created');
+      const dlg = dialogsNow[0];
+      assert.equal(dlg.webContents.__url, 'file://' + path.join(__dirname, '../renderer/index.html') + '?linkDialog=1', 'the dialog loads the renderer in dialog mode');
+      const dataSend = calls.sends.find(s => s.channel === 'core:dialog-data' && s.payload && s.payload.url === link.url);
+      assert.ok(dataSend, 'the dialog received the link data');
+      assert.equal(dataSend.payload.sourceTabId, 'l-1', 'the source tab is known for "Open link"');
+
+      // Anti-spoof: the same magic message from the MAIN world (a different
+      // context id) must be ignored.
+      emitCdp('Runtime.consoleAPICalled', { type: 'log', executionContextId: 12345, args: [{ type: 'string', value: '%CC-LINK% ' + JSON.stringify(link) }] });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.equal(BrowserWindowStub.windows.filter(w => w.__dialog).length, 1, 'a forged main-world message opened nothing');
+
+      // "Copy link address" goes through the trusted dialog IPC.
+      const dialogEvent = { sender: dlg.webContents, senderFrame: dlg.webContents.mainFrame };
+      await calls.ipcHandles.get('core:dialog')(dialogEvent, 'copy', { url: link.url, sourceTabId: 'l-1' });
+      assert.deepEqual(calls.clipboard.at(-1), 'https://site.test/destination?x=1', 'the address was copied');
+      assert.equal(dlg.__destroyed, true, 'the dialog closed after the action');
+
+      // "Open in new window" creates a protected standalone window.
+      emitCdp('Runtime.consoleAPICalled', { type: 'log', executionContextId: linkContextId, args: [{ type: 'string', value: '%CC-LINK% ' + JSON.stringify(link) }] });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const dlg2 = BrowserWindowStub.windows.filter(w => w.__dialog).at(-1);
+      assert.ok(dlg2, 'a second dialog for the next double-click');
+      const dialogEvent2 = { sender: dlg2.webContents, senderFrame: dlg2.webContents.mainFrame };
+      await calls.ipcHandles.get('core:dialog')(dialogEvent2, 'open-window', { url: link.url, sourceTabId: 'l-1' });
+      const standalone = BrowserWindowStub.windows.find(w => !w.__dialog && w !== winStub());
+      assert.ok(standalone, 'a standalone browsing window was created');
+      assert.equal(standalone.webContents.__url, 'https://site.test/destination?x=1', 'it navigated to the link');
+      assert.ok(standalone.webContents.__openHandler, 'it has the popup policy wired (identical protection)');
+      standalone.close();
+    } finally {
+      await closeTabs('l-1');
+      cdpStub.pageStateEnabled = false;
+      cdpStub.attachEnabled = false;
+    }
+  });
+
+  await t.test('double-click "commit" routing: blank goes through the popup policy, top navigates, download goes to the hidden carrier', async () => {
+    cdpStub.pageStateEnabled = true;
+    cdpStub.attachEnabled = true;
+    try {
+      const { view: page, known } = await freshTab('l-2', 'https://site.test/page');
+      const started = Date.now();
+      while (!cdpMessageListener && Date.now() - started < 2000) await new Promise(resolve => setTimeout(resolve, 25));
+      const linkContextId = 4000;
+      emitCdp('Runtime.executionContextCreated', { context: { id: linkContextId, name: 'cc-links' } });
+      const commit = over => emitCdp('Runtime.consoleAPICalled', { type: 'log', executionContextId: linkContextId, args: [{ type: 'string', value: '%CC-LINK% ' + JSON.stringify(over) }] });
+
+      // target=_blank with NO recent input (a page script "double-clicked"
+      // the anchor): the open is denied by the policy exactly like any other
+      // unattributed open.
+      commit({ t: 'commit', url: 'https://site.test/blank-no-gesture', text: 'x', media: false, isTop: true, crossOrigin: false, target: 'blank' });
+      await settle();
+      assert.ok(!openPublished('https://site.test/blank-no-gesture'), 'an unattributed blank commit is blocked');
+
+      // With a real click, the blank commit is verified and published.
+      clickOn(page.webContents);
+      commit({ t: 'commit', url: 'https://site.test/blank-ok', text: 'x', media: false, isTop: true, crossOrigin: false, target: 'blank' });
+      await settle();
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'the clicked blank commit is verified');
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(openPublished('https://site.test/blank-ok'), 'the verified blank commit was published');
+
+      // A same-document commit navigates the TAB (no new window at all).
+      const urlBefore = page.webContents.__url;
+      commit({ t: 'commit', url: 'https://site.test/in-place', text: 'x', media: false, isTop: true, crossOrigin: false, target: 'top' });
+      await settle();
+      assert.notEqual(page.webContents.__url, urlBefore, 'the tab navigated in place');
+      assert.equal(page.webContents.__url, 'https://site.test/in-place');
+    } finally {
+      await closeTabs('l-2');
+      cdpStub.pageStateEnabled = false;
+      cdpStub.attachEnabled = false;
+    }
   });
 
   await t.test('permissions: fullscreen is allowed, tracker abuses stay denied', async () => {

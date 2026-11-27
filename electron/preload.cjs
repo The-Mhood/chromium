@@ -29,4 +29,7 @@ contextBridge.exposeInMainWorld('chromiumCore', {
   onNavigationBlocked: subscribe('core:navigation-blocked'),
   onLoadFailed: subscribe('core:load-failed'),
   onTabClosed: subscribe('core:tab-closed'),
+  onToast: subscribe('core:toast'),
+  onDialogData: subscribe('core:dialog-data'),
+  dialogAction: (action, payload) => ipcRenderer.invoke('core:dialog', action, payload),
 });

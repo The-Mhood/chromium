@@ -115,6 +115,21 @@ h1, h2, h3, h4, p { margin: 0; }
 .menu-item > svg { color: var(--secondary); }
 .menu-item kbd { font-size: 10px; color: var(--muted); }
 .popover-divider { border-top: 1px solid var(--border); margin: 6px 0; }
+
+/* Double-click link options — rendered in its own small frameless window
+   (dialog mode), styled like the chrome popovers. */
+body:has(.link-dialog-backdrop) { min-width: 0; background: #f8f9fb; }
+.link-dialog-backdrop { position: fixed; inset: 0; background: #f8f9fb; display: grid; place-items: center; }
+.link-dialog { width: 316px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 44px #26314829; padding: 15px 15px 12px; }
+.link-dialog-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 11px; }
+.link-dialog-heading-text { flex: 1; min-width: 0; }
+.link-dialog-heading-text strong { font-size: 13px; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link-dialog-heading-text p { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.link-dialog-mark { color: var(--accent-strong); display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; background: var(--accent-soft); flex-shrink: 0; }
+.link-dialog-url { font-size: 11px; color: var(--secondary); background: var(--surface-alt); border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; margin: 0 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; }
+.link-dialog-actions { display: flex; flex-direction: column; gap: 1px; }
+.link-dialog-item kbd, .link-dialog-hint kbd { font-size: 10px; color: var(--muted); background: var(--surface-alt); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+.link-dialog-hint { font-size: 10px; color: var(--muted); line-height: 1.6; margin-top: 10px; }
 .popover-section-title { font-size: 9px; letter-spacing: 1px; color: var(--muted); margin: 0 8px 8px; display: flex; justify-content: space-between; }
 
 .workspace { display: flex; height: calc(100dvh - 96px); }

@@ -19,7 +19,7 @@
 //   * shared/youtube-shield.js  — YouTube ad-data shield (document start).
 // ---------------------------------------------------------------------------
 
-const { app, BrowserWindow, WebContentsView, ipcMain, session, Menu, screen } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, session, Menu, screen, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -287,9 +287,16 @@ function destroyTab(id) {
 // top page. A failed read degrades to the main-process input observation
 // (see popup-blocker.classifyWindowOpen), which still requires a real,
 // recent gesture.
-const POPUP_STATE_EXPR = '(function () { var s = window.__ccPopupState; if (!s) return null; return { age: s.t ? Date.now() - s.t : 999999999, open: s.lastOpen && Date.now() - s.lastOpen.t < 3000 ? s.lastOpen : null, click: s.lastClick && Date.now() - s.lastClick.t < 3000 ? s.lastClick : null }; })()';
+// The isolated world reports RAW timestamps (same machine clock as the main
+// process). The ages are computed HERE, against the moment the open was
+// requested — never against the moment this read finishes. That read is an
+// asynchronous DevTools round trip that can take a second or more on
+// ad-heavy pages (dozens of frames, like fmhy.net); computing ages against
+// "now" is what starved a fresh user click of its 1.5 s gesture window and
+// made ordinary links "refuse to click".
+const POPUP_STATE_EXPR = '(function () { var s = window.__ccPopupState; if (!s) return null; return { t: s.t || 0, open: s.lastOpen && Date.now() - s.lastOpen.t < 3000 ? s.lastOpen : null, click: s.lastClick && Date.now() - s.lastClick.t < 3000 ? s.lastClick : null }; })()';
 
-async function readPagePopupState(contents) {
+async function readPagePopupState(contents, atMs) {
   const entry = syncQueue.get(contents.id);
   if (!entry || contents.isDestroyed() || !contents.debugger.isAttached()) return null;
   const cdp = contents.debugger;
@@ -309,17 +316,25 @@ async function readPagePopupState(contents) {
         return (result && result.result && result.result.value) || null;
       } catch { return null; }
     })), 'popup state', 2500);
-    let ageMs = null;
+    let lastActivityAt = 0;
     let open = null;
     let click = null;
     for (const value of reads) {
       if (!value) continue;
-      if (typeof value.age === 'number' && (ageMs === null || value.age < ageMs)) ageMs = value.age;
+      if (typeof value.t === 'number' && value.t > lastActivityAt) lastActivityAt = value.t;
       if (value.open && (!open || value.open.t > open.t)) open = value.open;
       if (value.click && (!click || value.click.t > click.t)) click = value.click;
     }
-    if (ageMs === null && !open && !click) return null;
-    return { ageMs: ageMs === null ? 999999999 : ageMs, open, click };
+    if (!lastActivityAt && !open && !click) return null;
+    // Freshness is measured against the OPEN, not the read: a record made
+    // more than 3 s before the open is a different event (slight clock
+    // tolerance for records written microseconds "after" the request).
+    const fresh = record => record && atMs - record.t < 3000 && record.t < atMs + 2000 ? record : null;
+    return {
+      ageMs: lastActivityAt ? Math.max(0, atMs - lastActivityAt) : 999999999,
+      open: fresh(open),
+      click: fresh(click),
+    };
   } catch {
     return null;
   }
@@ -332,6 +347,11 @@ async function readPagePopupState(contents) {
 // a domain jump — can never become a visible tab or window.
 async function handleWindowOpen(details, contents) {
   if (contents.isDestroyed()) return;
+  // The open was requested NOW. Every age in the policy is measured against
+  // this instant — the isolated-world state read below is asynchronous and
+  // can take seconds on ad-heavy pages, and must not count against the
+  // user's gesture (that is what made fresh link clicks "stale").
+  const atMs = Date.now();
   const sourceUrl = contents.getURL();
   const disposition = details.disposition || 'default';
   let url;
@@ -343,7 +363,7 @@ async function handleWindowOpen(details, contents) {
     logPopup({ source: safeHost(sourceUrl), url: details.url, disposition, decision: 'deny', reason: 'scheme', created: false });
     return;
   }
-  const pageState = await readPagePopupState(contents);
+  const pageState = await readPagePopupState(contents, atMs);
   if (contents.isDestroyed()) return;
   const decision = engine.popupPolicy.classifyWindowOpen({
     url,
@@ -352,6 +372,7 @@ async function handleWindowOpen(details, contents) {
     tabCount: views.size,
     pageState,
     contentsId: contents.id,
+    atMs,
   });
   // For the log: the frame that actually initiated this open (a window.open
   // record, or — for a target=_blank link click — the click record).
@@ -366,13 +387,14 @@ async function handleWindowOpen(details, contents) {
     if (decision.earlierUrl) closeEarlierPopupTab(decision.earlierUrl);
     return;
   }
+  const isLinkClick = disposition === 'foreground-tab';
   if (!decision.needsCommit) {
     logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'allow', reason: decision.reason, created: true });
     send('core:open-tab', { url, title: safeHost(url) });
     return;
   }
   logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'verify', reason: decision.reason, created: false });
-  startCommitVerification({ url, sourceUrl });
+  startCommitVerification({ url, sourceUrl, viaLinkClick: isLinkClick });
 }
 
 // ---------------------------------------------------------------------------
@@ -389,11 +411,11 @@ async function handleWindowOpen(details, contents) {
 //                No tab, no window, no chip, no flash.
 // ---------------------------------------------------------------------------
 
-function startCommitVerification({ url, sourceUrl }) {
+function startCommitVerification({ url, sourceUrl, viaLinkClick = false }) {
   if (!win || win.isDestroyed()) return;
   const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
   const contents = view.webContents;
-  const record = { url, sourceUrl, view, openedAt: Date.now(), committed: false, settled: false, timer: null };
+  const record = { url, sourceUrl, view, openedAt: Date.now(), committed: false, settled: false, timer: null, viaLinkClick: viaLinkClick === true };
   inspectors.set(contents.id, record);
   view.setVisible(false); // never painted, ever
   view.setBounds({ x: -1, y: -1, width: 0, height: 0 });
@@ -428,6 +450,7 @@ function startCommitVerification({ url, sourceUrl }) {
       matchRequest: (u, s, _type, group) => (group === 'threats' ? engine.matchMainFrame(u, s, 'threats') : engine.matchMainFrame(u, s)) !== null,
       nowMs: Date.now(),
       createdAt: record.openedAt,
+      viaLinkClick: record.viaLinkClick,
     });
     if (hit) resolveInspector(contents, { block: true, type: hit, reason: 'listed-destination', url: finalUrl });
     else if (verdict.block) resolveInspector(contents, { block: true, type: verdict.type, reason: verdict.reason, url: finalUrl });
@@ -478,7 +501,7 @@ function resolveInspector(contents, outcome) {
     logPopup({ source: safeHost(record.sourceUrl), url: outcome.url, decision: 'allow', reason: outcome.reason || 'verified', created: true, stage: 'commit' });
     // The renderer will create the tab for this URL; when its navigation
     // arrives we learn the tab id (repeat rule + optional popunder watch).
-    verifiedPopupOpens.push({ url: outcome.url, sourceUrl: record.sourceUrl, at: Date.now(), watch: outcome.watch === true });
+    verifiedPopupOpens.push({ url: outcome.url, sourceUrl: record.sourceUrl, at: Date.now(), watch: outcome.watch === true, viaLinkClick: record.viaLinkClick });
     if (verifiedPopupOpens.length > 50) verifiedPopupOpens.splice(0, verifiedPopupOpens.length - 50);
     send('core:open-tab', { url: outcome.url, title: safeHost(outcome.url) });
   }
@@ -502,9 +525,9 @@ function closeEarlierPopupTab(openUrl) {
   send('core:tab-closed', { id });
 }
 
-// First-navigation inspection for script-opened tabs whose commit
-// verification could not finish in time (popunder fallback watch).
-const popunderWatches = new Map(); // contents id -> { intendedUrl, sourceUrl, createdAt }
+// First-navigation inspection for tabs whose commit verification could not
+// finish in time (popunder fallback watch).
+const popunderWatches = new Map(); // contents id -> { intendedUrl, sourceUrl, createdAt, viaLinkClick }
 
 function checkPopunderNavigation(contents, url, tabId) {
   const watch = popunderWatches.get(contents.id);
@@ -517,6 +540,7 @@ function checkPopunderNavigation(contents, url, tabId) {
     matchRequest: (u, s, _type, group) => (group === 'threats' ? engine.matchMainFrame(u, s, 'threats') : engine.matchMainFrame(u, s)) !== null,
     nowMs: Date.now(),
     createdAt: watch.createdAt,
+    viaLinkClick: watch.viaLinkClick === true,
   });
   if (!verdict.block) return false;
   recordBlocked(verdict.type || 'Pop-up', url, contents.getURL());
@@ -533,12 +557,24 @@ function navigationLockFor(contents, url) {
   return false;
 }
 
-function makeTab(id) {
-  const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
-  views.set(id, view);
-  win.contentView.addChildView(view);
-  const contents = view.webContents;
-  lastBounds = null;
+/**
+ * Shared protection wiring for ANY browsing context in the app — the tab
+ * views of the main window and the standalone "open in new window" windows.
+ * The popup policy, navigation checks, download protection (session level),
+ * cosmetics and document-start scripts are identical everywhere, so a link
+ * opened in a secondary window gets exactly the same protection as a tab.
+ *
+ * @param {object} opts
+ *   onIssue   report blocked/failed navigations to the main renderer (tabs
+ *             have a placeholder to explain them; secondary windows do not)
+ *   onMedia   route media fullscreen into the window state machine (only the
+ *             main window's tabs drive fsCtl)
+ *   onF11     F11 / Escape browser-fullscreen handling (main window tabs)
+ *   onLayout  re-apply the main window layout after load (tabs)
+ *   onTitle   (title) callback — publish the tab, or set the window title
+ */
+function wireBrowsingContents(contents, id, opts = {}) {
+  const { onIssue = true, onMedia = true, onF11 = true, onLayout = true, onTitle = () => {} } = opts;
 
   contents.setWindowOpenHandler(details => {
     handleWindowOpen(details, contents).catch(console.warn);
@@ -565,7 +601,7 @@ function makeTab(id) {
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
-        send('core:navigation-blocked', { id, url, type: hit });
+        if (onIssue) send('core:navigation-blocked', { id, url, type: hit });
       }
     } catch (error) { console.warn('Navigation check failed:', error.message); }
   });
@@ -578,7 +614,7 @@ function makeTab(id) {
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
-        send('core:navigation-blocked', { id, url, type: hit });
+        if (onIssue) send('core:navigation-blocked', { id, url, type: hit });
       }
     } catch (error) { console.warn('Redirect check failed:', error.message); }
   });
@@ -590,31 +626,41 @@ function makeTab(id) {
     if (errorCode === -3) return; // ERR_ABORTED: superseded or cancelled, not a failure
     if (validatedURL && lastRequested.get(contents.id) === validatedURL) {
       lastRequested.delete(contents.id);
-      send('core:load-failed', { id, url: validatedURL });
+      if (onIssue) send('core:load-failed', { id, url: validatedURL });
     }
   });
 
-  // A background tab can't own media fullscreen: the user is looking at a
-  // different tab, and maximising the window for a hidden video would be a
-  // surprise. The active tab's real isFullscreen() is re-synced on focus.
-  contents.on('enter-html-full-screen', () => { if (!contents.isDestroyed() && activeId === id) fsCtl.mediaEnter(id); });
-  contents.on('leave-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaLeave(id); });
+  if (onMedia) {
+    // A background tab can't own media fullscreen: the user is looking at a
+    // different tab, and maximising the window for a hidden video would be a
+    // surprise. The active tab's real isFullscreen() is re-synced on focus.
+    // NOTE: the enter event is forwarded for EVERY tab — the state machine
+    // itself decides (background tabs are presented when focused). Guarding
+    // on activeId here was a real bug: a stale activeId (focus IPC not yet
+    // run) left the header visible during a video's fullscreen.
+    contents.on('enter-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaEnter(id); });
+    contents.on('leave-html-full-screen', () => { if (!contents.isDestroyed()) fsCtl.mediaLeave(id); });
+  }
 
   contents.on('before-input-event', (_event, input) => {
     if (input.type === 'keyDown' || input.type === 'char' || input.type === 'mouseDown' || input.type === 'mouseWheel') {
-      fsCtl.activity();
+      if (onF11) fsCtl.activity(); // secondary windows do not drive the main window's chrome
       engine.popupPolicy.observeInput(contents.id, input.type);
     }
-    if (input.type === 'keyDown') {
+    if (onF11 && input.type === 'keyDown') {
       if (input.key === 'F11') fsCtl.userToggle();
       else if (input.key === 'Escape' && fsCtl.userFullscreen && !fsCtl.mediaActive) fsCtl.setUserFullscreen(false);
     }
   });
 
-  contents.on('page-title-updated', () => publishTab(id, contents));
-  contents.on('did-navigate', () => publishTab(id, contents));
-  contents.on('did-navigate-in-page', () => publishTab(id, contents));
-  contents.on('did-finish-load', () => { publishTab(id, contents); applyLayout(); engine.applyCosmetics(contents).catch(console.warn); });
+  contents.on('page-title-updated', () => onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com')));
+  contents.on('did-navigate', () => onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com')));
+  contents.on('did-navigate-in-page', () => onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com')));
+  contents.on('did-finish-load', () => {
+    onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com'));
+    if (onLayout) applyLayout();
+    engine.applyCosmetics(contents).catch(console.warn);
+  });
   contents.on('destroyed', () => {
     engine.forget(contents.id);
     engine.popupPolicy.forget(contents.id);
@@ -623,23 +669,283 @@ function makeTab(id) {
     lastRequested.delete(contents.id);
     popunderWatches.delete(contents.id);
   });
+}
 
+function makeTab(id) {
+  const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
+  views.set(id, view);
+  win.contentView.addChildView(view);
+  const contents = view.webContents;
+  lastBounds = null;
+  wireBrowsingContents(contents, id, { onTitle: () => publishTab(id, contents) });
   syncPageScripts(contents);
   applyLayout();
   return view;
 }
 
 // ---------------------------------------------------------------------------
+// Double-click link support (shared/link-support.js, isolated world
+// "cc-links"). The page script suppresses the default action of a plain link
+// click for 300 ms: a second click cancels it and opens the link-options
+// dialog (so a double-click never navigates); otherwise it re-performs the
+// navigation itself or hands it to the main process, where the FULL popup
+// policy still applies (listed destinations, gesture checks, commit
+// verification, downloads through the protected session pipeline).
+// ---------------------------------------------------------------------------
+
+const downloads = new Map(); // contents id -> { view, timer, settled } (hidden download carriers)
+let linkDialogWin = null;
+
+/** The main window's tab id that owns a given webContents, or null. */
+function tabIdOfContents(contents) {
+  for (const [id, view] of views) if (view.webContents === contents) return id;
+  return null;
+}
+
+/** User-initiated navigation of a tab's main frame (address bar / dialog
+ *  "Open link"). The lock keeps the will-navigate check from re-examining a
+ *  navigation the user explicitly chose; the session request pipeline still
+ *  protects the load, and a listed main frame surfaces the blocked state. */
+function navigateContentsForUser(view, url) {
+  const contents = view.webContents;
+  if (contents.isDestroyed()) return;
+  navigationLocks.set(contents.id, { url, at: Date.now() });
+  lastRequested.set(contents.id, url);
+  contents.loadURL(url).catch(error => { if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Navigation failed:', error.message); });
+}
+
+/** A "commit" from the page's link script: a real click on a real anchor,
+ *  re-performed after the double-click window. `target`:
+ *   blank    -> open a tab through the full popup policy (verification)
+ *   top      -> navigate the tab's main frame (user-initiated)
+ *   download -> download through the protected session pipeline */
+function handleLinkCommit(contents, payload) {
+  if (contents.isDestroyed() || !payload || typeof payload !== 'object') return;
+  let url;
+  try { url = browsingUrl(payload.url); } catch { return; }
+  const sourceUrl = contents.getURL();
+  const isTop = payload.isTop !== false;
+  const crossOrigin = payload.crossOrigin === true;
+
+  if (payload.target === 'download') {
+    startHiddenDownload(url, sourceUrl);
+    return;
+  }
+  if (payload.target === 'top') {
+    const tabId = tabIdOfContents(contents);
+    const view = tabId && views.get(tabId);
+    if (view) navigateContentsForUser(view, url);
+    return;
+  }
+  // target: 'blank' — the browser would have opened a new tab here. Route it
+  // through the same policy a native open gets: a real click on a real anchor
+  // means a fresh gesture (the mouseDown was observed milliseconds ago) and
+  // an href-matched click attribution.
+  const atMs = Date.now();
+  const pageState = {
+    ageMs: 999999999, // the main-process input observation is the gesture source here
+    open: null,
+    click: { t: atMs, isTop: isTop, crossOrigin, frameHost: '', topHost: '', href: url },
+  };
+  const decision = engine.popupPolicy.classifyWindowOpen({
+    url,
+    sourceUrl,
+    disposition: 'foreground-tab',
+    tabCount: views.size,
+    pageState,
+    contentsId: contents.id,
+    atMs,
+  });
+  if (!decision.allowed) {
+    logPopup({ source: safeHost(sourceUrl), url, disposition: 'foreground-tab', frame: { isTop, crossOrigin, via: 'link-commit' }, decision: 'deny', reason: decision.reason, created: false });
+    recordBlocked('Pop-up', url, sourceUrl);
+    noticePopupBlocked(url, sourceUrl, decision.reason);
+    if (decision.earlierUrl) closeEarlierPopupTab(decision.earlierUrl);
+    return;
+  }
+  if (!decision.needsCommit) {
+    logPopup({ source: safeHost(sourceUrl), url, disposition: 'foreground-tab', frame: { isTop, crossOrigin, via: 'link-commit' }, decision: 'allow', reason: decision.reason, created: true });
+    send('core:open-tab', { url, title: safeHost(url) });
+    return;
+  }
+  logPopup({ source: safeHost(sourceUrl), url, disposition: 'foreground-tab', frame: { isTop, crossOrigin, via: 'link-commit' }, decision: 'verify', reason: decision.reason, created: false });
+  startCommitVerification({ url, sourceUrl, viaLinkClick: true });
+}
+
+/** A page->main message from the isolated link world (verified by context id). */
+function handleLinkMessage(contents, raw) {
+  let payload;
+  try { payload = JSON.parse(raw); } catch { return; }
+  if (contents.isDestroyed() || !payload || typeof payload !== 'object') return;
+  if (payload.t === 'dialog') {
+    let url;
+    try { url = browsingUrl(payload.url); } catch { return; }
+    let point = { x: 0, y: 0 };
+    try { point = screen.getCursorScreenPoint(); } catch { /* headless */ }
+    openLinkDialog({
+      url,
+      title: typeof payload.text === 'string' ? payload.text : '',
+      media: payload.media === true,
+      x: point.x,
+      y: point.y,
+      sourceTabId: tabIdOfContents(contents),
+    });
+  } else if (payload.t === 'commit') {
+    handleLinkCommit(contents, payload);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The link-options dialog: a small frameless window that loads the app's own
+// renderer in dialog mode (same design language, keyboard + Esc support),
+// positioned at the double-click point.
+// ---------------------------------------------------------------------------
+
+function closeLinkDialog() {
+  if (linkDialogWin && !linkDialogWin.isDestroyed()) {
+    try { linkDialogWin.close(); } catch { /* already gone */ }
+  }
+  linkDialogWin = null;
+}
+
+function openLinkDialog({ url, title, media = false, x, y, sourceTabId }) {
+  if (!win || win.isDestroyed()) return;
+  closeLinkDialog();
+  const width = 340;
+  const winBounds = win.getBounds();
+  // Position near the double-click, clamped inside the window.
+  const dx = Math.min(Math.max(x - winBounds.x - 24, 8), Math.max(8, winBounds.width - width - 8));
+  const dy = Math.min(Math.max(y - winBounds.y - 16, 8), Math.max(8, winBounds.height - 300));
+  linkDialogWin = new BrowserWindow({
+    // `dialog` is not an Electron option; it is our marker (harmless if
+    // ignored) used to find the dialog window in tests and window lists.
+    dialog: true,
+    width,
+    height: 348,
+    x: winBounds.x + dx,
+    y: winBounds.y + dy,
+    frame: false,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    show: false,
+    backgroundColor: '#f8f9fb',
+    hasShadow: true,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true },
+  });
+  linkDialogWin.setAlwaysOnTop(true, 'screen-saver');
+  linkDialogWin.setMenu(null);
+  // Leave on any focus loss: an outside click dismisses the dialog.
+  linkDialogWin.on('blur', () => { if (linkDialogWin && !linkDialogWin.isDestroyed()) linkDialogWin.close(); });
+  linkDialogWin.webContents.on('before-input-event', (_event, input) => {
+    if (input.type === 'keyDown' && input.key === 'Escape' && linkDialogWin && !linkDialogWin.isDestroyed()) linkDialogWin.close();
+  });
+  linkDialogWin.webContents.on('did-finish-load', () => {
+    if (!linkDialogWin || linkDialogWin.isDestroyed()) return;
+    linkDialogWin.webContents.send('core:dialog-data', { url, title, media: media === true, sourceTabId: sourceTabId || null });
+    linkDialogWin.webContents.focus();
+  });
+  linkDialogWin.on('closed', () => { linkDialogWin = null; });
+  linkDialogWin.loadFile(path.join(__dirname, '../renderer/index.html'), { query: { linkDialog: '1' } });
+}
+
+/** "Open in new window": a standalone window for the link, sharing the
+ *  browsing session and the exact same protection wiring as a tab. */
+function openBrowsingWindow(url) {
+  const w = new BrowserWindow({
+    width: 1080,
+    height: 720,
+    minWidth: 640,
+    minHeight: 480,
+    title: safeHost(url),
+    backgroundColor: '#ffffff',
+    icon: path.join(__dirname, '../assets/icon.png'),
+    webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false },
+  });
+  const contents = w.webContents;
+  wireBrowsingContents(contents, `win-${contents.id}`, {
+    onIssue: false,   // no renderer placeholder in a standalone window
+    onMedia: false,   // its own OS window; no main-window state machine
+    onF11: false,     // the main window owns F11/Escape fullscreen
+    onLayout: false,
+    onTitle: title => { if (title) w.setTitle(title); },
+  });
+  syncPageScripts(contents);
+  navigationLocks.set(contents.id, { url, at: Date.now() });
+  lastRequested.set(contents.id, url);
+  w.once('ready-to-show', () => w.show());
+  w.on('closed', () => { /* state cleanup happens on the contents 'destroyed' */ });
+  contents.loadURL(url).catch(error => { if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Navigation failed:', error.message); });
+  return w;
+}
+
+/** Download a URL through the app's protected pipeline: a hidden, never
+ *  painted WebContentsView navigates to it; the session's will-download
+ *  handler (ad/threat checks + save dialog) does the rest. The carrier is
+ *  destroyed as soon as the download starts, the load fails, or the URL
+ *  turns out to be a page. */
+function startHiddenDownload(url, sourceUrl) {
+  if (!win || win.isDestroyed()) return;
+  const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
+  const contents = view.webContents;
+  const record = { view, settled: false, timer: setTimeout(() => settleDownload(contents, record), 15000) };
+  downloads.set(contents.id, record);
+  view.setVisible(false); // never painted, ever
+  view.setBounds({ x: -1, y: -1, width: 0, height: 0 });
+  win.contentView.addChildView(view);
+  contents.setWindowOpenHandler(details => {
+    logPopup({ source: safeHost(sourceUrl), url: details.url, disposition: details.disposition || 'default', decision: 'deny', reason: 'download-escape', created: false });
+    return { action: 'deny' };
+  });
+  // will-download is a SESSION event; the session handler settles the
+  // carrier as soon as the download is handed to the save pipeline (it
+  // checks the carrier set). What settles here is load failure...
+  contents.on('did-fail-load', (_event, code) => {
+    if (code === -3) return; // aborted (listed download cancelled) — the session handler already settled it
+    settleDownload(contents, record);
+  });
+  contents.on('did-navigate', (_event, navUrl) => {
+    // It loaded as a page, not a file: nothing to download, settle quietly.
+    try { if (!new URL(navUrl).pathname.match(/\.(mp4|webm|ogv|ogg|mov|mkv|m4v|avi|mp3|m4a|aac|flac|wav|opus)$/i)) settleDownload(contents, record); } catch { /* keep waiting */ }
+  });
+  contents.on('destroyed', () => settleDownload(contents, record));
+  contents.loadURL(url).catch(() => settleDownload(contents, record));
+}
+
+function settleDownload(contents, record) {
+  if (!record || record.settled) return;
+  record.settled = true;
+  if (record.timer) clearTimeout(record.timer);
+  downloads.delete(contents.id);
+  try { if (win && !win.isDestroyed() && record.view && win.contentView.children.includes(record.view)) win.contentView.removeChildView(record.view); } catch { /* already gone */ }
+  try { contents.close(); } catch { /* already closing */ }
+}
+
+// ---------------------------------------------------------------------------
 // Document-start scripts via the DevTools protocol: the popup support on every
-// page, the YouTube shield where it applies. A stuck command must never block
-// browsing, so every step is guarded and the script is simply re-queued.
+// page, the link support on every page, the YouTube shield where it applies.
+// A stuck command must never block browsing, so every step is guarded and the
+// script is simply re-queued.
 // ---------------------------------------------------------------------------
 
 const popupSupportSource = (() => {
   try { return fs.readFileSync(path.join(__dirname, '..', 'shared', 'popup-support.js'), 'utf8'); } catch { return ''; }
 })();
+const linkSupportSource = (() => {
+  try { return fs.readFileSync(path.join(__dirname, '..', 'shared', 'link-support.js'), 'utf8'); } catch { return ''; }
+})();
 // Isolated JavaScript world for the popup support script (see shared/popup-support.js).
 const POPUP_WORLD = 'cc-popup';
+// Isolated world for the link support (double-click options) script.
+const LINK_WORLD = 'cc-links';
+// Page -> main channel: the link script console.logs MAGIC + JSON in its
+// isolated world; the main process verifies the execution context id, so the
+// page's own world can forge none of these messages.
+const LINK_MAGIC = '%CC-LINK% ';
 const syncQueue = new Map();
 
 function withTimeout(promise, label, ms = 4000) {
@@ -648,9 +954,34 @@ function withTimeout(promise, label, ms = 4000) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** CDP events for one contents: isolated-world bookkeeping (the link world's
+ *  context ids — the page->main channel's anti-spoofing check) and the link
+ *  messages themselves. Registered once per attach. */
+function handleCdpMessage(contents, entry, method, params) {
+  try {
+    if (method === 'Runtime.executionContextCreated' && params && params.context && params.context.name === LINK_WORLD) {
+      entry.linkContextIds.add(params.context.id);
+      return;
+    }
+    if (method === 'Runtime.executionContextDestroyed') {
+      entry.linkContextIds.delete(params.executionContextId);
+      return;
+    }
+    if (method === 'Runtime.consoleAPICalled') {
+      const arg = params && params.args && params.args[0];
+      if (!arg || arg.type !== 'string' || typeof arg.value !== 'string') return;
+      if (!arg.value.startsWith(LINK_MAGIC)) return;
+      // Only the isolated link world may use this channel; the page's own
+      // console (a different context) cannot forge link messages.
+      if (!entry.linkContextIds.has(params.executionContextId)) return;
+      handleLinkMessage(contents, arg.value.slice(LINK_MAGIC.length));
+    }
+  } catch (error) { console.warn('Link message error:', error.message); }
+}
+
 function syncPageScripts(contents) {
   const id = contents.id;
-  const entry = syncQueue.get(id) || { identifier: null, popupIdentifier: null, listening: false, queue: Promise.resolve() };
+  const entry = syncQueue.get(id) || { identifier: null, popupIdentifier: null, linkIdentifier: null, listening: false, cdpListening: false, linkContextIds: new Set(), queue: Promise.resolve() };
   syncQueue.set(id, entry);
   entry.queue = entry.queue.then(async () => {
     if (contents.isDestroyed()) return;
@@ -663,16 +994,22 @@ function syncPageScripts(contents) {
         cdp.attach('1.3');
         entry.identifier = null;
         entry.popupIdentifier = null;
-        if (!entry.listening) {
-          entry.listening = true;
-          cdp.on('detach', () => { entry.identifier = null; entry.popupIdentifier = null; });
+        entry.linkIdentifier = null;
+        if (!entry.cdpListening) {
+          entry.cdpListening = true;
+          cdp.on('message', (method, params) => handleCdpMessage(contents, entry, method, params));
+          cdp.on('detach', () => { entry.identifier = null; entry.popupIdentifier = null; entry.linkIdentifier = null; entry.linkContextIds.clear(); });
         }
         await withTimeout(cdp.sendCommand('Page.enable'), 'Page.enable');
+        // Runtime events deliver the link world's console channel and its
+        // execution-context bookkeeping.
+        await withTimeout(cdp.sendCommand('Runtime.enable'), 'Runtime.enable').catch(() => {});
       } catch (error) { console.warn('Page scripts unavailable:', error.message); return; }
     }
     const { protection } = state;
     const wantPopup = protection.enabled && protection.popups && popupSupportSource;
     const wantShield = protection.enabled && protection.youtube;
+    const wantLink = !!linkSupportSource; // a UX feature: on regardless of protection
     if (entry.popupIdentifier) {
       await withTimeout(cdp.sendCommand('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.popupIdentifier }), 'remove popup support').catch(() => {});
       entry.popupIdentifier = null;
@@ -681,11 +1018,21 @@ function syncPageScripts(contents) {
       await withTimeout(cdp.sendCommand('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.identifier }), 'remove shield').catch(() => {});
       entry.identifier = null;
     }
+    if (entry.linkIdentifier) {
+      await withTimeout(cdp.sendCommand('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.linkIdentifier }), 'remove link support').catch(() => {});
+      entry.linkIdentifier = null;
+    }
     if (wantPopup) {
       try {
         const result = await withTimeout(cdp.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: popupSupportSource, worldName: POPUP_WORLD }), 'install popup support');
         entry.popupIdentifier = result.identifier;
       } catch (error) { console.warn('Popup support could not be installed:', error.message); }
+    }
+    if (wantLink) {
+      try {
+        const result = await withTimeout(cdp.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: linkSupportSource, worldName: LINK_WORLD }), 'install link support');
+        entry.linkIdentifier = result.identifier;
+      } catch (error) { console.warn('Link support could not be installed:', error.message); }
     }
     if (wantShield) {
       try {
@@ -705,8 +1052,12 @@ async function refreshPageScripts() {
 // IPC
 // ---------------------------------------------------------------------------
 
-function trusted(event) {
-  if (!win || event.sender.id !== win.webContents.id || event.senderFrame !== win.webContents.mainFrame) throw new Error('Untrusted IPC sender');
+function trusted(event, extraSender = null) {
+  if (!win) throw new Error('Untrusted IPC sender');
+  // The link-options dialog is a separate window running our own renderer:
+  // its sender is verified by id (it never loads untrusted content).
+  if (extraSender && !extraSender.isDestroyed() && event.sender.id === extraSender.id) return;
+  if (event.sender.id !== win.webContents.id || event.senderFrame !== win.webContents.mainFrame) throw new Error('Untrusted IPC sender');
 }
 
 function registerIPC() {
@@ -721,7 +1072,7 @@ function registerIPC() {
     const pending = verifiedPopupOpens.find(item => item.url === url && Date.now() - item.at < 10000);
     if (pending) {
       verifiedPopupOpens.splice(verifiedPopupOpens.indexOf(pending), 1);
-      if (pending.watch) popunderWatches.set(view.webContents.id, { intendedUrl: pending.url, sourceUrl: pending.sourceUrl, createdAt: pending.at });
+      if (pending.watch) popunderWatches.set(view.webContents.id, { intendedUrl: pending.url, sourceUrl: pending.sourceUrl, createdAt: pending.at, viaLinkClick: pending.viaLinkClick === true });
       popupTabByOpenUrl.set(url, id);
     }
     // Make sure the document-start scripts are in place before the page loads.
@@ -789,6 +1140,44 @@ function registerIPC() {
   handle('core:engine-status', () => engine.status());
   handle('core:privacy', enabled => { if (typeof enabled === 'boolean') { state.doNotTrack = enabled; persist(); } });
   handle('core:clear-data', () => { state.stats = structuredClone(defaults.stats); persist(); send('core:stats-update', state.stats); });
+  // The link-options dialog (a separate window running our own renderer).
+  ipcMain.handle('core:dialog', (event, action, payload) => {
+    if (!linkDialogWin || linkDialogWin.isDestroyed()) return;
+    trusted(event, linkDialogWin.webContents);
+    const p = payload && typeof payload === 'object' ? payload : {};
+    let linkUrl = '';
+    try { linkUrl = typeof p.url === 'string' ? browsingUrl(p.url) : ''; } catch { /* not a browsable URL */ }
+    if (action === 'close') { closeLinkDialog(); return; }
+    if (!linkUrl) return;
+    if (action === 'open-link') {
+      closeLinkDialog();
+      const view = typeof p.sourceTabId === 'string' ? views.get(p.sourceTabId) : null;
+      if (view) navigateContentsForUser(view, linkUrl);
+      else send('core:open-tab', { url: linkUrl, title: safeHost(linkUrl) }); // the source tab closed meanwhile
+      return;
+    }
+    if (action === 'open-tab') {
+      closeLinkDialog();
+      send('core:open-tab', { url: linkUrl, title: safeHost(linkUrl) });
+      return;
+    }
+    if (action === 'open-window') {
+      closeLinkDialog();
+      openBrowsingWindow(linkUrl);
+      return;
+    }
+    if (action === 'copy') {
+      try { clipboard.writeText(linkUrl); } catch { /* clipboard unavailable */ }
+      closeLinkDialog();
+      send('core:toast', { text: 'Link address copied.', tone: 'success' });
+      return;
+    }
+    if (action === 'download') {
+      closeLinkDialog();
+      startHiddenDownload(linkUrl, '');
+      return;
+    }
+  });
   ipcMain.on('core:window', (event, action) => {
     trusted(event);
     if (action === 'close') win.close();
@@ -840,6 +1229,12 @@ function createWindow() {
     views.clear();
     for (const record of inspectors.values()) { if (record.timer) clearTimeout(record.timer); try { record.view.webContents.close(); } catch { /* ignore */ } }
     inspectors.clear();
+    for (const record of downloads.values()) settleDownload(record.view.webContents, record);
+    downloads.clear();
+    closeLinkDialog();
+    // No stale idle ticks for a closed window (the interval must never outlive
+    // the window it drives; createWindow clears it again before re-arming).
+    clearInterval(chromeIdleTimer);
     clearInterval(fullscreenVerifyTimer);
     fsCtl.activeTabId = null;
     fsCtl.userFullscreen = false;
@@ -911,6 +1306,13 @@ app.whenReady().then(() => {
     callback({ requestHeaders });
   });
   browsingSession.on('will-download', (event, item) => {
+    // A hidden download carrier (the double-click "Download attached media"
+    // action) is only a request vehicle: once the download is handed to the
+    // save pipeline, tear the carrier down immediately.
+    try {
+      const sender = event && event.sender;
+      if (sender && downloads.has(sender.id)) settleDownload(sender, downloads.get(sender.id));
+    } catch { /* never block the download itself */ }
     try {
       const url = item.getURL();
       const hit = engine.matchMainFrame(url, '');

@@ -22,22 +22,33 @@
 //     an active document-fullscreen makes Chromium tear the element down
 //     (spurious leave-html-full-screen), which is why media fullscreen used
 //     to appear broken or flash back out.
-// Chrome visibility is a third, independent state: it is forced off while
-// media is active, and otherwise auto-hides after seven seconds of
-// inactivity (only while focused and while an external page or browser
-// fullscreen is on screen), revealing on any activity.
 //
-// Previously these were scattered booleans in main.cjs with no single owner;
-// that is what produced the "stuck in fullscreen" states (closing the owning
-// tab never cleared them) and the geometry races (layout computed from a
-// stale window size mid-transition).
+// Chrome visibility (the inactivity auto-hide) has ONE owner — this state
+// machine — and ONE rule set, applied identically on macOS and Windows:
+//
+//   * The header is visible by default.
+//   * ANY activity (mouse movement, click, key, wheel, window focus, tab
+//     switch) reveals the header immediately and restarts the inactivity
+//     clock — including while media is playing in fullscreen.
+//   * Exactly IDLE_MS (10 s) after the last activity the header hides:
+//       - in the hide context: the window is focused and an external page or
+//         browser (window) fullscreen is on screen, or
+//       - while media is fullscreen: the header was hidden immediately when
+//         the media entered; after any reveal it hides again once the 10 s
+//         elapse.
+//   * When media exits, the header comes back and the clock restarts.
+//
+// The previous implementation let the renderer hide the header on its own
+// (a second source of truth) and never revealed the chrome while media was
+// active, which is what produced the "sometimes disappears, sometimes stays"
+// behaviour and the 7 s instead of 10 s timeout.
 // ---------------------------------------------------------------------------
 
-const IDLE_MS = 7000;
+const IDLE_MS = 10000;
 
 class FullscreenController {
   constructor(options = {}) {
-    this.idleMs = options.idleMs ?? 7000;
+    this.idleMs = options.idleMs ?? IDLE_MS;
     this.chromeHeight = options.chromeHeight ?? 96;
     this._now = options.now || (() => Date.now());
     this._listeners = new Set();
@@ -76,37 +87,50 @@ class FullscreenController {
     return this.mediaTabId !== null && this.mediaTabId === this.activeTabId;
   }
 
-  /** Chrome is off-screen while hidden by the idle rule, or while media is active. */
+  /** Chrome is off-screen only while this state machine says so. The
+   *  renderer must not add its own hide rule: one source of truth keeps the
+   *  CSS (header) and the view layout (page top) from ever disagreeing. */
   chromeHidden() {
-    return !this.chromeVisible || this.mediaActive;
+    return !this.chromeVisible;
   }
 
   viewTop() {
     return this.chromeHidden() ? 0 : this.chromeHeight;
   }
 
+  /** The 10 s idle hide only applies where the header belongs to the page:
+   *  the window is focused AND an external page or browser fullscreen is on
+   *  screen. Internal (workspace) pages and unfocused windows keep the
+   *  header. */
   autoHideAllowed() {
-    return this.mediaTabId === null && this._windowFocused && (this._showingExternal || this.userFullscreen);
+    return this._windowFocused && (this._showingExternal || this.userFullscreen);
   }
 
   // ------------------------------------------------------------------ state
 
-  /** Any user interaction in the window or a page. */
+  /** Any user interaction in the window or a page — including while media is
+   *  fullscreen: the header comes back and hides again after the idle time. */
   activity() {
     this._lastActivityAt = this._now();
-    if (!this.chromeVisible && this.autoHideAllowed()) {
+    if (!this.chromeVisible) {
       this.chromeVisible = true;
       this._emit({ type: 'chrome', visible: true });
       this._emit({ type: 'layout' });
     }
   }
 
-  /** Idle-timer tick, driven by the main process (every ~250 ms). */
+  /** Idle-timer tick, driven by the main process (every ~250 ms). Hides the
+   *  chrome exactly IDLE_MS after the last activity:
+   *   - media fullscreen: the media already hid it on entry; this re-hides
+   *     it after any activity-based reveal (immediate on entry, 10 s after
+   *     the last interaction afterwards — never sooner);
+   *   - otherwise: only in the auto-hide context (focused + page on screen). */
   tick({ windowFocused, showingExternal, cursorMoved = false } = {}) {
     if (windowFocused !== undefined) this._windowFocused = windowFocused;
     if (showingExternal !== undefined) this._showingExternal = showingExternal;
     if (cursorMoved) this._lastActivityAt = this._now();
-    if (this.autoHideAllowed() && this.chromeVisible && this._now() - this._lastActivityAt >= this.idleMs) {
+    if (this.chromeVisible && this._now() - this._lastActivityAt >= this.idleMs &&
+        (this.mediaActive || this.autoHideAllowed())) {
       this.chromeVisible = false;
       this._emit({ type: 'chrome', visible: false });
       this._emit({ type: 'layout' });
@@ -143,7 +167,9 @@ class FullscreenController {
 
   // ------------------------------------------------------------------ input
 
-  /** A tab's document entered the HTML fullscreen state. */
+  /** A tab's document entered the HTML fullscreen state. The header hides
+   *  IMMEDIATELY (the "media is playing in fullscreen" rule) — and, for a
+   *  background tab, the presentation is deferred until the tab is focused. */
   mediaEnter(tabId) {
     this._adoptMedia(tabId);
   }
@@ -210,9 +236,12 @@ class FullscreenController {
     this.mediaTabId = tabId;
     if (tabId !== this.activeTabId) return; // background: presented when focused
     if (this.chromeVisible) {
+      // Media is playing in fullscreen: the header goes away NOW, without
+      // waiting for the inactivity timeout.
       this.chromeVisible = false;
       this._emit({ type: 'chrome', visible: false });
     }
+    this._lastActivityAt = this._now();
     if (!this.userFullscreen && !this._mediaMaximized) {
       // Window-level media fullscreen: grow the window so the document's
       // fullscreen element can cover the screen. No OS transition — those
