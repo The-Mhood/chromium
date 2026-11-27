@@ -57,4 +57,25 @@ jobs:
       - run: npm ci
       # This project stores a base64 recovery copy of gradle-wrapper.jar; the
       # packaging script restores it, runs unit tests, assembles and verifies the APK.
-      - run: node scripts/package-android.mjs
+      - name: Build the Android TV app
+        run: node scripts/package-android.mjs 2>&1 | tee android-tv-build.log
+      # Keep the compilation ZIP (the thing users download to build on their
+      # own machines) building on every change too.
+      - run: node scripts/package-android-source.mjs
+      # Job logs are not always downloadable from every environment, so a
+      # failed build throws its log tail as an error annotation: the reason
+      # is visible on the run page and via the check annotations API.
+      - if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let tail = '';
+            try {
+              tail = fs.readFileSync('android-tv-build.log', 'utf8').trim().split('\n').slice(-60).join('\n');
+            } catch (e) { /* no log captured */ }
+            throw new Error(
+              'ChromiumCore Android TV build failed on ubuntu-latest (node ' + process.version +
+              '), commit ' + (context.sha || '?') + '.\n--- log tail ---\n' +
+              (tail || '(no output captured)')
+            );

@@ -63,16 +63,29 @@ This is a cat-and-mouse area. YouTube changes its pages often and actively tries
 
 The TV app lives in `android-tv/`. It is a separate native Kotlin application on the system WebView, because Electron does not run on Android. It targets Android 6 and later: Android TV, Google TV, Fire TV, and set-top boxes. Touch is optional.
 
-Requirements: JDK 17 and the Android SDK (platform 34, build-tools 34.0.0). Set `ANDROID_HOME` if the SDK is not in a standard location.
+Requirements: JDK 17 and the Android SDK (platform 34, build-tools 34.0.0). Set `ANDROID_HOME` if the SDK is not in a standard location. On a Mac the one-time setup is:
 
 ```sh
-node scripts/package-android.mjs
+brew install --cask temurin@17
+brew install --cask android-commandlinetools
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+```
+
+Then build from the terminal (no Android Studio needed):
+
+```sh
+node scripts/package-android.mjs        # tests + signed release APK
+node scripts/package-android-source.mjs # self-contained compilation ZIP
 node scripts/package-source.mjs
 npm run build
 node scripts/verify-downloads.mjs --dist --require-all
 ```
 
-The script runs the Kotlin unit tests, builds the release APK, signs it with a preview key generated into `.android-signing/` (never committed), verifies the signature with `apksigner`, and publishes `ChromiumCore-1.0.0-android-universal.apk` with its SHA-256 into `public/download/`. Keep the key if you plan to ship updates, since Android only upgrades an app signed with the same key. The APK is self-signed and is not a Google Play release. Install with `adb connect <tv-ip>` then `adb install ChromiumCore-1.0.0-android-universal.apk`, or sideload with a file-transfer app.
+`scripts/package-android.mjs` runs the Kotlin unit tests, builds the release APK, signs it with a preview key generated into `.android-signing/` (never committed), verifies the signature with `apksigner`, and publishes `ChromiumCore-1.0.0-android-universal.apk` with its SHA-256 into `public/download/`. Keep the key if you plan to ship updates, since Android only upgrades an app signed with the same key. The APK is self-signed and is not a Google Play release. Install with `adb connect <tv-ip>` then `adb install ChromiumCore-1.0.0-android-universal.apk`, or sideload with a file-transfer app.
+
+`scripts/package-android-source.mjs` writes `ChromiumCore-1.0.0-android-tv-source.zip`: the complete `android-tv/` Gradle project, the `shared/` code the build pulls from, the one-command build script, and `android-tv/BUILD.md` with the exact Mac install-and-build steps (including a plain-Gradle path that needs no Node). Anyone can unzip it on a Mac, follow `android-tv/BUILD.md`, and compile the APK from the terminal. The tagged release workflow (`.github/workflows/desktop-release.yml`) builds and publishes both the APK and this compilation ZIP as run artifacts alongside the desktop builds.
 
 **Remote pointer.** A D-pad cannot click a desktop website, so the app draws a pointer above the page. Arrow keys move it, and holding a key accelerates it (speed is adjustable). OK clicks at the pointer through real touch events, so text fields open the on-screen keyboard. Pushing the pointer against the top or bottom edge scrolls with mouse-wheel events, which also scrolls inner panels. Channel and Page keys scroll too. Pushing Up at the top of a page moves focus to the toolbar, and Down returns to the page. Menu or Info opens settings, Search edits the address, and Back goes back or leaves full-screen video. Hover events follow the pointer so menus that need hovering open. The pointer also works over full-screen video. If a site has its own remote navigation, switch the pointer off in the menu. A full keyboard typing into a field is passed through to the page instead.
 
