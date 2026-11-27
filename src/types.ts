@@ -111,6 +111,9 @@ export interface DesktopBridge {
   onNavigationBlocked: (callback: (info: { id: string; url: string; type: TabIssue['type'] }) => void) => () => void;
   onLoadFailed: (callback: (info: { id: string; url: string }) => void) => () => void;
   onTabClosed: (callback: (info: { id: string }) => void) => () => void;
+  onToast: (callback: (info: { text: string; tone: 'success' | 'info' | 'error' }) => void) => () => void;
+  onDialogData: (callback: (data: { url: string; title: string; media: boolean; sourceTabId: string | null }) => void) => () => void;
+  dialogAction: (action: 'close' | 'open-link' | 'open-tab' | 'open-window' | 'copy' | 'download', payload?: { url: string; sourceTabId?: string | null }) => Promise<void>;
 }
 
 declare global {

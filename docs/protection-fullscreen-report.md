@@ -456,3 +456,176 @@ stale ad click (link now opens), scripted-open attribution, and the
 repeat-rule-not-swallowing-link-clicks case; wiring subtest asserting the
 permission handler allows `fullscreen` and denies `notifications`/`media`/
 `geolocation`. `tsc` clean; **v1.0.12** built on all three platforms.
+
+## 17. Round 6 — consistent 10 s header hide, fmhy.net links, double-click dialog, address-bar search (2026-11-27)
+
+Four fixes, all verified against the real Electron main process (stub harness)
+and the staged desktop build — not just isolated units.
+
+### 1. Header auto-hide: one owner, exactly ten seconds
+**Symptom:** the header hid inconsistently — sometimes after ~7 s, sometimes
+never, sometimes while a video was playing and sometimes not; mouse movement
+did not reliably bring it back.
+**Root causes:**
+1. **Two hide rules.** The renderer hid the header itself
+   (`App.tsx` `chrome-hidden` on `fullscreenState.media`) while the main
+   process hid it on its own 7 s timer — two sources of truth, so the CSS
+   (header) and the page-view layout (page top) disagreed.
+2. **7 s constant**, not the 10 s the product specifies.
+3. **Media never revealed the chrome:** activity while media was fullscreen
+   was ignored, so the header stayed hidden for the whole video (or, after a
+   manual show, snapped back at the next idle tick — "sometimes stays,
+   sometimes disappears").
+4. **Stale timers / state:** the window-close path did not clear the idle
+   interval, and media was previously routed through an OS
+   `setFullScreen` transition that tore down the document's fullscreen
+   element (the original "media fullscreen broken").
+
+**Fix:** the main-process state machine (`fullscreen-state.cjs`) is now the
+*SINGLE* owner of header visibility with one rule set:
+- visible by default; ANY activity (mouse, key, wheel, focus, tab switch)
+  reveals it immediately and restarts the clock — including while media is
+  fullscreen;
+- exactly `IDLE_MS = 10000` after the last activity it hides (in the auto-hide
+  context, and while media is fullscreen);
+- media enter hides the header **immediately** (no 10 s wait) and grows the
+  window (`window-maximize`) — no OS transition, so the fullscreen element is
+  never torn down; media exit restores the header and the window;
+- `tabClosed` clears media ownership (the "stuck in fullscreen" case); the
+  window-close path clears the idle interval; the renderer's second rule is
+  removed (`App.tsx` keys only on `chromeVisible`).
+- macOS + Windows share the identical code path (the cursor is polled with
+  `screen.getCursorScreenPoint()`; input events are OS-level).
+
+### 2. fmhy.net and ordinary site links actually navigate
+**Symptom (real app):** clicking a movie link on fmhy.net (and many other
+content sites) did nothing — no tab, no navigation — while ad popups were
+being blocked correctly.
+**Root causes (three over-blockers, all policy-level; the filter lists were
+proven clean — see verification):**
+1. **Ages measured at read-finish, not request time.** The page's isolated
+   world is read over the DevTools protocol *asynchronously*; on ad-heavy
+   pages that read took 1–2 s, so a click that was 50 ms old at request time
+   was 1.5–2 s old when `classifyWindowOpen` ran — outside the 1.5 s gesture
+   window — and the open was denied as `no-gesture`.
+2. **Freshest-record attribution misfired.** A legitimate link open was
+   attributed to a *stale cross-origin `window.open` record* left by an ad
+   iframe (records linger 3 s) → denied as `ad-iframe`. (Round 5's exact-href
+   rule was necessary but not sufficient: `foreground-tab` opens were never
+   attributed to an open record, so the *scripted* ad case slipped through
+   while the *link* case was still hostage to the stale record.)
+3. **Popunder verdict on link clicks.** A link that 302s across domains
+   (the site's player/CDN — the normal shape of fmhy.net) tripped the
+   `window.open("")` domain-jump rule and was killed in the inspector.
+
+**Fixes:**
+- **`atMs` threading** (`main.cjs` + `popup-blocker.cjs`): the age of every
+  record is measured against the moment the open was *requested*, never
+  against whenever the async read finished. A fresh click is never starved.
+- **Attribution priority** (`popup-blocker.cjs`, `pickAttribution`): (1) a
+  click whose anchor href *exactly matches* the destination wins (the user
+  clicked this link — even if an ad called `window.open` at the same
+  instant); (2) otherwise an open record is a *scripted* open — a
+  cross-origin `window.open` is blocked `ad-iframe` **even when the browser
+  reports it as a foreground tab**; (3) otherwise a weak click record; (4)
+  nothing → the unspoofable gesture check + commit verification decide.
+  Cross-origin *link* clicks (a real embedded widget with its own links) are
+  allowed once per 8 s window — the first is commit-verified, a burst of
+  them is the ad click-through pattern and is blocked.
+- **Popunder exemption for link clicks** (`committedNavigationVerdict`
+  gains `viaLinkClick`): a link click crossing domains is the user following
+  the site's redirects — accepted. The *scripted* `window.open("")`
+  domain-jump is still blocked, and *listed* destinations are still blocked
+  in both cases (the filter check is never relaxed).
+- **Engine repro confirms the lists were never the problem**: all fmhy.net
+  URL shapes (home, movie, watch, ajax player, api) are clean under the
+  93 534 bundled baseline rules, while doubleclick/pagead controls are still
+  blocked — so the fix is policy-level, not a site-specific allowlist.
+
+### 3. Double-click link options (macOS + Windows)
+Double-clicking any link shows a small frameless dialog at the cursor with
+the **actual destination URL** and the actions **Open link, Open in new
+tab, Open in new window, Copy link address, and Download attached media**
+(the last only when the link points at media / carries `download`).
+- **No unintended single-click navigation:** a plain left click
+  `preventDefault`s only the default navigation (page handlers still run)
+  and defers 300 ms; a second click on the same anchor within 600 ms
+  cancels the deferred navigation and opens the dialog. The commit routing
+  reproduces native behaviour: same-frame `location.assign` (with an SPA
+  `pushState` guard), `target=_blank` through the *full popup policy*,
+  `target=_top/_parent` across origins through the main process, and
+  media/`download` through the main-process download pipeline (save dialog +
+  ad/threat checks).
+- **Injected in an isolated world** (`cc-links`, document-start) and reached
+  through the DevTools protocol on a magic console prefix; the main process
+  verifies the *execution-context id* of the isolated world, so the page's
+  own world cannot forge messages, and only **trusted** (`isTrusted`)
+  mouse events drive it — a page that dispatches synthetic clicks cannot
+  open the dialog, commit a navigation, or swallow the user's real clicks.
+- Keyboard dismiss (Esc), outside-click dismiss (window blur), first action
+  focused on open (Tab/Enter/Space), ARIA `role="dialog"`.
+- **Open in new window** creates a standalone window wired through the same
+  `wireBrowsingContents` path — identical popup/ad protection, media
+  handling and navigation lock as a tab.
+- `main.cjs` `core:dialog` IPC is `trusted(event, linkDialogWin)` — only the
+  dialog window's own contents may act.
+
+### 4. Address bar: valid URL → navigate, otherwise Google search
+`shared/address.ts` (`classifyAddress`) with strict hostname rules:
+- valid URLs navigate — explicit `http(s)://`, implied-scheme
+  (`youtube.com`, `example.com:8080`, `www.…`, paths/queries/fragments),
+  IPv4, `[v6]`, `localhost` (incl. `localhost:port`);
+- **never** misclassified as hostnames: single labels other than
+  `localhost` (`exam`), dotted words (`node.js and deno`), whitespace,
+  numeric TLDs (`exam.123`), bad ports (`example.com:abc`), hyphen edge
+  cases, empty labels, and non-http schemes (`javascript:`, `file:`,
+  `mailto:`, `data:`, `intent:`) all become searches;
+- search terms are URL-encoded (`%20`, `%26`, `%3C`…) into the configured
+  engine (Google default; DuckDuckGo/Bing honoured); `safeUrl`/`searchUrl`
+  are re-exported from `shared/address` so the renderer and any future
+  caller share one classifier.
+- The `host:port` vs `scheme:` ambiguity is resolved explicitly: a **dotted**
+  label before `:` is a host (`example.com:8080` navigates), and
+  `localhost:<digit>` is a host not a "localhost:" scheme.
+
+### Files
+- `electron/fullscreen-state.cjs` — single-owner 10 s state machine;
+  media = window-maximize + immediate chrome hide (no OS transition).
+- `electron/popup-blocker.cjs` — `atMs` ages, `pickAttribution` priority,
+  cross-origin *click* rate limit, scripted-open `ad-iframe` (any
+  disposition), `committedNavigationVerdict(viaLinkClick)`.
+- `electron/main.cjs` — `atMs` threading through the open/commit/popunder
+  pipeline; `wireBrowsingContents` shared by tabs and standalone windows
+  (media events forwarded for every tab — the stale active-tab guard is
+  gone); CDP link world + context-id verification; dialog window +
+  `core:dialog` IPC; `openBrowsingWindow`; hidden download carrier
+  (settled by the session `will-download` handler, which carries the
+  sender); window-close clears the idle interval and dialogs.
+- `electron/preload.cjs`, `src/types.ts` — dialog + toast bridge.
+- `shared/link-support.js` — isolated-world double-click manager (NEW).
+- `shared/address.ts` + `shared/address.test.ts` — strict classifier (NEW).
+- `src/main.tsx` (dialog mode), `src/components/LinkDialog.tsx` (NEW),
+  `src/App.tsx` (second hide rule removed; toast wiring), `src/index.css`
+  (dialog styles), `src/lib/data.ts` (classifier re-export).
+- Tests: `popup-blocker.test.cjs` (+8), `fullscreen-state.test.cjs` (+5),
+  `main.wiring.test.cjs` (media 10 s round-trip, fmhy link + popunder
+  control, CDP dialog pipeline + anti-spoof, commit routing, address via
+  unit suite), `shared/address.test.ts` (10 cases).
+
+### Verification (all genuinely executed)
+- **Staged desktop suite (the CI `electron` signal): 128/128** — including
+  the new regression guards, run from a fresh `prepare-desktop` build.
+- **Root unit suites:** address 10/10; fullscreen-state 26/26;
+  popup-blocker 39/40 — the single failure is the pre-existing tldts
+  public-suffix artifact that only occurs outside the staged build (it
+  passes in `.desktop-build`, i.e. in CI).
+- **FMHY engine repro** (real `@ghostery/adblocker`, real baseline files):
+  every fmhy.net URL shape clean under 93 534 rules; ad controls blocked.
+- `tsc --noEmit` clean; `vite build` green.
+- **Honest limitation:** this sandbox has no display server and no access to
+  the Playwright browser CDN, so the *packaged GUI* (pixel-level header
+  hide, on-screen dialog, real fmhy.net navigation) is verified here via the
+  real `main.cjs` against the Electron stub (128/128) and will be exercised
+  on the three release builds (win32-x64, darwin-arm64, darwin-x64) by the
+  `desktop-release` workflow when the tag is pushed. No packaged-app test is
+  reported as passed in this environment.

@@ -1,17 +1,23 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// ChromiumCore popup / popunder policy (v3 — default-deny).
+// ChromiumCore popup / popunder policy (v4 — default-deny, link-aware).
 //
 // Pure module: no Electron imports, so the entire classification and state
 // machine is unit tested in plain Node (popup-blocker.test.cjs). The main
 // process feeds it:
 //   - a `matchRequest(url, sourceUrl, type, group?)` predicate built from the
 //     ad / threat engines,
-//   - the page's user-activation age and per-frame window.open records read
-//     from *isolated* JavaScript worlds (shared/popup-support.js, injected
-//     with a CDP worldName so pages cannot observe or tamper with them),
-//   - the disposition Chromium reports for each window.open request.
+//   - the page's user-activation and per-frame window.open / click records
+//     read from *isolated* JavaScript worlds (shared/popup-support.js,
+//     injected with a CDP worldName so pages cannot observe or tamper with
+//     them),
+//   - the disposition Chromium reports for each window.open request,
+//   - the time the open was REQUESTED (`atMs`). Every age is measured
+//     against this — never against the time the (asynchronous, up to a few
+//     seconds on ad-heavy pages) isolated-world state read finishes. That
+//     was the "links refuse to click" defect on pages like fmhy.net: the
+//     read alone pushed a fresh click past the gesture window.
 //
 // Product requirement: an advertising tab or window must never become
 // visible. So the policy never "allows and closes later" — an allowed open
@@ -21,7 +27,8 @@
 //
 // Trust model: pages can lie about anything inside their own world, so the
 // decision never relies on page-visible state alone:
-//   * activation age = min(isolated-world age, main-process input age);
+//   * activation age = min(isolated-world age, main-process input age),
+//     both measured against the open-request time;
 //   * the per-gesture quota is counted by the main process (one script-driven
 //     window.open per user activation) and cannot be reset from the page;
 //   * when there is NO activation evidence at all, the open is BLOCKED.
@@ -29,31 +36,56 @@
 //     legitimately open a browsing context, and unlisted ad domains cannot
 //     be told apart from legitimate ones by a blocklist anyway.)
 //
+// Attribution — which frame initiated an open — is precise, never "freshest
+// record":
+//   * a CLICK whose anchor href MATCHES the destination is the initiator
+//     (that is the click the browser acted on) — for ANY disposition, in any
+//     frame;
+//   * a SCRIPTED open (any disposition but "foreground-tab") is attributed
+//     to the window.open record (the call that caused it);
+//   * a LINK open ("foreground-tab") is never attributed to a window.open
+//     record: a target=_blank click does not call window.open, so a stale
+//     window.open record from an ad iframe (its popup attempt was blocked,
+//     but the record lingers for 3 s) is a DIFFERENT event. Attributing it
+//     is what kept blocking legitimate site links after an ad popup fired.
+//
+// Frame policy:
+//   * a SCRIPTED open from a cross-origin iframe (the standard ad-embed
+//     pattern) is BLOCKED, even on a real click elsewhere on the page;
+//   * a LINK CLICK inside a cross-origin iframe (an embedded third-party
+//     widget with its own links) is allowed with commit verification, but a
+//     page may only get ONE such click-open per REPEAT_WINDOW_MS — ad units
+//     fire repeated click-throughs, a user rarely clicks two different
+//     third-party iframe links within seconds. Same-origin iframe links are
+//     part of the page and are treated like top-frame links.
+//
 // Rules:
 //   1. Protection off / site allowlisted            -> allow (no verification
 //      hold: the user explicitly paused protection for that site).
 //   2. Destination matches an ad/threat filter       -> block.
 //   3. "background-tab" (window.open 'background' — the classic popunder
 //      primitive) -> block, even with a fresh gesture.
-//   4. An open initiated from a cross-origin iframe (the standard ad-embed
-//      pattern) -> block, even on a real click. Same-origin iframe opens are
-//      treated like top-frame opens. Attribution covers BOTH ways a frame
-//      opens a tab: a window.open call recorded in that frame, and a
-//      target=_blank anchor CLICK recorded in that frame (which never
-//      involves window.open and was the hole that let "sponsored" ad
-//      iframes open tabs on the user's click).
-//   5. Tab budget exhausted                           -> block.
-//   6. A second script popup from the same page within REPEAT_WINDOW_MS
+//   4. Tab budget exhausted                           -> block.
+//   5. A second script popup from the same page within REPEAT_WINDOW_MS
 //      (even with a fresh gesture each time) -> block, and report the
 //      earlier popup's URL so the main process can close that tab.
-//   7. Everything else requires a FRESH user gesture (real key/click input
-//      within GESTURE_WINDOW_MS — scrolling never counts) and, for
-//      script-driven opens, stays within the per-gesture quota.
-//   8. Every other allowed open returns needsCommit: the main process
+//   6. Everything else requires a FRESH user gesture (real key/click input
+//      within GESTURE_WINDOW_MS of the OPEN-REQUEST time — scrolling never
+//      counts) and, for script-driven opens, stays within the per-gesture
+//      quota.
+//   7. Every other allowed open returns needsCommit: the main process
 //      verifies the first committed main frame (after redirects) before the
 //      tab chip is ever shown.
-// This stops timer popups, popup chains, popunders and click-to-ad redirects
-// to *unlisted* destinations, which a domain blocklist alone cannot catch.
+//
+// Commit verdict (committedNavigationVerdict): a redirect into a listed
+// ad/threat domain is always blocked, for every kind of open. The
+// popunder domain-JUMP rule (open started on the opener's own registrable
+// domain but committed on a different one) applies to SCRIPTED opens only:
+// it is the window.open('')-then-location=ad primitive. A LINK CLICK that
+// bounces across domains (a movie page redirecting to its player or a
+// sister domain, google.com to accounts.google.com) is the user's chosen
+// destination following the site's normal redirects — blocking it is what
+// made "site links refuse to click".
 // ---------------------------------------------------------------------------
 
 const GESTURE_WINDOW_MS = 1500;
@@ -100,20 +132,47 @@ function sameAnchorHref(href, destination) {
  *     attribution (that click is what the browser acted on): it catches the
  *     "sponsored link in a cross-origin ad iframe" pattern, and it
  *     attributes a top-frame link click to the top frame;
- *   - a scripted window.open is attributed to the window.open record.
- * A link open with NO matching-href click is NOT attributed to a stale
- * cross-origin click: the freshest-click heuristic misfired in practice —
- * a user who clicked an ad element and then a site link within the record
- * window had their site link blocked as an "ad-iframe" open. When no
- * record matches, the (unspoofable) gesture check and commit verification
- * decide instead.
+ *   - a scripted open (not "foreground-tab") is attributed to the freshest
+ *     window.open record;
+ *   - a link open with NO matching-href click has NO attribution: a stale
+ *     window.open record from another frame is a different event, and the
+ *     freshest-record heuristic misfired in practice — a user who clicked
+ *     an ad element and then a site link within the record window had their
+ *     site link blocked as an "ad-iframe" open. When no record matches, the
+ *     (unspoofable) gesture check and commit verification decide instead.
  */
-function pickAttribution({ url, disposition, pageState }) {
+/**
+ * Which frame action caused THIS open, and through which mechanism.
+ *
+ * Priority (the order matters — it is the fmhy.net fix):
+ *   1. A click record whose href is exactly the destination: the user
+ *      clicked THIS anchor. Ads react to user clicks (the ad iframe calls
+ *      window.open milliseconds after the click), so without this rule the
+ *      ad's open record could steal the attribution of the user's link —
+ *      the exact failure that blocked legitimate site links.
+ *   2. An open record (a window.open() call from a frame): direct evidence
+ *      of a SCRIPTED open — even when the browser reported the open as a
+ *      foreground tab (window.open with window features reports
+ *      'foreground-tab'). Without this rule a cross-origin ad iframe's
+ *      window.open could never be blocked under that disposition.
+ *   3. A click record without an href match: the click was on a different
+ *      anchor (or the href was not captured). Weak evidence; the gesture
+ *      check below still gates it.
+ *   4. Nothing: no attribution — the gesture check decides.
+ *
+ * Returns the record annotated with `via` ('open' | 'click') so the caller
+ * can tell scripted opens from link clicks even under identical
+ * dispositions.
+ */
+function pickAttribution({ url, pageState }) {
   const openRecord = pageState && pageState.open;
   const clickRecord = pageState && pageState.click;
-  if (clickRecord && sameAnchorHref(clickRecord.href, url)) return clickRecord;
-  if (disposition !== 'foreground-tab' && openRecord) return openRecord;
-  return openRecord || null;
+  if (clickRecord && sameAnchorHref(clickRecord.href, url)) {
+    return Object.assign({}, clickRecord, { via: 'click' });
+  }
+  if (openRecord) return Object.assign({}, openRecord, { via: 'open' });
+  if (clickRecord) return Object.assign({}, clickRecord, { via: 'click' });
+  return null;
 }
 
 function createPopupPolicy(options = {}) {
@@ -130,6 +189,9 @@ function createPopupPolicy(options = {}) {
   // Repeat-popup tracking: webContents id -> { url, firstAt } of the last
   // allowed script popup from that page.
   const repeatOpeners = new Map();
+  // Cross-origin click-open tracking: webContents id -> { firstAt } of the
+  // last allowed LINK click from a cross-origin iframe on that page.
+  const repeatCrossOriginClicks = new Map();
 
   function settingsOf() {
     const s = getSettings();
@@ -157,6 +219,9 @@ function createPopupPolicy(options = {}) {
    * @param {number} p.tabCount     external tabs currently open
    * @param {object|null} p.pageState { ageMs, open, click } from the isolated
    *                                   worlds, or null when CDP is unavailable.
+   *                                   `ageMs` is measured against the open
+   *                                   request time (the main process
+   *                                   computes it from raw timestamps).
    *                                   `open` = { t, isTop, crossOrigin, ... }
    *                                   of the freshest window.open record;
    *                                   `click` = { t, isTop, crossOrigin,
@@ -165,11 +230,20 @@ function createPopupPolicy(options = {}) {
    *                                   window.open, so this is the only
    *                                   record of that path).
    * @param {number} p.contentsId
+   * @param {number} [p.atMs]       when the open was REQUESTED. All ages are
+   *                                 measured against this, not against the
+   *                                 time this function runs (the isolated-
+   *                                 world read is asynchronous and can take
+   *                                 seconds on ad-heavy pages — measuring
+   *                                 against "now" is what starved fresh
+   *                                 clicks of their gesture).
    * @returns {{ allowed: boolean, reason: string, needsCommit?: boolean, earlierUrl?: string }}
    */
   function classifyWindowOpen(p) {
     const { url, sourceUrl, disposition, tabCount, pageState, contentsId } = p;
+    const atMs = typeof p.atMs === 'number' ? p.atMs : now();
     const { protection, allowlist } = settingsOf();
+    const isLinkClick = disposition === 'foreground-tab';
 
     if (!protection.enabled || protection.popups === false) return { allowed: true, reason: 'protection-off', needsCommit: false };
     if (isAllowedDomain(sourceUrl, allowlist)) return { allowed: true, reason: 'allowlisted', needsCommit: false };
@@ -181,19 +255,29 @@ function createPopupPolicy(options = {}) {
     if (disposition === 'background-tab') {
       return { allowed: false, reason: 'background-tab', needsCommit: false };
     }
-    // Frame attribution: which frame's action caused THIS open. A cross-
-    // origin iframe is the canonical ad-embed pattern — a third-party ad
-    // unit opens a tab "on" the user's click — and never gets one, even on
-    // a real click. A same-origin iframe is part of the page being viewed.
-    // Two mechanisms open tabs:
+    // Frame attribution: which frame's action caused THIS open. Two
+    // mechanisms open tabs:
     //   * a scripted window.open      -> the `open` record in that frame;
     //   * a target=_blank anchor click -> the `click` record (window.open is
-    //     NOT called; the browser opens the tab directly). This is the
-    //     "sponsored link" ad pattern and the hole a window.open-only check
-    //     misses.
-    const attribution = pickAttribution({ url, disposition, pageState });
+    //     NOT called; the browser opens the tab directly).
+    const attribution = pickAttribution({ url, pageState });
     if (attribution && attribution.crossOrigin === true) {
-      return { allowed: false, reason: 'ad-iframe', needsCommit: false };
+      if (attribution.via === 'open' || !isLinkClick) {
+        // A scripted window.open from a cross-origin iframe is the canonical
+        // ad-embed pattern — it never opens, even on a real click elsewhere
+        // and even when the browser reports it as a foreground tab. (The
+        // href-matched click record above already took priority, so this
+        // only fires when the open's own evidence says "ad".)
+        return { allowed: false, reason: 'ad-iframe', needsCommit: false };
+      }
+      // A LINK click inside a cross-origin iframe: an embedded third-party
+      // widget with its own links is legitimate (commit verification still
+      // vets the destination), but a page that gets more than one such
+      // click-open inside the window is an ad unit firing click-throughs.
+      const repeatClick = repeatCrossOriginClicks.get(contentsId);
+      if (repeatClick && atMs - repeatClick.firstAt < REPEAT_WINDOW_MS) {
+        return { allowed: false, reason: 'repeat-cross-origin-click', needsCommit: false };
+      }
     }
     if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsCommit: false };
 
@@ -205,20 +289,20 @@ function createPopupPolicy(options = {}) {
     // navigations, not popups — a page that legitimately popped once must
     // not swallow the user's next link click.
     const repeat = repeatOpeners.get(contentsId);
-    if (disposition !== 'foreground-tab' && repeat && now() - repeat.firstAt < REPEAT_WINDOW_MS) {
+    if (!isLinkClick && repeat && atMs - repeat.firstAt < REPEAT_WINDOW_MS) {
       return { allowed: false, reason: 'repeat-popup', needsCommit: false, earlierUrl: repeat.url };
     }
 
     const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
-    const isLinkClick = disposition === 'foreground-tab';
     if (!isLinkClick) entry.opens += 1; // every script-driven attempt consumes quota until a fresh gesture
     pageInput.set(contentsId, entry);
 
     // Activation evidence: the freshest of the isolated-world clock (any
-    // frame) and the unspoofable main-process input observation.
+    // frame) and the unspoofable main-process input observation — both
+    // measured against the moment the open was requested.
     let age = NO_ACTIVATION_MS;
     if (pageState && typeof pageState.ageMs === 'number') age = Math.min(age, pageState.ageMs);
-    if (entry.lastInputAt) age = Math.min(age, now() - entry.lastInputAt);
+    if (entry.lastInputAt) age = Math.min(age, atMs - entry.lastInputAt);
 
     if (age >= NO_ACTIVATION_MS) {
       // No input seen by the main process, no activation seen in the page:
@@ -229,7 +313,10 @@ function createPopupPolicy(options = {}) {
     }
 
     if (age <= GESTURE_WINDOW_MS && entry.opens <= OPENS_PER_ACTIVATION) {
-      if (!isLinkClick) repeatOpeners.set(contentsId, { url, firstAt: now() });
+      if (!isLinkClick) repeatOpeners.set(contentsId, { url, firstAt: atMs });
+      if (isLinkClick && attribution && attribution.crossOrigin === true) {
+        repeatCrossOriginClicks.set(contentsId, { firstAt: atMs });
+      }
       // The allow is provisional: the main process verifies the first
       // committed main frame (following redirects) before any tab chip is
       // created, so a redirect-to-ad can never flash on screen.
@@ -241,6 +328,7 @@ function createPopupPolicy(options = {}) {
   function forget(contentsId) {
     pageInput.delete(contentsId);
     repeatOpeners.delete(contentsId);
+    repeatCrossOriginClicks.delete(contentsId);
   }
 
   return {
@@ -267,23 +355,32 @@ function createPopupPolicy(options = {}) {
  * @param {function} p.matchRequest (url, sourceUrl, type, group?) => bool
  * @param {number} p.nowMs
  * @param {number} p.createdAt     when the open was requested
+ * @param {boolean} [p.viaLinkClick] true when the open was a user LINK click
+ *   (the destination is the user's choice). The popunder domain-jump rule
+ *   then does NOT apply: a page may legitimately redirect the user across
+ *   registrable domains (player/CDN/sister domains). Scripted keeps are
+ *   still vetted against the filter lists above.
  * @returns {{ block: boolean, reason: string, type: 'Ad'|'Threat'|'Pop-up'|null }}
  */
 function committedNavigationVerdict(p) {
   const { intendedUrl, openerUrl, finalUrl, matchRequest, nowMs, createdAt } = p;
+  const viaLinkClick = p.viaLinkClick === true;
   if (nowMs - createdAt > WATCH_TTL_MS) return { block: false, reason: 'expired', type: null };
 
   if (matchRequest(finalUrl, intendedUrl, 'main_frame') || matchRequest(finalUrl, openerUrl, 'main_frame')) {
     const threat = matchRequest(finalUrl, intendedUrl, 'main_frame', 'threats') || matchRequest(finalUrl, openerUrl, 'main_frame', 'threats');
     return { block: true, reason: 'listed-redirect', type: threat ? 'Threat' : 'Ad' };
   }
-  // window.open('') / location=ad popunder scheme: the open started on the
-  // opener's own domain and the committed frame jumped to another one.
-  const intendedDomain = getRegistrableDomain(intendedUrl);
-  const openerDomain = getRegistrableDomain(openerUrl);
-  const finalDomain = getRegistrableDomain(finalUrl);
-  if (intendedDomain !== '' && intendedDomain === openerDomain && finalDomain !== '' && finalDomain !== openerDomain) {
-    return { block: true, reason: 'popunder', type: 'Pop-up' };
+  // Scripted opens only: window.open('') / location=ad popunder scheme: the
+  // open started on the opener's own domain and the committed frame jumped
+  // to another one. (A user link click is exempt — see viaLinkClick.)
+  if (!viaLinkClick) {
+    const intendedDomain = getRegistrableDomain(intendedUrl);
+    const openerDomain = getRegistrableDomain(openerUrl);
+    const finalDomain = getRegistrableDomain(finalUrl);
+    if (intendedDomain !== '' && intendedDomain === openerDomain && finalDomain !== '' && finalDomain !== openerDomain) {
+      return { block: true, reason: 'popunder', type: 'Pop-up' };
+    }
   }
   return { block: false, reason: 'accepted', type: null };
 }

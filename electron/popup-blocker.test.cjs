@@ -112,20 +112,66 @@ test('a top-frame open with no frame record falls back to the gesture check', ()
   assert.equal(decision.reason, 'user-gesture');
 });
 
-test('a target=_blank click from a cross-origin ad iframe is blocked (no window.open involved)', () => {
+test('a link click in a cross-origin iframe is verified, then rate-limited (ad click-throughs stop)', () => {
   const { policy, at, classify } = makePolicy();
   at(1_000_000);
   policy.observeInput(1, 'mouseDown');
   at(1_000_100);
-  // The user clicked the ad iframe's own anchor; the click record's href is
-  // the destination and the frame is cross-origin. No open record exists.
-  const decision = classify({
-    url: 'https://sponsored-offers.example.org/deal',
+  // The user clicked an anchor in a cross-origin iframe (an embedded
+  // third-party widget with its own links). No open record exists (a link
+  // click never calls window.open). The first such click-open is allowed
+  // with commit verification — the destination is still vetted by the
+  // filter engine and the hidden inspector...
+  const first = classify({
+    url: 'https://widget.example.org/doc',
     disposition: 'foreground-tab',
-    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test', href: 'https://sponsored-offers.example.org/deal' } },
+    pageState: { ageMs: 100, open: null, click: { t: 1_000_100, isTop: false, crossOrigin: true, frameHost: 'widget.example.org', topHost: 'site.test', href: 'https://widget.example.org/doc' } },
   });
-  assert.equal(decision.allowed, false);
-  assert.equal(decision.reason, 'ad-iframe');
+  assert.equal(first.allowed, true);
+  assert.equal(first.reason, 'link-click');
+  assert.equal(first.needsCommit, true, 'the destination is still verified before a chip appears');
+  // ...but an ad unit firing a SECOND cross-origin click-through within the
+  // repeat window is an ad pattern, not a user workflow: blocked.
+  at(1_002_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_002_100);
+  const second = classify({
+    url: 'https://widget.example.org/deal-2',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 100, open: null, click: { t: 1_002_100, isTop: false, crossOrigin: true, frameHost: 'widget.example.org', topHost: 'site.test', href: 'https://widget.example.org/deal-2' } },
+  });
+  assert.equal(second.allowed, false);
+  assert.equal(second.reason, 'repeat-cross-origin-click');
+  // After the repeat window elapses, an ordinary cross-origin link works again.
+  at(1_010_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_010_100);
+  const later = classify({
+    url: 'https://widget.example.org/doc-3',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 100, open: null, click: { t: 1_010_100, isTop: false, crossOrigin: true, frameHost: 'widget.example.org', topHost: 'site.test', href: 'https://widget.example.org/doc-3' } },
+  });
+  assert.equal(later.allowed, true);
+});
+
+test('a SCRIPTED open from a cross-origin iframe is still blocked outright', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_100);
+  // The ad-embed pattern: the iframe's SCRIPT calls window.open. The click
+  // rate limit does not soften scripted opens — they never get through.
+  for (let i = 0; i < 3; i += 1) {
+    at(1_000_100 + i * 1000);
+    policy.observeInput(1, 'mouseDown');
+    const decision = classify({
+      url: 'https://adunit.net/promo' + i,
+      disposition: 'default',
+      pageState: { ageMs: 100, open: { t: 1_000_100 + i * 1000, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' } },
+    });
+    assert.equal(decision.allowed, false, `attempt ${i}`);
+    assert.equal(decision.reason, 'ad-iframe', `attempt ${i}`);
+  }
 });
 
 test('a stale cross-origin click with a NON-matching href does not block a link click', () => {
@@ -161,6 +207,123 @@ test('a scripted open is still attributed to the window.open record', () => {
   });
   assert.equal(decision.allowed, false);
   assert.equal(decision.reason, 'ad-iframe');
+});
+
+// ---------------------------------------------------------------------------
+// Root-cause regression guards for the real-app "links refuse to click"
+// failures (fmhy.net): (1) ages must be measured against the OPEN-REQUEST
+// time, not against whenever the async state read finishes; (2) a link open
+// must never be attributed to a stale window.open record from another frame.
+// ---------------------------------------------------------------------------
+
+test('a slow isolated-world read does not starve a fresh click of its gesture', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown'); // the user clicks at t=1_000_000
+  // The open request arrives a few ms later (t=1_000_030) — that is atMs.
+  // classifyWindowOpen runs 2 s LATER, after the asynchronous DevTools read
+  // finished on an ad-heavy page. The age must be measured against atMs:
+  at(1_002_030);
+  const decision = classify({
+    url: 'https://site.test/movies/watch-123',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 30, open: null, click: null }, // age computed by main against atMs
+    atMs: 1_000_030,
+  });
+  assert.equal(decision.allowed, true, 'the fresh click is not made "stale" by the read latency');
+  assert.equal(decision.reason, 'link-click');
+  // Sanity: with the same input but atMs genuinely 4 s after the click, the
+  // open IS stale and must be blocked.
+  at(1_004_030);
+  const stale = classify({
+    url: 'https://site.test/movies/watch-999',
+    disposition: 'foreground-tab',
+    pageState: { ageMs: 4000, open: null, click: null },
+    atMs: 1_004_030,
+  });
+  assert.equal(stale.allowed, false);
+  assert.equal(stale.reason, 'no-gesture');
+});
+
+test('fmhy fix: a link click whose href matches is NOT stolen by the ad iframe’s window.open record', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown'); // the user clicks a site link
+  at(1_000_050);
+  // The page state carries the ad iframe's window.open record from 2 s ago
+  // (its popup attempt was blocked, but the record lingers in the isolated
+  // world for 3 s) AND the click record of the anchor the user just
+  // clicked. The href match must win the attribution — under the old
+  // "freshest record" rule the ad's open record stole it and the
+  // legitimate link was blocked as an "ad-iframe" open.
+  const decision = classify({
+    url: 'https://site.test/movies/watch-123',
+    disposition: 'foreground-tab',
+    pageState: {
+      ageMs: 50,
+      open: { t: 999_850, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' },
+      click: { t: 1_000_050, isTop: true, crossOrigin: false, frameHost: 'site.test', topHost: 'site.test', href: 'https://site.test/movies/watch-123' },
+    },
+  });
+  assert.equal(decision.allowed, true, 'the user link is not attributed to the ad open');
+  assert.equal(decision.reason, 'link-click');
+  assert.equal(decision.needsCommit, true, 'commit verification still vets the destination');
+});
+
+test('an open with no click evidence and a cross-origin open record is an ad-iframe open (even as foreground-tab)', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_050);
+  // A window.open() call from a cross-origin iframe — the browser may
+  // report it as a foreground tab (window features), but the open record
+  // is direct evidence of the scripted ad open: blocked, full stop. (With
+  // NO click record at all there is no proof the user clicked anything.)
+  const decision = classify({
+    url: 'https://ad-landing.example.com/',
+    disposition: 'foreground-tab',
+    pageState: {
+      ageMs: 50,
+      open: { t: 1_000_050, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' },
+      click: null,
+    },
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'ad-iframe');
+});
+
+test('a matching cross-origin click record still attributes (and rate-limits) even with a stale open record', () => {
+  const { policy, at, classify } = makePolicy();
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_000_050);
+  // First cross-origin click-open on this page: allowed (verification).
+  const first = classify({
+    url: 'https://widget.example.org/a',
+    disposition: 'foreground-tab',
+    pageState: {
+      ageMs: 50,
+      open: { t: 999_850, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' },
+      click: { t: 1_000_050, isTop: false, crossOrigin: true, frameHost: 'widget.example.org', topHost: 'site.test', href: 'https://widget.example.org/a' },
+    },
+  });
+  assert.equal(first.allowed, true);
+  // Second within the window: the REPEATED cross-origin click is blocked —
+  // even though the stale open record is still sitting in the page state.
+  at(1_003_000);
+  policy.observeInput(1, 'mouseDown');
+  at(1_003_050);
+  const second = classify({
+    url: 'https://widget.example.org/b',
+    disposition: 'foreground-tab',
+    pageState: {
+      ageMs: 50,
+      open: { t: 999_850, isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'site.test' },
+      click: { t: 1_003_050, isTop: false, crossOrigin: true, frameHost: 'widget.example.org', topHost: 'site.test', href: 'https://widget.example.org/b' },
+    },
+  });
+  assert.equal(second.allowed, false);
+  assert.equal(second.reason, 'repeat-cross-origin-click');
 });
 
 test('a page that popped once does not block the user\u2019s next link click', () => {
@@ -428,6 +591,43 @@ test('commit: legitimate same-domain redirects and explicit targets pass', () =>
   assert.equal(verdict({ intendedUrl: 'https://login.other.test/', openerUrl: 'https://site.test/page', finalUrl: 'https://login.other.test/auth/callback' }).block, false);
   // www and subdomain rewrites within the same registrable domain pass.
   assert.equal(verdict({ intendedUrl: 'https://example.com/', openerUrl: 'https://example.com/', finalUrl: 'https://www.example.com/start' }).block, false);
+});
+
+test('commit: a LINK click that redirects across domains is NOT a popunder (site links work)', () => {
+  // Real-world shape of the fmhy.net failure: the user clicks a movie link
+  // on fmhy.net (intended == opener domain); the page 302s to its player on
+  // a sister/CDN domain. The domain-jump rule must not fire for a link
+  // click — the destination is the user's choice following the site's
+  // normal redirects. Listed destinations are still caught above.
+  const v = verdict({
+    intendedUrl: 'https://fmhy.net/movie/watch-123',
+    openerUrl: 'https://fmhy.net/',
+    finalUrl: 'https://player.example-cdn.net/embed/123',
+    viaLinkClick: true,
+  });
+  assert.equal(v.block, false, 'a link click crossing domains is the user navigating, not a popunder');
+  assert.equal(v.reason, 'accepted');
+  // The SAME jump for a SCRIPTED open is the window.open('') popunder
+  // primitive and must still be blocked.
+  const scripted = verdict({
+    intendedUrl: 'https://fmhy.net/movie/watch-123',
+    openerUrl: 'https://fmhy.net/',
+    finalUrl: 'https://player.example-cdn.net/embed/123',
+  });
+  assert.equal(scripted.block, true);
+  assert.equal(scripted.reason, 'popunder');
+});
+
+test('commit: a link click that lands on a LISTED ad domain is still blocked', () => {
+  // viaLinkClick relaxes only the domain-jump rule, never the filter check.
+  const v = verdict({
+    intendedUrl: 'https://fmhy.net/ad-link',
+    openerUrl: 'https://fmhy.net/',
+    finalUrl: 'https://adnet.test/takeover',
+    viaLinkClick: true,
+  });
+  assert.equal(v.block, true);
+  assert.equal(v.reason, 'listed-redirect');
 });
 
 test('commit: an expired watch does not block (slow legitimate sites keep working)', () => {

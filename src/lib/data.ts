@@ -1,5 +1,10 @@
 import type { ActivityItem, FilterList, Page } from '../types';
 
+// Address bar classification lives in shared/ (plain, engine-free) so the
+// exact same rules run in the desktop renderer and in the Node test suite.
+export { classifyAddress, safeUrl, searchUrl } from '../../shared/address';
+export type { Address, AddressKind } from '../../shared/address';
+
 export const pageDetails: Record<Exclude<Page, 'external'>, { title: string; path: string }> = {
   overview: { title: 'Protection overview', path: 'protection' },
   activity: { title: 'Browsing activity', path: 'activity' },
@@ -60,17 +65,7 @@ export function relativeTime(date: string): string {
   return `${Math.floor(minutes / 60)}h ago`;
 }
 
-export function safeUrl(value: string, engine = 'google'): string {
-  const input = value.trim();
-  if (input.startsWith('core://')) return input;
-  try {
-    const url = new URL(input);
-    if (url.protocol === 'http:' || url.protocol === 'https:') return url.href;
-  } catch { /* Treat non-URLs as a search query. */ }
-  if (/^[\w-]+(?:\.[\w-]+)+(?:[/:?#].*)?$/.test(input)) return `https://${input}`;
-  const base = engine === 'duckduckgo' ? 'https://duckduckgo.com/?q=' : engine === 'bing' ? 'https://www.bing.com/search?q=' : 'https://www.google.com/search?q=';
-  return base + encodeURIComponent(input);
-}
+
 
 export function downloadText(name: string, content: string, type = 'text/plain') {
   const url = URL.createObjectURL(new Blob([content], { type }));
