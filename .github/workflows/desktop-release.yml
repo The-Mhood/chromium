@@ -88,6 +88,7 @@ jobs:
           # the log artifact is not reachable from every environment.
           node scripts/package-android-source.mjs 2>&1 | tee android-tv-build.log
           node scripts/package-android.mjs 2>&1 | tee -a android-tv-build.log
+          node scripts/package-android-tv-app.mjs 2>&1 | tee -a android-tv-build.log
       - if: failure()
         uses: actions/github-script@v7
         with:
@@ -108,4 +109,10 @@ jobs:
           path: |
             public/download/ChromiumCore-1.0.0-android-universal.apk
             public/download/ChromiumCore-1.0.0-android-tv-source.zip
+          if-no-files-found: error
+      # The single file users want: the APK + INSTALL.md in one simple ZIP.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChromiumCore-android-tv-app
+          path: public/download/ChromiumCore-1.0.0-android-tv-app.zip
           if-no-files-found: error

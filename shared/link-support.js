@@ -47,7 +47,7 @@
     var COMMIT_DELAY_MS = 300;  // how long a single click waits before it commits
     var SECOND_CLICK_MS = 600;  // a second click on the same anchor within this span is a double-click
 
-    var state = { pending: null, last: null, lastBlank: null, cooldownUntil: 0 };
+    var state = { pending: null, last: null, lastBlank: null, rightTap: null, cooldownUntil: 0 };
 
     function emit(payload) {
       try { console.log(MAGIC + JSON.stringify(payload)); } catch (error) { /* channel unavailable; the page must not break */ }
@@ -167,6 +167,18 @@
         var href = safeHref(anchor);
         if (!href) return;
 
+        // A left click right after a right-side tap on the same anchor is a
+        // double-click (the first tap was a trackpad two-finger tap, which
+        // arrives as contextmenu, not click). Dialog, no navigation — this
+        // check precedes both first-click paths so no tab/navigation starts.
+        if (state.rightTap && state.rightTap.anchor === anchor && Date.now() - state.rightTap.at < SECOND_CLICK_MS) {
+          state.last = { anchor: anchor, href: href, at: Date.now() };
+          state.rightTap = null;
+          state.cooldownUntil = Date.now() + 400;
+          openDialog();
+          return;
+        }
+
         // Links that open a NEW TAB: do not touch the default action. The
         // browser opens the tab immediately (a single click gets its tab
         // NOW — waiting for a possible second click is what made new-tab
@@ -259,6 +271,44 @@
         }
       } catch (error) { /* never break the page */ }
     }, { capture: true, passive: true });
+
+    // Trackpad two-finger taps (and plain right clicks) do NOT arrive as
+    // click/dblclick — they arrive as `contextmenu` (button 2). A user who
+    // "double-clicks" a link on a trackpad therefore produces either
+    // click + contextmenu or contextmenu + contextmenu, and the dialog
+    // above would never see it. Treat a second tap of EITHER kind within
+    // the double window as the double-click: cancel what the first tap
+    // started (a suppressed navigation, or the new-tab the browser opened)
+    // and open the options dialog.
+    document.addEventListener('contextmenu', function (event) {
+      try {
+        if (!event.isTrusted) return; // synthetic contextmenu is never a tap
+        if (Date.now() < state.cooldownUntil) return;
+        var anchor = anchorOf(event);
+        if (!anchor) return;
+        var href = safeHref(anchor);
+        if (!href) return;
+        var now = Date.now();
+        var pendingHit = state.pending && state.pending.anchor === anchor && now - state.pending.at < SECOND_CLICK_MS;
+        var blankHit = state.lastBlank && state.lastBlank.anchor === anchor && now - state.lastBlank.at < SECOND_CLICK_MS;
+        var rightHit = state.rightTap && state.rightTap.anchor === anchor && now - state.rightTap.at < SECOND_CLICK_MS;
+        if (!pendingHit && !blankHit && !rightHit) {
+          // A lone tap on a link: keep the native context menu (copy link
+          // address & co.) but remember it, so a following click within the
+          // double window still counts as the second click.
+          state.rightTap = { anchor: anchor, href: href, at: now };
+          return;
+        }
+        // Second tap of a double: the dialog, and no context menu.
+        state.last = { anchor: anchor, href: href, at: now };
+        cancelPending();
+        state.lastBlank = null;
+        state.rightTap = null;
+        state.cooldownUntil = now + 400;
+        openDialog();
+        event.preventDefault();
+      } catch (error) { /* never break the page */ }
+    }, { capture: true, passive: false });
   } catch (error) {
     /* Link support is best-effort; the page must never be broken by it. */
   }

@@ -458,14 +458,22 @@ function committedNavigationVerdict(p) {
     const threat = matchRequest(finalUrl, intendedUrl, 'main_frame', 'threats') || matchRequest(finalUrl, openerUrl, 'main_frame', 'threats');
     return { block: true, reason: 'listed-redirect', type: threat ? 'Threat' : 'Ad' };
   }
-  // Scripted opens only: window.open('') / location=ad popunder scheme: the
-  // open started on the opener's own domain and the committed frame jumped
-  // to another one. (A user link click is exempt — see viaLinkClick.)
+  // Scripted opens only. A user link click is exempt (see viaLinkClick):
+  // the destination is the user's choice and sites redirect across
+  // domains normally. For window.open() there is no such freedom:
+  //   * the classic popunder: the open starts on the opener's own domain
+  //     (window.open('')) and the committed frame jumped elsewhere;
+  //   * the ad redirector: window.open('https://innocent-redirector.com/…')
+  //     — a domain that is NOT the opener's — and that URL 302s to the ad
+  //     before the first commit.
+  // Both are the same shape: the committed frame is on a registrable domain
+  // that is neither the one the open was asked about nor the opener's own.
   if (!viaLinkClick) {
     const intendedDomain = getRegistrableDomain(intendedUrl);
     const openerDomain = getRegistrableDomain(openerUrl);
     const finalDomain = getRegistrableDomain(finalUrl);
-    if (intendedDomain !== '' && intendedDomain === openerDomain && finalDomain !== '' && finalDomain !== openerDomain) {
+    if (finalDomain !== '' && finalDomain !== intendedDomain && finalDomain !== openerDomain &&
+        (intendedDomain !== '' || openerDomain !== '')) {
       return { block: true, reason: 'popunder', type: 'Pop-up' };
     }
   }
