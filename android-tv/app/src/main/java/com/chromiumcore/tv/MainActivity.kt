@@ -78,7 +78,7 @@ class MainActivity : Activity() {
     private lateinit var store: SettingsStore
     private lateinit var webView: WebView
     private lateinit var overlay: PointerOverlayView
-    private lateinit var newWindowHost: View
+    private lateinit var newWindowHost: ViewGroup
     private lateinit var toolbar: View
     private lateinit var urlField: EditText
     private lateinit var counter: TextView
