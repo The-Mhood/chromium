@@ -34,12 +34,20 @@ export function ExternalPage({ url, title, issue }: { url: string; title: string
     // the page paints. Never present a click-to-open prompt here — the
     // navigation is already in flight, and a slow first byte should read as
     // "loading", not as a request for permission.
-    if (issue && issue.url === url && issue.kind === 'blocked') {
+    // An issue is shown whenever it is set: a fresh navigation clears it
+    // (store.navigate), so a present issue always belongs to the load the
+    // tab is currently on. Comparing issue.url to the tab's URL here used
+    // to hide the card for a BLOCKED REDIRECT (the issue carries the
+    // redirect target, not the typed URL) — the tab then sat on the
+    // loading card with no explanation, looking "refused to load".
+    if (issue && issue.kind === 'blocked') {
       const label = { Ad: 'ad filtering', Tracker: 'tracker blocking', 'Pop-up': 'popup protection', Threat: 'malware protection' }[issue.type ?? 'Ad'];
-      return <div className="external-page"><div className="external-icon-tile danger"><ShieldOff size={30} /></div><h1>Blocked by protection</h1><p className="external-url">{url}</p><p>This page was stopped by {label} before it could load.</p><button className="button button-primary" onClick={() => navigatePage('activity')}>See blocked requests<ArrowRight size={15} /></button><div className="external-note"><ShieldCheck size={15} />Add the domain to your allowlist to load this page.</div></div>;
+      return <div className="external-page"><div className="external-icon-tile danger"><ShieldOff size={30} /></div><h1>Blocked by protection</h1><p className="external-url">{issue.url}</p><p>This page was stopped by {label} before it could load.</p><button className="button button-primary" onClick={() => navigatePage('activity')}>See blocked requests<ArrowRight size={15} /></button><div className="external-note"><ShieldCheck size={15} />Add the domain to your allowlist to load this page.</div></div>;
     }
-    if (issue && issue.url === url && issue.kind === 'failed') {
-      return <div className="external-page"><div className="external-icon-tile"><CloudOff size={30} /></div><h1>Couldn't reach {hostname}</h1><p className="external-url">{url}</p><p>The address could not be loaded.<br />Check the address or your connection.</p><button className="button button-primary" onClick={() => navigate(url)}><RefreshCw size={15} />Try again</button></div>;
+    if (issue && issue.kind === 'failed') {
+      let issueHost = hostname;
+      try { issueHost = new URL(issue.url).hostname.replace(/^www\./, ''); } catch { /* keep the tab's host */ }
+      return <div className="external-page"><div className="external-icon-tile"><CloudOff size={30} /></div><h1>Couldn't reach {issueHost}</h1><p className="external-url">{issue.url}</p><p>The address could not be loaded.<br />Check the address or your connection.</p><button className="button button-primary" onClick={() => navigate(url)}><RefreshCw size={15} />Try again</button></div>;
     }
     return <div className="external-page external-loading" title={url}><span className="external-spinner" aria-hidden="true" /><h1>{title}</h1><p className="external-url">{loadingUrl(url)}</p><p>Loading {hostname}…</p><div className="external-note"><ShieldCheck size={15} />{protection.enabled ? 'Protected browsing — ads, popups and redirects are being filtered.' : 'Protection is paused for this page.'}</div></div>;
   }

@@ -505,6 +505,28 @@ test('main process wiring (Electron stub)', async t => {
   const findInspector = known => winStub().contentView.__views.find(v => !known.has(v));
   const closeTabs = async (...ids) => { for (const id of ids) await calls.ipcHandles.get('core:close')(fakeEvent(), id); };
 
+  await t.test('the loading gate releases on did-finish-load (no hard hang if the commit signal is missing)', async () => {
+    // Field failure (v1.0.17): a page whose commit event never reached the
+    // gate sat on the loading card forever even though the document fully
+    // loaded (title + URL published). Any proof-of-document signal must
+    // release the gate.
+    const { view } = await freshTab('gate-1', 'https://slowdoc.example.com/', { holdCommit: true });
+    assert.equal(view.__visible, false, 'the tab stays on the loading card while the load is in flight');
+    view.webContents.emit('did-finish-load');
+    assert.equal(view.__visible, true, 'did-finish-load released the gate');
+    await closeTabs('gate-1');
+  });
+
+  await t.test('the loading gate fails open when no document signal ever arrives', async () => {
+    const { view } = await freshTab('gate-2', 'https://stalled.example.com/', { holdCommit: true });
+    assert.equal(view.__visible, false, 'the tab is on the loading card');
+    // Nothing commits, finishes or retitles: the fail-open must let the
+    // page through rather than hold the user on the card forever.
+    await new Promise(resolve => setTimeout(resolve, 6600));
+    assert.equal(view.__visible, true, 'the gate failed open after the timeout');
+    await closeTabs('gate-2');
+  });
+
   // The vivarium-style burst: a page that fires one popup per click. The
   // first popup is verified in the hidden inspector (the user did click);
   // the second is a repeat offender and takes the first tab down with it.

@@ -48,8 +48,29 @@ const views = new Map();
 // new tab never flashes a blank white document before the page exists.
 // `issueHidden` tabs stay hidden even after a commit, so the renderer's
 // "blocked" / "couldn't reach" card is the thing on screen.
-const firstCommitted = new Set(); // webContents ids that committed a document
+const firstCommitted = new Set(); // webContents ids with a document
 const issueHidden = new Set();    // tab ids with a blocked/failed card showing
+// Fail-open timers: the gate must never hold a user on the card forever. If
+// a document neither commits nor finishes within this window, the view is
+// released anyway (worst case: a short white frame instead of a hard hang).
+const GATE_FAIL_OPEN_MS = 6000;
+const gateForceTimers = new Map(); // tab id -> timer
+
+/** Release a tab's "loading card" gate. Any of these proves the document
+ *  exists (commit, finished load, or a parsed title): the view may paint.
+ *  The signals are deliberately redundant — a gate that only trusted
+ *  did-commit-navigation held users on the card forever on the odd load
+ *  where that event did not arrive. */
+function releaseGate(contentsId, tabId, signal) {
+  if (firstCommitted.has(contentsId)) return;
+  firstCommitted.add(contentsId);
+  if (tabId && gateForceTimers.has(tabId)) {
+    clearTimeout(gateForceTimers.get(tabId));
+    gateForceTimers.delete(tabId);
+  }
+  console.info(`[layout] tab ${tabId ?? '?'} gate released via ${signal}`);
+  applyLayout();
+}
 const navigationLocks = new Map();
 // The URL each tab's main frame is currently trying to reach, so a
 // did-fail-load for a sub-resource is never reported as a failed page.
@@ -162,6 +183,15 @@ function applyLayout() {
   if (activeView) {
     const contents = activeView.webContents;
     const ready = firstCommitted.has(contents.id) && !issueHidden.has(activeId);
+    if (!ready && !issueHidden.has(activeId) && !gateForceTimers.has(activeId)) {
+      // No blocked/failed card is involved, yet no document signal has
+      // arrived: arm the fail-open (see GATE_FAIL_OPEN_MS).
+      gateForceTimers.set(activeId, setTimeout(() => {
+        gateForceTimers.delete(activeId);
+        console.warn(`[layout] tab ${activeId} gate fail-open: no commit/finish/title observed`);
+        releaseGate(contents.id, activeId, 'timeout');
+      }, GATE_FAIL_OPEN_MS));
+    }
     activeView.setBounds(bounds);
     // Note: no isLoading() gate — a commit is the moment the document
     // exists; gating on "load ended" would keep the card up over a healthy
@@ -287,6 +317,7 @@ function destroyTab(id) {
   lastRequested.delete(contents.id);
   firstCommitted.delete(contents.id);
   issueHidden.delete(id);
+  if (gateForceTimers.has(id)) { clearTimeout(gateForceTimers.get(id)); gateForceTimers.delete(id); }
   popunderWatches.delete(contents.id);
   immediateOpenWatches.delete(contents.id);
   for (const [openUrl, tabId] of popupTabByOpenUrl) if (tabId === id) popupTabByOpenUrl.delete(openUrl);
@@ -953,11 +984,7 @@ function wireBrowsingContents(contents, id, opts = {}) {
   // First-document commit ends the "loading card" phase: the view may
   // finally paint. (New tabs load hidden until this — a blank white doc
   // must never flash ahead of the card's own host + spinner.)
-  contents.on('did-commit-navigation', () => {
-    if (firstCommitted.has(contents.id)) return;
-    firstCommitted.add(contents.id);
-    applyLayout();
-  });
+  contents.on('did-commit-navigation', () => releaseGate(contents.id, id, 'commit'));
   // A new navigation (retry, unblock-reload, user typing) ends the blocked /
   // failed card: let the document through again (hidden until it commits).
   contents.on('did-start-navigation', () => {
@@ -1056,11 +1083,16 @@ function wireBrowsingContents(contents, id, opts = {}) {
     }
   });
 
-  contents.on('page-title-updated', () => onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com')));
+  contents.on('page-title-updated', () => {
+    onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com'));
+    releaseGate(contents.id, id, 'title'); // a parsed title proves the document exists
+  });
   contents.on('did-navigate', () => onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com')));
   contents.on('did-navigate-in-page', () => onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com')));
   contents.on('did-finish-load', () => {
     onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com'));
+    issueHidden.delete(id); // a finished load has no blocked/failed state
+    releaseGate(contents.id, id, 'finish');
     if (onLayout) applyLayout();
     engine.applyCosmetics(contents).catch(console.warn);
   });
