@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { initialFilters, pageDetails, safeUrl } from '../lib/data';
-import type { Bookmark, BrowserTab, FilterList, NativeStats, Page, Protection } from '../types';
+import type { Bookmark, BrowserTab, FilterList, FullscreenState, NativeStats, Page, Protection, TabIssue } from '../types';
 
 interface BrowserState {
   tabs: BrowserTab[];
@@ -14,8 +14,11 @@ interface BrowserState {
   searchEngine: string;
   doNotTrack: boolean;
   nativeStats: NativeStats | null;
+  fullscreenState: FullscreenState;
+  tabIssues: Record<string, TabIssue>;
   activityCleared: boolean;
   toast: { text: string; tone: 'success' | 'info' | 'error'; key: number } | null;
+  setFullscreenState: (state: FullscreenState) => void;
   navigatePage: (page: Exclude<Page, 'external'>) => void;
   newTab: (url?: string, title?: string) => void;
   closeTab: (id: string) => void;
@@ -34,6 +37,8 @@ interface BrowserState {
   removeBookmark: (id: string) => void;
   setPreference: (key: 'theme' | 'searchEngine' | 'doNotTrack', value: string | boolean) => void;
   setNativeStats: (stats: NativeStats) => void;
+  setTabIssue: (id: string, issue: TabIssue | null) => void;
+  removeTab: (id: string) => void;
   clearActivity: () => void;
   notify: (text: string, tone?: 'success' | 'info' | 'error') => void;
   dismissToast: () => void;
@@ -56,8 +61,11 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
   searchEngine: 'google',
   doNotTrack: true,
   nativeStats: null,
+  fullscreenState: { media: false, window: false },
+  tabIssues: {},
   activityCleared: false,
   toast: null,
+  setFullscreenState: (fullscreenState) => set({ fullscreenState }),
   navigatePage: (page) => {
     const detail = pageDetails[page];
     get().navigate(`core://${detail.path}`);
@@ -80,6 +88,19 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
     });
   },
   focusTab: (id) => set({ activeTabId: id }),
+  removeTab: (id) => set(state => {
+    // The main process already closed this tab (e.g. it was a repeat popup).
+    const index = state.tabs.findIndex(item => item.id === id);
+    if (index < 0) return {};
+    const tabs = state.tabs.filter(item => item.id !== id);
+    const tabIssues = { ...state.tabIssues };
+    delete tabIssues[id];
+    if (!tabs.length) {
+      const replacement = tab(crypto.randomUUID(), 'New Tab', 'core://newtab');
+      return { tabs: [replacement], activeTabId: replacement.id, tabIssues };
+    }
+    return { tabs, tabIssues, activeTabId: state.activeTabId === id ? tabs[Math.max(0, index - 1)].id : state.activeTabId };
+  }),
   navigate: (input) => {
     const url = safeUrl(input, get().searchEngine);
     const detail = Object.values(pageDetails).find(item => url === `core://${item.path}`);
@@ -87,7 +108,13 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
     if (!detail && !url.startsWith('core://')) {
       try { title = new URL(url).hostname.replace(/^www\./, ''); } catch { title = 'New Tab'; }
     }
-    set(state => ({ tabs: state.tabs.map(item => item.id === state.activeTabId ? { ...item, url, title, history: [...item.history.slice(0, item.historyIndex + 1), url], historyIndex: item.historyIndex + 1 } : item) }));
+    set(state => {
+      // A fresh navigation supersedes any earlier blocked/failed state for
+      // the tab the user is navigating from.
+      const tabIssues = { ...state.tabIssues };
+      delete tabIssues[state.activeTabId];
+      return { tabIssues, tabs: state.tabs.map(item => item.id === state.activeTabId ? { ...item, url, title, history: [...item.history.slice(0, item.historyIndex + 1), url], historyIndex: item.historyIndex + 1 } : item) };
+    });
   },
   moveHistory: (direction) => {
     set(state => ({ tabs: state.tabs.map(item => {
@@ -114,6 +141,11 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
   removeBookmark: (id) => set(state => ({ bookmarks: state.bookmarks.filter(item => item.id !== id) })),
   setPreference: (key, value) => set({ [key]: value } as Partial<BrowserState>),
   setNativeStats: (nativeStats) => set({ nativeStats }),
+  setTabIssue: (id, issue) => set(state => {
+    const tabIssues = { ...state.tabIssues };
+    if (issue) tabIssues[id] = issue; else delete tabIssues[id];
+    return { tabIssues };
+  }),
   clearActivity: () => set({ activityCleared: true, nativeStats: { ads: 0, trackers: 0, popups: 0, threats: 0, events: [] } }),
   notify: (text, tone = 'success') => set({ toast: { text, tone, key: Date.now() } }),
   dismissToast: () => set({ toast: null }),

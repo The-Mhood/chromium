@@ -14,3 +14,7 @@ local.properties
 
 # Signing material must never be committed
 .android-signing/
+
+# Generated release artifacts (built by scripts/package-android-source.mjs
+# and shipped as GitHub release artifacts — see public/*/manifest.json)
+public/*/ChromiumCore-*-source.zip
