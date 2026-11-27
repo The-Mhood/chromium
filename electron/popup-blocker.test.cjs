@@ -621,6 +621,39 @@ test('commit: legitimate same-domain redirects and explicit targets pass', () =>
   assert.equal(verdict({ intendedUrl: 'https://example.com/', openerUrl: 'https://example.com/', finalUrl: 'https://www.example.com/start' }).block, false);
 });
 
+test('commit: a SCRIPTED open through a cross-domain redirector to a third domain is blocked', () => {
+  // The field shape the old rule missed: an ad script calls
+  // window.open('https://innocent-redirector/…') — a registrable domain that
+  // is NOT the opener's, so the "started on the opener's own domain" check
+  // never fired — and that URL 302s to an ad domain before the first
+  // commit. A scripted open may land on the domain it was asked about or
+  // the opener's own domain; a third domain is a jump.
+  const v = verdict({
+    intendedUrl: 'https://redirector.test/offer?dest=bet',
+    openerUrl: 'https://site.test/page',
+    finalUrl: 'https://bet-ads.example.net/promo?c=xyz&clickid=123',
+  });
+  assert.equal(v.block, true);
+  assert.equal(v.reason, 'popunder');
+  assert.equal(v.type, 'Pop-up');
+  // A legitimate scripted popup (payment/share window) stays on the domain
+  // it was pointed at, even when that domain is not the opener's:
+  assert.equal(verdict({
+    intendedUrl: 'https://checkout.payments.test/checkoutnow',
+    openerUrl: 'https://shop.test/cart',
+    finalUrl: 'https://checkout.payments.test/secure-step',
+  }).block, false, 'a scripted open that commits to its own domain is legitimate');
+  // And the window.open("") variant (intended domain empty) still only
+  // allows the opener's own domain:
+  const blank = verdict({
+    intendedUrl: 'about:blank',
+    openerUrl: 'https://site.test/page',
+    finalUrl: 'https://bet-ads.example.net/promo',
+  });
+  assert.equal(blank.block, true);
+  assert.equal(blank.reason, 'popunder');
+});
+
 test('commit: a LINK click that redirects across domains is NOT a popunder (site links work)', () => {
   // Real-world shape of the fmhy.net failure: the user clicks a movie link
   // on fmhy.net (intended == opener domain); the page 302s to its player on

@@ -79,7 +79,23 @@ function makeWebContents(id) {
     isLoadingMainFrame: () => false,
     isFullscreen: () => false,
     loadFile: () => Promise.resolve(),
-    loadURL: url => { wc.__url = url; return Promise.resolve(); },
+    loadURL: url => {
+      wc.__url = url;
+      // Contents the app wired as a browsing context (wireBrowsingContents
+      // registers did-start-navigation) commit their load like real
+      // Chromium: the main process holds the view hidden until that commit,
+      // so without it every tab would stay on the loading card. The hidden
+      // inspector (wired by startCommitVerification, no did-start-navigation
+      // listener) commits via the test's explicit event after the test
+      // rewrites __url (the redirect scenarios). A load held back by the
+      // test (holdCommit) models an in-flight load: its redirects happen
+      // BEFORE any commit, exactly as on the wire.
+      if (listeners.has('did-start-navigation') && !wc.__noAutoCommit) {
+        wc.emit('did-start-navigation');
+        wc.emit('did-commit-navigation');
+      }
+      return Promise.resolve();
+    },
     executeJavaScript: async () => 96,
     insertCSS: async () => `css-${id}-${Math.random().toString(36).slice(2)}`,
     removeInsertedCSS: async () => {},
@@ -208,8 +224,13 @@ BrowserWindowStub.getAllWindows = () => BrowserWindowStub.windows;
 
 let webContentsId = 100;
 class WebContentsViewStub {
+  // When true, the NEXT constructed view holds back its load's auto-commit
+  // (see freshTab's holdCommit option) so the test can drive the in-flight
+  // redirect chain before any commit happens.
+  static holdCommit = false;
   constructor(_options) {
     this.webContents = makeWebContents(++webContentsId);
+    if (WebContentsViewStub.holdCommit) this.webContents.__noAutoCommit = true;
     this.__bounds = null;
     this.__visible = false;
   }
@@ -467,11 +488,19 @@ test('main process wiring (Electron stub)', async t => {
   const clickOn = wc => wc.emit('before-mouse-event', {}, { type: 'mouseDown' });
   const settle = () => new Promise(resolve => setTimeout(resolve, 300)); // handleWindowOpen is async
   const openPublished = url => calls.sends.some(s => s.channel === 'core:open-tab' && s.payload.url === url);
-  const freshTab = async (tabId, url) => {
-    await calls.ipcHandles.get('core:focus')(fakeEvent(), tabId, true);
-    await calls.ipcHandles.get('core:navigate')(fakeEvent(), tabId, url);
-    const view = winStub().contentView.__views.at(-1); // makeTab just added it
-    return { view, known: new Set([view]) };
+  const freshTab = async (tabId, url, opts = {}) => {
+    // holdCommit: the tab's first load stays in flight (no auto-commit), so
+    // the test can emit the redirect chain exactly as the network would
+    // deliver it — before the first commit.
+    WebContentsViewStub.holdCommit = opts.holdCommit === true;
+    try {
+      await calls.ipcHandles.get('core:focus')(fakeEvent(), tabId, true);
+      await calls.ipcHandles.get('core:navigate')(fakeEvent(), tabId, url);
+      const view = winStub().contentView.__views.at(-1); // makeTab just added it
+      return { view, known: new Set([view]) };
+    } finally {
+      WebContentsViewStub.holdCommit = false;
+    }
   };
   const findInspector = known => winStub().contentView.__views.find(v => !known.has(v));
   const closeTabs = async (...ids) => { for (const id of ids) await calls.ipcHandles.get('core:close')(fakeEvent(), id); };
@@ -581,6 +610,31 @@ test('main process wiring (Electron stub)', async t => {
     assert.ok(!openPublished('https://jump-elsewhere.test/ad?ref=victim'), 'the domain jump was blocked');
     assert.equal(winStub().contentView.__views.length, viewsBefore, 'the inspector was destroyed');
     await closeTabs('h-4');
+  });
+
+  await t.test('hostile: a scripted open through an innocent redirector to an UNLISTED ad dies in the inspector', async () => {
+    // The field failure (a betting-ad tab): an ad script fires window.open()
+    // at a declared destination that looks innocent and is NOT listed; the
+    // server 302s to the ad network, whose domain is NOT listed either. No
+    // blocklist entry can catch this — the scripted open's domain-fidelity
+    // rule must (it may commit to the domain it was asked about or the
+    // opener's own, never a third one).
+    const { view: page, known } = await freshTab('h-16', 'https://victim.example.com/');
+    const viewsBefore = winStub().contentView.__views.length;
+    clickOn(page.webContents); // a real click — the ad script fires inside the handler
+    page.webContents.__openHandler({ url: 'https://offers-redirector.example.com/claim?dest=bet', disposition: 'default' });
+    await settle();
+    const inspector = findInspector(known);
+    assert.ok(inspector, 'scripted opens are verified in the hidden inspector');
+    assert.equal(inspector.__visible, false, 'the inspector is invisible');
+    // The redirect lands on an ad domain that is on no list.
+    inspector.webContents.__url = 'https://bet-ads.example.net/promo?c=xyz&clickid=179';
+    inspector.webContents.emit('did-commit-navigation');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(!openPublished('https://offers-redirector.example.com/claim?dest=bet'), 'no chip for the innocent URL');
+    assert.ok(!openPublished('https://bet-ads.example.net/promo?c=xyz&clickid=179'), 'no chip for the ad destination');
+    assert.equal(winStub().contentView.__views.length, viewsBefore, 'the inspector was destroyed, nothing was created');
+    await closeTabs('h-16');
   });
 
   await t.test('hostile: scrolling while popup scripts run opens nothing', async () => {
@@ -920,8 +974,9 @@ test('main process wiring (Electron stub)', async t => {
     page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
     await settle();
     assert.ok(openPublished(url), 'the click opened the tab (the declared destination itself is not listed)');
-    // The renderer materialises the tab; the redirect check is armed.
-    const tab = await freshTab('rt-tab', url);
+    // The renderer materialises the tab; the redirect check is armed. The
+    // load is held in flight: the 302 happens on the wire before any commit.
+    const tab = await freshTab('rt-tab', url, { holdCommit: true });
     // The destination 302s to a listed ad network — checked as it happens,
     // and the tab is rejected (closed) promptly, not "allowed and closed later".
     tab.view.webContents.emit('will-redirect', {}, 'https://pagead2.googlesyndication.com/landing');
@@ -1111,7 +1166,8 @@ test('main process wiring (Electron stub)', async t => {
     page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
     await settle();
     assert.ok(openPublished(url), 'the click opened the tab at once');
-    const tab = await freshTab('rt-2-tab', url);
+    // Hold the load in flight: both hops are on the wire before any commit.
+    const tab = await freshTab('rt-2-tab', url, { holdCommit: true });
     tab.view.webContents.emit('will-redirect', {}, 'https://trkhop.example.net/mid');
     await new Promise(resolve => setTimeout(resolve, 150));
     assert.ok(winStub().contentView.__views.includes(tab.view), 'the unlisted intermediate hop kept the tab open');

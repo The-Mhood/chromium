@@ -43,6 +43,13 @@ let lastBounds = null;
 let measureTimer = null;
 let mediaMaximized = false; // true when the window was maximised for media fullscreen
 const views = new Map();
+// A tab's view is kept hidden until its FIRST document commits: the
+// renderer's loading card (host + spinner, no raw URLs) shows instead, so a
+// new tab never flashes a blank white document before the page exists.
+// `issueHidden` tabs stay hidden even after a commit, so the renderer's
+// "blocked" / "couldn't reach" card is the thing on screen.
+const firstCommitted = new Set(); // webContents ids that committed a document
+const issueHidden = new Set();    // tab ids with a blocked/failed card showing
 const navigationLocks = new Map();
 // The URL each tab's main frame is currently trying to reach, so a
 // did-fail-load for a sub-resource is never reported as a failed page.
@@ -148,12 +155,18 @@ function applyLayout() {
     win.contentView.addChildView(activeView);
   }
   // Hide every other view first, then show the active one last, so there is
-  // never a frame where two views are visible at once.
+  // never a frame where two views are visible at once. The active view is
+  // held back (renderer card showing) until its first document commits —
+  // or for as long as a blocked/failed card is up (issueHidden).
   for (const [id, view] of views) if (view !== activeView) view.setVisible(false);
-  for (const [id, view] of views) {
-    if (view !== activeView) continue;
-    view.setBounds(bounds);
-    view.setVisible(true);
+  if (activeView) {
+    const contents = activeView.webContents;
+    const ready = firstCommitted.has(contents.id) && !issueHidden.has(activeId);
+    activeView.setBounds(bounds);
+    // Note: no isLoading() gate — a commit is the moment the document
+    // exists; gating on "load ended" would keep the card up over a healthy
+    // page (media/sockets can pin the loading state), the opposite bug.
+    activeView.setVisible(ready);
   }
 }
 
@@ -272,6 +285,8 @@ function destroyTab(id) {
   engine.popupPolicy.forget(contents.id);
   navigationLocks.delete(contents.id);
   lastRequested.delete(contents.id);
+  firstCommitted.delete(contents.id);
+  issueHidden.delete(id);
   popunderWatches.delete(contents.id);
   immediateOpenWatches.delete(contents.id);
   for (const [openUrl, tabId] of popupTabByOpenUrl) if (tabId === id) popupTabByOpenUrl.delete(openUrl);
@@ -713,7 +728,12 @@ function startCommitVerification({ url, sourceUrl, viaLinkClick = false }) {
   if (!win || win.isDestroyed()) return;
   const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
   const contents = view.webContents;
-  const record = { url, sourceUrl, view, openedAt: Date.now(), committed: false, settled: false, timer: null, viaLinkClick: viaLinkClick === true };
+  // A SCRIPTED open that passes verification still gets its tab's first
+  // redirect chain watched (same fallback as the commit-timeout path): the
+  // tab's own first load is re-checked against the same domain-fidelity
+  // rule. Link clicks are exempt — their first navigation is the user's
+  // choice, not a popup continuation.
+  const record = { url, sourceUrl, view, openedAt: Date.now(), committed: false, settled: false, timer: null, viaLinkClick: viaLinkClick === true, armTabWatch: viaLinkClick !== true };
   inspectors.set(contents.id, record);
   view.setVisible(false); // never painted, ever
   view.setBounds({ x: -1, y: -1, width: 0, height: 0 });
@@ -799,7 +819,7 @@ function resolveInspector(contents, outcome) {
     logPopup({ source: safeHost(record.sourceUrl), url: outcome.url, decision: 'allow', reason: outcome.reason || 'verified', created: true, stage: 'commit' });
     // The renderer will create the tab for this URL; when its navigation
     // arrives we learn the tab id (repeat rule + optional popunder watch).
-    verifiedPopupOpens.push({ url: outcome.url, sourceUrl: record.sourceUrl, at: Date.now(), watch: outcome.watch === true, viaLinkClick: record.viaLinkClick });
+    verifiedPopupOpens.push({ url: outcome.url, sourceUrl: record.sourceUrl, at: Date.now(), watch: outcome.watch === true || record.armTabWatch === true, viaLinkClick: record.viaLinkClick });
     if (verifiedPopupOpens.length > 50) verifiedPopupOpens.splice(0, verifiedPopupOpens.length - 50);
     send('core:open-tab', { url: outcome.url, title: safeHost(outcome.url) });
   }
@@ -930,6 +950,23 @@ function wireBrowsingContents(contents, id, opts = {}) {
   });
   contents.on('new-window', (event) => { event.preventDefault(); });
 
+  // First-document commit ends the "loading card" phase: the view may
+  // finally paint. (New tabs load hidden until this — a blank white doc
+  // must never flash ahead of the card's own host + spinner.)
+  contents.on('did-commit-navigation', () => {
+    if (firstCommitted.has(contents.id)) return;
+    firstCommitted.add(contents.id);
+    applyLayout();
+  });
+  // A new navigation (retry, unblock-reload, user typing) ends the blocked /
+  // failed card: let the document through again (hidden until it commits).
+  contents.on('did-start-navigation', () => {
+    issueHidden.delete(id);
+  });
+  contents.on('did-navigate', () => {
+    issueHidden.delete(id);
+  });
+
   contents.on('will-navigate', (event, url) => {
     try { browsingUrl(url); } catch { event.preventDefault(); return; }
     // Navigations we started (address bar, app logic) keep the user's intent;
@@ -943,7 +980,7 @@ function wireBrowsingContents(contents, id, opts = {}) {
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
-        if (onIssue) send('core:navigation-blocked', { id, url, type: hit });
+        if (onIssue) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type: hit }); }
       }
     } catch (error) { console.warn('Navigation check failed:', error.message); }
   });
@@ -957,7 +994,7 @@ function wireBrowsingContents(contents, id, opts = {}) {
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
-        if (onIssue) send('core:navigation-blocked', { id, url, type: hit });
+        if (onIssue) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type: hit }); }
       }
     } catch (error) { console.warn('Redirect check failed:', error.message); }
   });
@@ -969,7 +1006,7 @@ function wireBrowsingContents(contents, id, opts = {}) {
     if (errorCode === -3) return; // ERR_ABORTED: superseded or cancelled, not a failure
     if (validatedURL && lastRequested.get(contents.id) === validatedURL) {
       lastRequested.delete(contents.id);
-      if (onIssue) send('core:load-failed', { id, url: validatedURL });
+      if (onIssue) { issueHidden.add(id); send('core:load-failed', { id, url: validatedURL }); }
     }
   });
 
@@ -1485,6 +1522,7 @@ function registerIPC() {
     if (action === 'back' && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
     if (action === 'forward' && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
     if (action === 'reload') {
+      issueHidden.delete(id); // a retry dismisses the blocked/failed card (the view stays hidden until the retry commits)
       navigationLocks.set(contents.id, { url: contents.getURL(), at: Date.now() });
       contents.reload();
     }
@@ -1710,7 +1748,7 @@ app.whenReady().then(() => {
     onMainframeBlocked: (webContentsId, url, type) => {
       // The page will never load — tell the renderer so the tab shows why
       // instead of sitting on a placeholder that reads like a prompt.
-      for (const [id, view] of views) if (view.webContents.id === webContentsId) { send('core:navigation-blocked', { id, url, type }); break; }
+      for (const [id, view] of views) if (view.webContents.id === webContentsId) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type }); break; }
       // A commit inspector's main frame was cancelled: the open dies here,
       // before any chip exists — surface it as a blocked popup.
       if (inspectors.has(webContentsId)) noticePopupBlocked(url, inspectors.get(webContentsId).sourceUrl, 'listed-destination');

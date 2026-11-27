@@ -63,6 +63,18 @@ This is a cat-and-mouse area. YouTube changes its pages often and actively tries
 
 The TV app lives in `android-tv/`. It is a separate native Kotlin application on the system WebView, because Electron does not run on Android. It targets Android 6 and later: Android TV, Google TV, Fire TV, and set-top boxes. Touch is optional.
 
+**Get the app (simple ZIP).** The release workflow builds one simple file for this: `ChromiumCore-1.0.0-android-tv-app.zip` — the APK plus an `INSTALL.md` with the install steps, in a single archive. It is uploaded as the **`ChromiumCore-android-tv-app`** artifact on the tagged release run (Actions → the release run → Artifacts → download that one file). Unzip it on any computer, get `ChromiumCore-1.0.0-android-universal.apk` onto the TV (USB stick or `adb install -r`), enable *unknown sources* in the TV settings, and open it from the LEANBACK launcher. The exact steps are in `INSTALL.md` inside the ZIP.
+
+To (re)build that ZIP from a computer terminal:
+
+```sh
+git clone https://github.com/The-Mhood/chromium.git && cd chromium
+node scripts/package-android.mjs       # build the signed APK (JDK 17 + Android SDK 34 below)
+node scripts/package-android-tv-app.mjs # -> public/download/ChromiumCore-1.0.0-android-tv-app.zip
+```
+
+No Android SDK on the machine? Build is optional — download the APK from any release run's **`ChromiumCore-android-tv`** artifact and run `node scripts/package-android-tv-app.mjs --apk /path/to/ChromiumCore-1.0.0-android-universal.apk`. Committing the ZIP into `public/download/` also makes the web Downloads page offer it (the manifest entry is maintained by the script).
+
 Requirements: JDK 17 and the Android SDK (platform 34, build-tools 34.0.0). Set `ANDROID_HOME` if the SDK is not in a standard location. On a Mac the one-time setup is:
 
 ```sh
@@ -77,6 +89,7 @@ Then build from the terminal (no Android Studio needed):
 
 ```sh
 node scripts/package-android.mjs        # tests + signed release APK
+node scripts/package-android-tv-app.mjs # simple app ZIP: APK + INSTALL.md
 node scripts/package-android-source.mjs # self-contained compilation ZIP
 node scripts/package-source.mjs
 npm run build
