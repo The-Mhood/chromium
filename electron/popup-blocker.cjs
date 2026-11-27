@@ -1,23 +1,33 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// ChromiumCore popup / popunder policy (v4 — default-deny, link-aware).
+// ChromiumCore popup / popunder policy (v6 — browser-level input evidence).
 //
 // Pure module: no Electron imports, so the entire classification and state
 // machine is unit tested in plain Node (popup-blocker.test.cjs). The main
 // process feeds it:
 //   - a `matchRequest(url, sourceUrl, type, group?)` predicate built from the
 //     ad / threat engines,
-//   - the page's user-activation and per-frame window.open / click records
-//     read from *isolated* JavaScript worlds (shared/popup-support.js,
-//     injected with a CDP worldName so pages cannot observe or tamper with
-//     them),
-//   - the disposition Chromium reports for each window.open request,
+//   - its OWN observation of real input events: keyboard via
+//     before-input-event, mouse via before-mouse-event. These fire in the
+//     browser's input pipeline BEFORE the page sees the event — real,
+//     unspoofable, and independent of DevTools. A synthetic element.click()
+//     is generated inside the renderer and never passes through this
+//     pipeline, so it observes to nothing here;
+//   - page-activation and per-frame window.open / click records read from
+//     *isolated* JavaScript worlds (shared/popup-support.js, injected with
+//     a CDP worldName so pages cannot observe, reset or fake the records —
+//     and its listeners only accept isTrusted events, so a page cannot
+//     even dispatch synthetic input to refresh them);
+//   - the disposition Chromium reports for each window.open request;
 //   - the time the open was REQUESTED (`atMs`). Every age is measured
 //     against this — never against the time the (asynchronous, up to a few
-//     seconds on ad-heavy pages) isolated-world state read finishes. That
-//     was the "links refuse to click" defect on pages like fmhy.net: the
-//     read alone pushed a fresh click past the gesture window.
+//     seconds on ad-heavy pages) isolated-world state read finishes.
+//     Measuring against "now" was one half of the "links refuse to click"
+//     defect on pages like fmhy.net; the other half was that the main
+//     process only observed KEYBOARD (before-input-event is keyboard-only
+//     in Electron), so a real mouse click left no browser-level trace and
+//     its evidence hinged entirely on the flaky CDP read. Both are fixed.
 //
 // Product requirement: an advertising tab or window must never become
 // visible. So the policy never "allows and closes later" — an allowed open
@@ -28,7 +38,20 @@
 // Trust model: pages can lie about anything inside their own world, so the
 // decision never relies on page-visible state alone:
 //   * activation age = min(isolated-world age, main-process input age),
-//     both measured against the open-request time;
+//     both measured against the open-request time. The main-process age
+//     comes from the browser's input pipeline (real keyboard and mouse
+//     events) and works even when the CDP read fails; the isolated-world
+//     age covers frames/devices the main process might not see and
+//     counts isTrusted input only.
+//   * The same split is the link/ad discriminator. A GENUINE link click
+//     necessarily passes through the browser's input pipeline (it is the
+//     click that opens the tab), so it always has fresh main-process
+//     evidence — even on ad-heavy pages where the CDP read fails. A
+//     scripted element.click() on a target=_blank anchor ALSO arrives as
+//     a "foreground-tab" request (Chromium sets the disposition from the
+//     target attribute, not from isTrusted), but it never passes through
+//     the input pipeline and writes no isTrusted record — so it has NO
+//     evidence and is blocked like any other unactivated open.
 //   * the per-gesture quota is counted by the main process (one script-driven
 //     window.open per user activation) and cannot be reset from the page;
 //   * when there is NO activation evidence at all, the open is BLOCKED.
@@ -71,8 +94,11 @@
 //      earlier popup's URL so the main process can close that tab.
 //   6. Everything else requires a FRESH user gesture (real key/click input
 //      within GESTURE_WINDOW_MS of the OPEN-REQUEST time — scrolling never
-//      counts) and, for script-driven opens, stays within the per-gesture
-//      quota.
+//      counts) and, for script-driven opens, stays within the per-activation
+//      quota. This includes link clicks: a genuine link click always has
+//      fresh browser-level mouse evidence (see trust model), while a
+//      scripted element.click() on a target=_blank anchor — which the
+//      browser reports the same way — has none, and is blocked.
 //   7. Every other allowed open returns needsCommit: the main process
 //      verifies the first committed main frame (after redirects) before the
 //      tab chip is ever shown.
@@ -216,6 +242,13 @@ function createPopupPolicy(options = {}) {
    * @param {string} p.url          destination (already validated http/https)
    * @param {string} p.sourceUrl    the page that opened it
    * @param {string} p.disposition  "default" | "foreground-tab" | "background-tab"
+   *                                   ("new-window" | "other" behave like
+   *                                   "default"). "foreground-tab" is how
+   *                                   Chromium reports a user link click —
+   *                                   and a scripted element.click() on a
+   *                                   target=_blank anchor — so the
+   *                                   evidence rules (module header) are
+   *                                   what tell the two apart.
    * @param {number} p.tabCount     external tabs currently open
    * @param {object|null} p.pageState { ageMs, open, click } from the isolated
    *                                   worlds, or null when CDP is unavailable.
@@ -297,9 +330,11 @@ function createPopupPolicy(options = {}) {
     if (!isLinkClick) entry.opens += 1; // every script-driven attempt consumes quota until a fresh gesture
     pageInput.set(contentsId, entry);
 
-    // Activation evidence: the freshest of the isolated-world clock (any
-    // frame) and the unspoofable main-process input observation — both
-    // measured against the moment the open was requested.
+    // Activation evidence: the freshest of the isolated-world clock (real,
+    // isTrusted input only) and the main-process input observation (real
+    // key/mouse events from the browser's input pipeline — unspoofable,
+    // and present even when the CDP read fails), both measured against the
+    // moment the open was requested.
     let age = NO_ACTIVATION_MS;
     if (pageState && typeof pageState.ageMs === 'number') age = Math.min(age, pageState.ageMs);
     if (entry.lastInputAt) age = Math.min(age, atMs - entry.lastInputAt);
@@ -308,7 +343,11 @@ function createPopupPolicy(options = {}) {
       // No input seen by the main process, no activation seen in the page:
       // there is no proof this is user-driven. Default to deny — a page the
       // user never interacted with does not get browsing contexts, whether
-      // or not the destination looks familiar.
+      // or not the destination looks familiar. This is also what stops a
+      // scripted element.click() on a target=_blank anchor: the browser
+      // reports it as a "foreground-tab" open, but no REAL input passed
+      // through the browser's input pipeline and no isTrusted record was
+      // written — it has no evidence behind it.
       return { allowed: false, reason: 'no-gesture', needsCommit: false };
     }
 

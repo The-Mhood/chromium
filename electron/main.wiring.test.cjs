@@ -48,7 +48,7 @@ const calls = {
 //   stateValue     the Runtime.evaluate result in the cc-popup world
 //   delayMs        artificial latency on evaluate (the ad-heavy-page case)
 //   worldContexts  context ids reported for each isolated world
-const cdpStub = { pageStateEnabled: false, stateValue: null, attachEnabled: false, delayMs: 0 };
+const cdpStub = { pageStateEnabled: false, stateValue: null, attachEnabled: false, delayMs: 0, injectedScripts: [] };
 cdpStub.worldContexts = new Map(); // worldName -> nextContextId
 let cdpMessageListener = null; // the main process' CDP 'message' listener
 const emitCdp = (method, params) => { if (cdpMessageListener) cdpMessageListener(method, params); };
@@ -97,7 +97,7 @@ function makeWebContents(id) {
         if (!cdpStub.attachEnabled && !cdpStub.pageStateEnabled) return Promise.reject(new Error('no CDP'));
         const later = promise => (cdpStub.delayMs > 0 ? new Promise(resolve => setTimeout(() => resolve(promise), cdpStub.delayMs)) : Promise.resolve(promise));
         if (method === 'Page.enable' || method === 'Runtime.enable') return Promise.resolve({});
-        if (method === 'Page.addScriptToEvaluateOnNewDocument') return Promise.resolve({ identifier: `script-${Math.random().toString(36).slice(2)}` });
+        if (method === 'Page.addScriptToEvaluateOnNewDocument') { cdpStub.injectedScripts.push(params); return Promise.resolve({ identifier: `script-${Math.random().toString(36).slice(2)}` }); }
         if (method === 'Page.removeScriptToEvaluateOnNewDocument') return Promise.resolve({});
         if (method === 'Page.getFrameTree') return Promise.resolve({ frameTree: { frame: { id: 'frame-0' }, childFrames: [] } });
         if (method === 'Runtime.getIsolatedContext') {
@@ -389,9 +389,10 @@ test('main process wiring (Electron stub)', async t => {
     assert.deepEqual(view.__bounds, { x: 0, y: 0, width: 1440, height: 1000 },
       'the page view expanded to the full window while the chrome is hidden');
 
-    // A mouse event reveals the chrome and restores the layout.
+    // A mouse event reveals the chrome and restores the layout (real
+    // Electron delivers mouse input on before-mouse-event).
     const visibleBefore = calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === true).length;
-    winStub().webContents.emit('before-input-event', {}, { type: 'mouseDown' });
+    winStub().webContents.emit('before-mouse-event', {}, { type: 'mouseDown' });
     await new Promise(resolve => setTimeout(resolve, 400));
     const visibleAfter = calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === true).length;
     assert.ok(visibleAfter > visibleBefore, 'activity revealed the chrome');
@@ -433,7 +434,12 @@ test('main process wiring (Electron stub)', async t => {
   // Shared helpers for the hostile-page scenarios below. The layout keeps
   // the ACTIVE tab view as the last child (z-order), so views are identified
   // by exclusion — the inspector is the one view the test did not create.
-  const clickOn = wc => wc.emit('before-input-event', {}, { type: 'mouseDown' });
+  // A REAL mouse click, delivered the way Electron delivers it: the
+  // browser's input pipeline fires before-mouse-event for mouse input.
+  // (before-input-event is keyboard-only in Electron — its input.type is
+  // keyDown/keyUp, verified against the engine source; a mouseDown emitted
+  // there would be ignored by the main process, exactly as in reality.)
+  const clickOn = wc => wc.emit('before-mouse-event', {}, { type: 'mouseDown' });
   const settle = () => new Promise(resolve => setTimeout(resolve, 300)); // handleWindowOpen is async
   const openPublished = url => calls.sends.some(s => s.channel === 'core:open-tab' && s.payload.url === url);
   const freshTab = async (tabId, url) => {
@@ -555,7 +561,7 @@ test('main process wiring (Electron stub)', async t => {
   await t.test('hostile: scrolling while popup scripts run opens nothing', async () => {
     const { view: page, known } = await freshTab('h-5', 'https://victim.example.com/');
     const viewsBefore = winStub().contentView.__views.length;
-    page.webContents.emit('before-input-event', {}, { type: 'mouseWheel' }); // scroll, not a click
+    page.webContents.emit('before-mouse-event', {}, { type: 'mouseWheel' }); // scroll, not a click (never grants activation)
     page.webContents.__openHandler({ url: 'https://scroll-popup.example.com/', disposition: 'default' });
     await settle();
     assert.ok(!openPublished('https://scroll-popup.example.com/'), 'scroll-firing popups are blocked');
@@ -651,6 +657,65 @@ test('main process wiring (Electron stub)', async t => {
     } finally {
       cdpStub.pageStateEnabled = false;
       cdpStub.stateValue = null;
+    }
+  });
+
+  await t.test('hostile: a synthetic element.click() on a target=_blank anchor opens nothing (click-to-ad defence)', async () => {
+    // CDP on, so the page records ARE readable — and empty: the page
+    // fired element.click(), which is isTrusted=false, so the isolated
+    // world's clock and click recorder (isTrusted-only) wrote nothing.
+    // And no real mouse event passed through the browser's input pipeline
+    // (no before-mouse-event), so the main process saw nothing either.
+    // Chromium still reports the open as "foreground-tab" (the disposition
+    // comes from the target attribute, not isTrusted) — the evidence rules
+    // are what catch it.
+    cdpStub.pageStateEnabled = true;
+    try {
+      const { view: page, known } = await freshTab('h-15', 'https://victim.example.com/');
+      const viewsBefore = winStub().contentView.__views.length;
+      cdpStub.stateValue = null; // no isTrusted input was ever recorded
+      // NO clickOn — a synthetic click leaves no before-mouse-event.
+      page.webContents.__openHandler({ url: 'https://sponsored-landing.example.org/clickpay', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!openPublished('https://sponsored-landing.example.org/clickpay'), 'the click-to-ad open was blocked');
+      assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+      // The SAME destination with a real click works (the user's link is
+      // not what we are stopping).
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://sponsored-landing.example.org/clickpay', disposition: 'foreground-tab' });
+      await settle();
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'the identical open with a real click is verified');
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(openPublished('https://sponsored-landing.example.org/clickpay'), 'the real-click open was published');
+      await closeTabs('h-15');
+    } finally {
+      cdpStub.pageStateEnabled = false;
+      cdpStub.stateValue = null;
+    }
+  });
+
+  await t.test('the injected link script is wired correctly (non-passive click listener, isTrusted-only records)', async () => {
+    // Source-level regression guards for the two "green tests, dead
+    // reality" defects: a passive click listener's preventDefault() is a
+    // no-op (the double-click dialog could never win), and unguarded
+    // page-world records let a page refresh its own "user was here"
+    // clock with synthetic events.
+    cdpStub.pageStateEnabled = true;
+    try {
+      await freshTab('src-1', 'https://victim.example.com/');
+      const started = Date.now();
+      while (cdpStub.injectedScripts.length < 2 && Date.now() - started < 2000) await new Promise(resolve => setTimeout(resolve, 25));
+      const linkScript = cdpStub.injectedScripts.find(s => s.worldName === 'cc-links');
+      const popupScript = cdpStub.injectedScripts.find(s => s.worldName === 'cc-popup');
+      assert.ok(linkScript && linkScript.source, 'the link-support script was injected into its isolated world');
+      assert.ok(popupScript && popupScript.source, 'the popup-support script was injected into its isolated world');
+      assert.ok(linkScript.source.includes('passive: false'), 'the click listener is non-passive so preventDefault() actually suppresses the navigation');
+      assert.ok(popupScript.source.includes('event.isTrusted'), 'the popup-support records only accept isTrusted (real) input');
+      await closeTabs('src-1');
+    } finally {
+      cdpStub.pageStateEnabled = false;
     }
   });
 
@@ -761,7 +826,7 @@ test('main process wiring (Electron stub)', async t => {
     assert.deepEqual(calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1).payload, { media: true, window: false });
 
     const v0 = visibleSends();
-    view.webContents.emit('before-input-event', {}, { type: 'mouseDown' });
+    view.webContents.emit('before-mouse-event', {}, { type: 'mouseDown' });
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.ok(visibleSends() > v0, 'mouse movement revealed the header over the player');
 
@@ -784,6 +849,9 @@ test('main process wiring (Electron stub)', async t => {
 
   await t.test('site links (the fmhy.net failure): a fresh click opens even when the destination redirects across domains', async () => {
     // No CDP at all — the exact degraded path the packaged app was on.
+    // The click is still admitted because the main process observes it in
+    // the browser's input pipeline (before-mouse-event), independent of
+    // the DevTools read that fails on ad-heavy pages.
     cdpStub.pageStateEnabled = false;
     cdpStub.attachEnabled = false;
     try {
@@ -850,6 +918,7 @@ test('main process wiring (Electron stub)', async t => {
       assert.equal(dialogsNow.length, 1, 'exactly one link-options window was created');
       const dlg = dialogsNow[0];
       assert.equal(dlg.webContents.__url, 'file://' + path.join(__dirname, '../renderer/index.html') + '?linkDialog=1', 'the dialog loads the renderer in dialog mode');
+      assert.equal(dlg.__shown, true, 'the dialog window is actually SHOWN (ready-to-show -> show()); a hidden dialog is the "double-click does nothing" defect');
       const dataSend = calls.sends.find(s => s.channel === 'core:dialog-data' && s.payload && s.payload.url === link.url);
       assert.ok(dataSend, 'the dialog received the link data');
       assert.equal(dataSend.payload.sourceTabId, 'l-1', 'the source tab is known for "Open link"');
