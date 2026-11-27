@@ -285,16 +285,25 @@ class FullscreenController {
 
   /** The OS told us the window entered/left native fullscreen. Reconcile:
    *  - OS entered on its own (user shortcut) -> adopt it;
-   *  - OS dropped the user fullscreen (Esc / shortcut) -> treat as exited.
-   *  Media never drives the OS window, so there is nothing to re-assert. */
+   *  - OS dropped it while we still want it -> STRAY drop, keep the intent.
+   *
+   *  An intentional exit (F11 / Escape / maximize dot / the media session
+   *  ending) always goes through userToggle() or setUserFullscreen(false)
+   *  FIRST — those clear userFullscreen and emit the window effect before
+   *  the OS transition completes, so by the time this event lands
+   *  userFullscreen is already false and nothing happens. A drop that still
+   *  finds userFullscreen true was never requested (taskbar click, Win+Down
+   *  race, OS glitch) — the field contract is that the window stays in
+   *  fullscreen until the session intentionally ends, so the intent is kept
+   *  and the main process re-asserts the OS state (see the leave-full-screen
+   *  handler and the re-assertion timer). */
   windowFullscreenChanged(actual) {
     if (actual && !this.userFullscreen) {
       this.userFullscreen = true;
       return;
     }
     if (!actual && this.userFullscreen) {
-      this.userFullscreen = false;
-      this._emit({ type: 'window-fullscreen', value: false });
+      return; // stray drop: keep the intent, the window is re-asserted
     }
   }
 

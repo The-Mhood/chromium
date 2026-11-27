@@ -17,6 +17,13 @@ interface BrowserState {
   fullscreenState: FullscreenState;
   tabIssues: Record<string, TabIssue>;
   activityCleared: boolean;
+  // Per-tab navigation sequence: tabId -> count of user navigations issued
+  // for that tab. It advances ONLY when that specific tab is navigated, so
+  // focusing an already-loaded tab (a plain switch) leaves the number alone
+  // while a retry of the same url bumps it — which is exactly the signal the
+  // main process needs to reload an unchanged url (the "Try again" case)
+  // without reloading a tab the user merely switched to.
+  navSeq: Record<string, number>;
   toast: { text: string; tone: 'success' | 'info' | 'error'; key: number } | null;
   setFullscreenState: (state: FullscreenState) => void;
   navigatePage: (page: Exclude<Page, 'external'>) => void;
@@ -64,6 +71,7 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
   fullscreenState: { media: false, window: false },
   tabIssues: {},
   activityCleared: false,
+  navSeq: {},
   toast: null,
   setFullscreenState: (fullscreenState) => set({ fullscreenState }),
   navigatePage: (page) => {
@@ -113,7 +121,16 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
       // the tab the user is navigating from.
       const tabIssues = { ...state.tabIssues };
       delete tabIssues[state.activeTabId];
-      return { tabIssues, tabs: state.tabs.map(item => item.id === state.activeTabId ? { ...item, url, title, history: [...item.history.slice(0, item.historyIndex + 1), url], historyIndex: item.historyIndex + 1 } : item) };
+      return {
+        // The retry token (per tab, see the state field): the App's
+        // navigation effect keys on the active tab's sequence, so navigating
+        // to the SAME url the tab already shows (the "Try again" button after
+        // a failed load, re-typing the address) bumps it and the effect
+        // re-fires — while switching away and back never bumps it.
+        navSeq: { ...state.navSeq, [state.activeTabId]: (state.navSeq[state.activeTabId] || 0) + 1 },
+        tabIssues,
+        tabs: state.tabs.map(item => item.id === state.activeTabId ? { ...item, url, title, history: [...item.history.slice(0, item.historyIndex + 1), url], historyIndex: item.historyIndex + 1 } : item)
+      };
     });
   },
   moveHistory: (direction) => {

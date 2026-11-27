@@ -18,11 +18,17 @@ execFileSync(process.execPath, [path.join(stage, 'node_modules/@electron-forge/c
 if (process.env.CORE_INSTALLER !== '1') {
   const collect = async dir => { const entries = await fs.readdir(dir, { withFileTypes: true }); return (await Promise.all(entries.map(entry => entry.isDirectory() ? collect(path.join(dir, entry.name)) : [path.join(dir, entry.name)]))).flat(); };
   const candidates = await collect(path.join(stage, 'out/make'));
-  const artifact = candidates.find(file => file.endsWith('.zip') && file.includes(platform) && file.includes(arch));
-  if (!artifact) throw new Error('Forge did not produce the expected archive.');
+  // Windows ships the NSIS installer (.exe); macOS/Linux ship the ZIP. The
+  // match is by extension + arch: the run builds exactly one target, so
+  // out/make holds only that target's output (the NSIS path carries the arch
+  // but not the literal "win32", so the platform string is not a reliable
+  // discriminator here).
+  const ext = platform === 'win32' ? '.exe' : '.zip';
+  const artifact = candidates.find(file => file.endsWith(ext) && file.includes(arch));
+  if (!artifact) throw new Error(`Forge did not produce the expected ${ext} archive.`);
   const dir = path.join(root, 'public/download'); await fs.mkdir(dir, { recursive: true });
   const legacyDir = path.join(root, 'public/downloads'); await fs.mkdir(legacyDir, { recursive: true });
-  const file = `ChromiumCore-1.0.0-${platform}-${arch}.zip`;
+  const file = `ChromiumCore-1.0.0-${platform}-${arch}${ext}`;
   await fs.copyFile(artifact, path.join(dir, file));
   await fs.copyFile(path.join(dir, file), path.join(legacyDir, file));
   const bytes = await fs.readFile(path.join(dir, file));

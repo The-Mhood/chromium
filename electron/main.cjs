@@ -83,6 +83,13 @@ const navigationLocks = new Map();
 // The URL each tab's main frame is currently trying to reach, so a
 // did-fail-load for a sub-resource is never reported as a failed page.
 const lastRequested = new Map();
+// The last navigation sequence the renderer asked each tab to honour
+// (core:navigate, 3rd arg). The renderer bumps its navSeq on every user
+// navigation — including a retry of the SAME url after a failed load — while
+// a plain tab switch re-focuses without bumping it. Comparing sequences lets
+// core:navigate reload an unchanged url (the retry) without reloading a tab
+// the user merely switched to.
+const lastNavSeq = new Map();
 // Verified popup opens awaiting the renderer's tab: when core:navigate
 // arrives for that URL, the tab->popup link is recorded (repeat rule) and,
 // for opens that timed out during verification, the first-navigation
@@ -287,11 +294,17 @@ fsCtl.onEffect(effect => {
   if (!win || win.isDestroyed()) return;
   if (effect.type === 'window-fullscreen' && win.isFullScreen() !== effect.value) {
     // Browser (user) fullscreen only — media never comes through here.
+    // An intentional exit holds the re-assertion so the mid-session guard
+    // does not fight the user out of their own fullscreen.
+    if (!effect.value) holdFullscreenReassert();
     win.setFullScreen(effect.value);
     settleLayout();
     verifyWindowFullscreen(effect.value);
   }
   if (effect.type === 'window-maximize') {
+    // The media leaving (or being abandoned) un-maximises on purpose —
+    // hold the re-assertion through the transition.
+    if (!effect.on) holdFullscreenReassert();
     // Window-level media fullscreen: cover the screen with the window
     // itself. No OS transition, so the document's fullscreen element is
     // never torn down by a competing transition (the old failure mode).
@@ -312,57 +325,55 @@ fsCtl.onEffect(effect => {
 });
 
 // ---------------------------------------------------------------------------
-// Media pause → end the fullscreen session.
-// The contract for a media session: media fullscreen + browser fullscreen
-// persist THROUGHOUT playback, and end together when the user pauses the
-// media or goes back. Pause is page-level state the browser process cannot
-// see as an event, so while the controller is presenting media fullscreen
-// we poll the media element under the document's fullscreen element; on a
-// real pause (or ended) we end the document fullscreen — whose leave
-// handler releases the browser fullscreen as part of the same session.
+// Keeping the window in fullscreen while a media session is active.
+// Field contract (the "mouse activity removes the fullscreen" report): the
+// browser stays in fullscreen as long as the media is in fullscreen; mouse
+// activity never removes it; and ONLY the media leaving fullscreen (Esc,
+// the player's exit control, navigating away, tab close — all of them
+// fire leave-html-full-screen) ends the session. Pausing the media is NOT
+// an exit: the document's fullscreen element persists while paused, and so
+// does the session.
+//
+// Re-assertion: even with that rule, the window can drop out of its state
+// mid-session (a stray restore — taskbar click while the chrome is
+// revealed, Win+Down, a resize race). Once a second we check and put it
+// back. Intentional releases hold the re-assertion briefly so the exit
+// is not fought (see holdFullscreenReassert, called from the effect sink).
 // ---------------------------------------------------------------------------
-const MEDIA_PAUSE_CHECK_MS = 500;
-const MEDIA_PAUSE_STATE_EXPR = '(() => { const el = document.fullscreenElement; if (!el) return null; const v = (el.querySelector && el.querySelector("video,audio")) || null; return { paused: v ? v.paused : null, ended: v ? v.ended : null }; })()';
-let mediaPauseTimer = null;
-// Two consecutive polls must agree the media is paused before the session
-// is released. A single "paused" reading is not proof: YouTube remounts
-// its <video> on quality changes, players show a brief paused state on
-// seek, and one stray reading used to drop the user out of fullscreen for
-// no reason ("works sometimes, doesn't work sometimes").
-let mediaPauseStrikes = 0;
-function armMediaPausePoll() {
-  if (mediaPauseTimer) return;
-  mediaPauseStrikes = 0;
-  mediaPauseTimer = setInterval(() => {
-    if (!win || win.isDestroyed() || !fsCtl.mediaActive) { disarmMediaPausePoll(); return; }
-    const view = views.get(activeId);
-    const contents = view ? view.webContents : null;
-    if (!contents || contents.isDestroyed()) return;
-    contents.executeJavaScript(MEDIA_PAUSE_STATE_EXPR, true)
-      .then(state => {
-        if (!state || !fsCtl.mediaActive) { mediaPauseStrikes = 0; return; }
-        // "ended" is final — no confirmation needed. A pause must hold for
-        // the next poll too (player remounts / seeks are transient).
-        if (state.ended !== true) {
-          if (state.paused !== true) { mediaPauseStrikes = 0; return; }
-          mediaPauseStrikes += 1;
-          if (mediaPauseStrikes < 2) return;
-        }
-        mediaPauseStrikes = 0;
-        console.log('[fullscreen] media paused/ended in fullscreen; releasing the fullscreen session');
-        // End the document fullscreen first (its leave handler releases the
-        // browser fullscreen); release directly as well in case the leave
-        // event is late or lost.
-        contents.executeJavaScript('document.exitFullscreen && document.exitFullscreen().catch(() => {})', true)
-          .catch(() => { /* document mid-navigation */ });
-        if (fsCtl.userFullscreen) fsCtl.setUserFullscreen(false);
-      })
-      .catch(() => { /* navigating or destroyed — the poll retries or disarms */ });
-  }, MEDIA_PAUSE_CHECK_MS);
+const FULLSCREEN_REASSERT_MS = 1000;
+let fullscreenReassertTimer = null;
+let fsReassertHoldUntil = 0; // release paths hold re-assertion past their transition
+
+function holdFullscreenReassert(ms = 2500) {
+  fsReassertHoldUntil = Date.now() + ms;
 }
-function disarmMediaPausePoll() {
-  if (mediaPauseTimer) { clearInterval(mediaPauseTimer); mediaPauseTimer = null; }
-  mediaPauseStrikes = 0;
+
+function armFullscreenReassert() {
+  if (fullscreenReassertTimer) return;
+  fullscreenReassertTimer = setInterval(() => {
+    if (!win || win.isDestroyed()) { disarmFullscreenReassert(); return; }
+    const wantsUser = fsCtl.userFullscreen;
+    const wantsMediaMax = mediaMaximized && fsCtl.mediaActive;
+    if (!wantsUser && !wantsMediaMax) { disarmFullscreenReassert(); return; }
+    if (Date.now() < fsReassertHoldUntil) return;
+    try {
+      if (wantsUser && !win.isFullScreen()) {
+        console.warn('[fullscreen] window left OS fullscreen mid-session; re-asserting');
+        win.setFullScreen(true);
+        settleLayout();
+        verifyWindowFullscreen(true);
+        return;
+      }
+      if (wantsMediaMax && !win.isFullScreen() && !win.isMaximized()) {
+        console.warn('[fullscreen] window left media-maximize mid-session; re-asserting');
+        win.maximize();
+      }
+    } catch { /* window mid-transition — retry next tick */ }
+  }, FULLSCREEN_REASSERT_MS);
+}
+
+function disarmFullscreenReassert() {
+  if (fullscreenReassertTimer) { clearInterval(fullscreenReassertTimer); fullscreenReassertTimer = null; }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,10 +395,19 @@ function destroyTab(id) {
   engine.popupPolicy.forget(contents.id);
   navigationLocks.delete(contents.id);
   lastRequested.delete(contents.id);
+  lastNavSeq.delete(id);
   firstCommitted.delete(contents.id);
   liveTabs.delete(id);
   issueHidden.delete(id);
   if (gateForceTimers.has(id)) { clearTimeout(gateForceTimers.get(id)); gateForceTimers.delete(id); }
+  // A closed tab must not keep a page-script heal timer armed: the retry
+  // would re-attach a destroyed renderer (and, in the wiring smoke, clobber
+  // the shared CDP listener a later test is counting on).
+  const syncEntry = syncQueue.get(contents.id);
+  if (syncEntry) {
+    if (syncEntry.healTimer) { clearTimeout(syncEntry.healTimer); syncEntry.healTimer = null; }
+    syncQueue.delete(contents.id);
+  }
   popunderWatches.delete(contents.id);
   immediateOpenWatches.delete(contents.id);
   for (const [openUrl, tabId] of popupTabByOpenUrl) if (tabId === id) popupTabByOpenUrl.delete(openUrl);
@@ -1059,9 +1079,60 @@ function wireBrowsingContents(contents, id, opts = {}) {
   // failed card: let the document through again (hidden until it commits).
   contents.on('did-start-navigation', () => {
     issueHidden.delete(id);
+    // Self-heal the document-start scripts (popup shield, YouTube shield,
+    // double-click channel): a no-op fast path on a healthy tab; a re-attach
+    // plus reinstall for a tab whose debugger was detached — otherwise one
+    // transient attach failure left the tab feature-less for its life.
+    if (typeof syncPageScripts === 'function') syncPageScripts(contents);
   });
   contents.on('did-navigate', () => {
     issueHidden.delete(id);
+  });
+
+  // ---------------------------------------------------------------- double-click (main side)
+  // The isolated link world is the PRIMARY double-click route; this is the
+  // fallback for when that world cannot run (repeated attach failure — the
+  // very "works in tests, dead in the field" gap). It works from the OS-level
+  // mouse events the main process observes anyway, and resolves the anchor
+  // under the cursor through CDP (the same capability the popup state reads
+  // already use).
+  //
+  // CRITICAL: this only arms when the in-page world is ABSENT (no
+  // linkIdentifier). before-mouse-event fires in the input pipeline BEFORE
+  // the click reaches the page, so an always-on fallback would win the race
+  // against the in-page route and substitute cursor-coordinate +
+  // elementFromPoint guesses for the in-page route's exact trusted-DOM
+  // anchor. On a healthy tab the in-page route is strictly better, so stand
+  // down; on a degraded tab it is the only route left. serveLinkDialog's
+  // cooldown still dedupes any rare overlap.
+  //
+  // The second press only counts when the page did NOT navigate in between
+  // (a same-frame link that already navigated is unrecoverable — the second
+  // click sits on a different document); for target=_blank links the source
+  // page keeps the anchor, so a real double still resolves.
+  let lastMouseDown = null;
+  contents.on('before-mouse-event', (_event, input) => {
+    try {
+      if (!input || input.type !== 'mouseDown' || input.button !== 'left') return;
+      const entry = syncQueue.get(contents.id);
+      if (entry && entry.linkIdentifier) { lastMouseDown = null; return; } // in-page route owns this tab
+      const nowMs = Date.now();
+      if (lastMouseDown &&
+          nowMs - lastMouseDown.at < LINK_SECOND_CLICK_MS &&
+          Math.abs(input.x - lastMouseDown.x) <= 12 && Math.abs(input.y - lastMouseDown.y) <= 12 &&
+          contents.getURL() === lastMouseDown.url) {
+        lastMouseDown = null;
+        resolveDoubleClickedAnchor(contents, input.x, input.y).then(href => {
+          // Re-check at resolve time: the world may have self-healed in the
+          // meantime, in which case the in-page route is back in charge.
+          const current = syncQueue.get(contents.id);
+          if (current && current.linkIdentifier) return;
+          if (href) serveLinkDialog({ url: href, sourceContentsId: contents.id, sourceTabId: tabIdOfContents(contents) });
+        }).catch(() => { /* degraded */ });
+      } else {
+        lastMouseDown = { x: input.x, y: input.y, at: nowMs, url: contents.getURL() };
+      }
+    } catch { /* never break input */ }
   });
 
   contents.on('will-navigate', (event, url) => {
@@ -1118,21 +1189,25 @@ function wireBrowsingContents(contents, id, opts = {}) {
     contents.on('enter-html-full-screen', () => {
       if (contents.isDestroyed()) return;
       fsCtl.mediaEnter(id);
-      armMediaPausePoll();
+      armFullscreenReassert();
     });
     contents.on('leave-html-full-screen', () => {
       if (contents.isDestroyed()) return;
       const owned = fsCtl.mediaTabId === id;
       fsCtl.mediaLeave(id);
-      disarmMediaPausePoll();
       // The browser fullscreen rides the media session: when the document
-      // leaves media fullscreen (Esc, the player's exit control, a
-      // pause-driven exit, or navigating away) and the user had also taken
-      // the browser fullscreen, release that too — the two enter and exit
-      // as one session, so a stuck-fullscreen state cannot re-form.
+      // leaves media fullscreen (Esc, the player's exit control, or
+      // navigating away) and the user had also taken the browser fullscreen,
+      // release that too — the two enter and exit as one session, so a
+      // stuck-fullscreen state cannot re-form. PAUSING the media is not one
+      // of these exits: the fullscreen element persists through a pause, so
+      // the session does too (the field contract).
       // "owned" matters: a hidden tab's video ending must not release the
       // user's browser fullscreen on the tab they are actually looking at.
       if (owned && fsCtl.userFullscreen) fsCtl.setUserFullscreen(false);
+      // Keep the mid-session re-assertion only while a fullscreen session
+      // still runs in this window.
+      if (fsCtl.userFullscreen) armFullscreenReassert(); else disarmFullscreenReassert();
     });
     contents.on('did-navigate', () => {
       // A committed navigation to a different document tears down any media
@@ -1496,9 +1571,78 @@ function handleCdpMessage(contents, entry, method, params) {
   } catch (error) { console.warn('Link message error:', error.message); }
 }
 
+/** Attach can fail transiently (DevTools holding the debugger, a restarting
+ *  renderer, a first-byte race). One failed attach used to leave the tab
+ *  degraded for its whole life — popup shield, YouTube shield and the
+ *  double-click channel all gone, silently. Retry with backoff, bounded; a
+ *  permanently lost debugger degrades to the pre-feature behaviour without
+ *  hammering the log. Per-navigation sync (see did-start-navigation) keeps
+ *  trying anyway. */
+function schedulePageScriptHeal(contents, entry) {
+  if (entry.healTimer) return;
+  entry.healAttempts = (entry.healAttempts || 0) + 1;
+  if (entry.healAttempts > 10) return;
+  const delay = entry.healAttempts <= 3 ? 1000 : 5000;
+  entry.healTimer = setTimeout(() => {
+    entry.healTimer = null;
+    if (!contents.isDestroyed()) syncPageScripts(contents);
+  }, delay);
+}
+
+/** Re-learn the cc-links isolated world's execution contexts for the
+ *  CURRENT document, per frame. The context id is the anti-spoofing key of
+ *  the link->main channel; it is normally learned from
+ *  executionContextCreated, but after a re-attach that event has already
+ *  fired for the existing world — without this explicit resolution the
+ *  channel stays closed (every double-click dropped as "untrusted
+ *  context") until the next document loads. */
+function refreshLinkContexts(contents, entry) {
+  (async () => {
+    try {
+      const cdp = contents.debugger;
+      if (!cdp.isAttached() || contents.isDestroyed()) return;
+      const tree = await withTimeout(cdp.sendCommand('Page.getFrameTree'), 'frame tree', 1500);
+      const frameIds = [];
+      (function walk(node, depth) {
+        if (!node || depth > 40 || frameIds.length >= 40) return;
+        if (node.frame && node.frame.id) frameIds.push(node.frame.id);
+        for (const child of node.childFrames || []) walk(child, depth + 1);
+      })(tree.frameTree, 0);
+      await Promise.all(frameIds.map(async frameId => {
+        try {
+          const context = await withTimeout(cdp.sendCommand('Runtime.getIsolatedContext', { frameId, worldName: LINK_WORLD }), 'link world', 1500);
+          const contextId = context && (context.contextId || context.executionContextId);
+          if (contextId) entry.linkContextIds.add(contextId);
+        } catch { /* the frame has no link world yet (about:blank, mid-load) */ }
+      }));
+    } catch { /* degraded: the event path still works for new documents */ }
+  })();
+}
+
+/** The http(s) anchor under (x, y) in the page (input coordinates are DIP;
+ *  the page's CSS pixels differ by the zoom factor), or null. Used by the
+ *  main-process double-click fallback (see before-mouse-event in
+ *  wireBrowsingContents). */
+async function resolveDoubleClickedAnchor(contents, x, y) {
+  const entry = syncQueue.get(contents.id);
+  if (!entry || !contents.debugger.isAttached() || contents.isDestroyed()) return null;
+  const cdp = contents.debugger;
+  const zoom = (typeof contents.getZoomFactor === 'function') ? (contents.getZoomFactor() || 1) : 1;
+  const expr = "(() => { const px = " + JSON.stringify(Number((x / zoom).toFixed(2))) + ", py = " + JSON.stringify(Number((y / zoom).toFixed(2))) +
+    "; let n = document.elementFromPoint(px, py);" +
+    " while (n && n.nodeType === 1 && !(n.tagName === 'A' && n.href)) n = n.parentElement;" +
+    " if (!n || n.tagName !== 'A' || !n.href) return null;" +
+    " const u = new URL(n.href, location.href);" +
+    " if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;" +
+    " return u.href; })()";
+  const result = await withTimeout(cdp.sendCommand('Runtime.evaluate', { expression: expr, returnByValue: true }), 'double-click anchor', 2000);
+  const href = result && result.result && result.result.value;
+  return typeof href === 'string' && href ? href : null;
+}
+
 function syncPageScripts(contents) {
   const id = contents.id;
-  const entry = syncQueue.get(id) || { identifier: null, popupIdentifier: null, linkIdentifier: null, listening: false, cdpListening: false, linkContextIds: new Set(), queue: Promise.resolve() };
+  const entry = syncQueue.get(id) || { identifier: null, popupIdentifier: null, linkIdentifier: null, listening: false, cdpListening: false, linkContextIds: new Set(), queue: Promise.resolve(), healAttempts: 0, healTimer: null };
   syncQueue.set(id, entry);
   entry.queue = entry.queue.then(async () => {
     if (contents.isDestroyed()) return;
@@ -1506,27 +1650,49 @@ function syncPageScripts(contents) {
     if (!contents.getURL() && !contents.isLoading()) await contents.loadURL('about:blank').catch(() => {});
     if (contents.isDestroyed()) return;
     const cdp = contents.debugger;
-    if (!cdp.isAttached()) {
+    const { protection } = state;
+    const wantPopup = protection.enabled && protection.popups && popupSupportSource;
+    const wantShield = protection.enabled && protection.youtube;
+    const wantLink = !!linkSupportSource; // a UX feature: on regardless of protection
+    if (cdp.isAttached()) {
+      // Fast path: everything we want is already installed. This is also
+      // the self-heal path: called on every navigation (see
+      // did-start-navigation), it re-attaches a tab whose debugger was
+      // detached (DevTools opened, renderer restarted) instead of leaving
+      // the tab feature-less for its whole life.
+      const installed = (!wantPopup || entry.popupIdentifier) && (!wantShield || entry.identifier) && (!wantLink || entry.linkIdentifier);
+      if (installed) { refreshLinkContexts(contents, entry); return; }
+    } else {
       try {
         cdp.attach('1.3');
+        entry.healAttempts = 0;
         entry.identifier = null;
         entry.popupIdentifier = null;
         entry.linkIdentifier = null;
         if (!entry.cdpListening) {
           entry.cdpListening = true;
           cdp.on('message', (method, params) => handleCdpMessage(contents, entry, method, params));
-          cdp.on('detach', () => { entry.identifier = null; entry.popupIdentifier = null; entry.linkIdentifier = null; entry.linkContextIds.clear(); });
+          cdp.on('detach', () => {
+            entry.identifier = null;
+            entry.popupIdentifier = null;
+            entry.linkIdentifier = null;
+            entry.linkContextIds.clear();
+            schedulePageScriptHeal(contents, entry);
+          });
         }
         await withTimeout(cdp.sendCommand('Page.enable'), 'Page.enable');
         // Runtime events deliver the link world's console channel and its
         // execution-context bookkeeping.
         await withTimeout(cdp.sendCommand('Runtime.enable'), 'Runtime.enable').catch(() => {});
-      } catch (error) { console.warn('Page scripts unavailable:', error.message); return; }
+        // The current document's link world (if the document predates this
+        // attach) already exists — resolve its context explicitly.
+        refreshLinkContexts(contents, entry);
+      } catch (error) {
+        console.warn('Page scripts unavailable:', error.message);
+        schedulePageScriptHeal(contents, entry);
+        return;
+      }
     }
-    const { protection } = state;
-    const wantPopup = protection.enabled && protection.popups && popupSupportSource;
-    const wantShield = protection.enabled && protection.youtube;
-    const wantLink = !!linkSupportSource; // a UX feature: on regardless of protection
     if (entry.popupIdentifier) {
       await withTimeout(cdp.sendCommand('Page.removeScriptToEvaluateOnNewDocument', { identifier: entry.popupIdentifier }), 'remove popup support').catch(() => {});
       entry.popupIdentifier = null;
@@ -1579,9 +1745,15 @@ function trusted(event, extraSender = null) {
 
 function registerIPC() {
   const handle = (channel, callback) => ipcMain.handle(channel, (event, ...args) => { trusted(event); return callback(...args); });
-  handle('core:navigate', async (id, input) => {
+  handle('core:navigate', async (id, input, seq) => {
     if (typeof id !== 'string' || id.length > 100) throw new Error('Invalid tab');
     const url = browsingUrl(input);
+    // A fresh user navigation (navSeq advanced) reloads even when the url
+    // string is unchanged — that is the "Try again" retry after a failed
+    // load, the one that used to die silently. A re-focus of an
+    // already-loaded tab (no seq, or the same seq) keeps the old guard.
+    const freshNav = typeof seq === 'number' && seq > (lastNavSeq.get(id) ?? -1);
+    if (typeof seq === 'number') lastNavSeq.set(id, seq);
     const view = views.get(id) || makeTab(id);
     // User-initiated navigation: the content shows live (no loading card).
     // This covers the address bar, the home page, quick links, and the
@@ -1627,10 +1799,18 @@ function registerIPC() {
     // Let the filter lists finish their initial build (bounded: the bundled
     // baseline is already active, so a slow network never stalls browsing).
     await Promise.race([engine.ready, new Promise(resolve => setTimeout(resolve, 4000))]);
-    if (view.webContents.getURL() !== url && !view.webContents.isLoadingMainFrame()) {
-      navigationLocks.set(view.webContents.id, { url, at: Date.now() });
-      lastRequested.set(view.webContents.id, url);
-      try { await view.webContents.loadURL(url); }
+    // A fresh user navigation (freshNav) reloads even when the url string is
+    // unchanged — that is the "Try again" retry after a failed load, which
+    // used to die here because getURL() already equaled the failed url. A
+    // re-focus of an already-loaded tab (no new seq) keeps the old guard so
+    // switching tabs never reloads the page.
+    const contents = view.webContents;
+    if (contents.isDestroyed()) return;
+    const shouldLoad = freshNav || (contents.getURL() !== url && !contents.isLoadingMainFrame());
+    if (shouldLoad) {
+      navigationLocks.set(contents.id, { url, at: Date.now() });
+      lastRequested.set(contents.id, url);
+      try { await contents.loadURL(url); }
       catch (error) { if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Navigation failed:', error.message); }
     }
   });
@@ -1769,7 +1949,23 @@ function createWindow() {
   });
   win.on('resize', () => { applyLayout(); measureChromeHeight(); });
   win.on('enter-full-screen', () => { clearInterval(fullscreenVerifyTimer); fsCtl.windowFullscreenChanged(true); settleLayout(); });
-  win.on('leave-full-screen', () => { clearInterval(fullscreenVerifyTimer); fsCtl.windowFullscreenChanged(false); settleLayout(); });
+  win.on('leave-full-screen', () => {
+    clearInterval(fullscreenVerifyTimer);
+    fsCtl.windowFullscreenChanged(false);
+    // An intentional exit cleared userFullscreen BEFORE this event (the
+    // toggle / setUserFullscreen ran first, effect sink drove the OS). If
+    // the controller still wants fullscreen, the drop was stray (taskbar
+    // click, Win+Down race, OS glitch) — the contract is that the window
+    // stays in fullscreen through mouse activity and pauses; only a
+    // deliberate exit or the media leaving ends it. Put it back now; the
+    // 1 s re-assertion timer is the backstop for later glitches.
+    if (win && !win.isDestroyed() && fsCtl.userFullscreen && !win.isFullScreen()) {
+      console.warn('[fullscreen] stray OS drop mid-session; re-asserting immediately');
+      win.setFullScreen(true);
+      verifyWindowFullscreen(true);
+    }
+    settleLayout();
+  });
   win.on('focus', () => fsCtl.focusWindow());
   win.on('blur', () => fsCtl.blurWindow());
   win.on('closed', () => {
@@ -1907,6 +2103,6 @@ app.whenReady().then(() => {
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => {
-  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer); clearInterval(settleTimer); clearInterval(fullscreenVerifyTimer); disarmMediaPausePoll();
+  clearTimeout(persistTimer); clearTimeout(broadcastTimer); clearInterval(chromeIdleTimer); clearInterval(settleTimer); clearInterval(fullscreenVerifyTimer); disarmFullscreenReassert();
   if (storePath) { try { fs.writeFileSync(storePath, JSON.stringify(state)); } catch (error) { console.warn('Could not save workspace:', error.message); } }
 });

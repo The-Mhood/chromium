@@ -59,7 +59,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ChromiumCore-${{ matrix.platform }}-${{ matrix.arch }}
-          path: public/download/ChromiumCore-*.zip
+          # Windows is the NSIS installer (.exe); macOS is the ZIP. Each job
+          # produces exactly one of the two, so listing both patterns is safe.
+          path: |
+            public/download/ChromiumCore-*.zip
+            public/download/ChromiumCore-*.exe
           if-no-files-found: error
 
   # The Android TV target: the signed release APK plus the self-contained

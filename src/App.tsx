@@ -16,9 +16,12 @@ import { Downloads } from './pages/Downloads';
 import { useBrowser } from './store/browser';
 
 export default function App() {
-  const { tabs, activeTabId, protection, setProtection, filters, allowlist, theme, doNotTrack, nativeStats, setNativeStats, updateTab, newTab, removeTab, notify, navigatePage, setFullscreenState, tabIssues, setTabIssue } = useBrowser();
+  const { tabs, activeTabId, protection, setProtection, filters, allowlist, theme, doNotTrack, nativeStats, setNativeStats, updateTab, newTab, removeTab, notify, navigatePage, setFullscreenState, tabIssues, setTabIssue, navSeq } = useBrowser();
   const active = tabs.find(tab => tab.id === activeTabId) || tabs[0];
   const page = getPage(active.url);
+  // The retry token for the active tab (see store.browser.ts navSeq). A plain
+  // tab switch leaves this number unchanged; a user navigation bumps it.
+  const activeNavSeq = navSeq[active.id] || 0;
   const [mobileOpen, setMobileOpen] = useState(false);
   const [notifications, setNotifications] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -47,13 +50,18 @@ export default function App() {
     const offToast = bridge.onToast(info => notify(info.text, info.tone));
     return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); offNavBlocked(); offLoadFailed(); offTabClosed(); offToast(); };
   }, [setNativeStats, updateTab, newTab, removeTab, notify, setFullscreenState, setTabIssue]);
+  // activeNavSeq is the retry token: it bumps only when THIS tab is navigated,
+  // so the effect re-fires even when the url string is unchanged (the "Try
+  // again" button after a failed load, or re-typing the same address) while a
+  // plain tab switch does not. Without it a site that failed to load can
+  // never be retried from the address bar.
   useEffect(() => {
     const bridge = window.chromiumCore;
     if (!bridge) return;
     bridge.focusTab(active.id, page === 'external').then(() => {
-      if (page === 'external') return bridge.navigate(active.id, active.url);
+      if (page === 'external') return bridge.navigate(active.id, active.url, activeNavSeq);
     }).catch(() => notify('This page could not be opened. Try another address.', 'error'));
-  }, [active.id, active.url, page, notify]);
+  }, [active.id, active.url, page, activeNavSeq, notify]);
   useEffect(() => { window.chromiumCore?.setProtection(protection).catch(() => notify('Protection settings could not be applied.', 'error')); }, [protection, notify]);
   useEffect(() => { window.chromiumCore?.setAllowlist(allowlist).catch(() => notify('Allowlist could not be applied.', 'error')); }, [allowlist, notify]);
   useEffect(() => { window.chromiumCore?.setFilters(filters).catch(() => notify('Filter lists could not be applied.', 'error')); }, [filters, notify]);

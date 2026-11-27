@@ -176,28 +176,42 @@ test('media enter while user fullscreen: exit media keeps user fullscreen', () =
   assert.equal(ctl.wantsWindowFullscreen, false);
 });
 
-test('the OS dropping user fullscreen while media is active only clears the user flag', () => {
+test('a stray OS drop with media active keeps the user flag AND the media presentation', () => {
   const { ctl, windowEffects } = makeController();
   ctl.userToggle();
   ctl.mediaEnter('tab-a');
-  ctl.windowFullscreenChanged(false); // e.g. the user used the OS shortcut
-  assert.equal(ctl.userFullscreen, false);
-  assert.equal(ctl.wantsWindowFullscreen, false);
-  assert.deepEqual(windowEffects(), [
-    { type: 'window-fullscreen', value: true },
-    { type: 'window-fullscreen', value: false },
-  ]);
+  // A stray drop (taskbar click, Win+Down race, OS glitch) arrives with the
+  // intent still set: the contract is that the session survives it — the
+  // main process re-asserts the OS window state.
+  ctl.windowFullscreenChanged(false);
+  assert.equal(ctl.userFullscreen, true);
+  assert.equal(ctl.wantsWindowFullscreen, true);
+  assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: true }]); // no "off" effect
   // Media keeps its window-level presentation until it leaves.
   assert.equal(ctl.mediaActive, true);
   assert.equal(ctl.viewTop(), 0);
 });
 
-test('the OS dropping user fullscreen is treated as the user exiting', () => {
+test('a stray OS drop of user fullscreen keeps the intent (re-asserted by the window)', () => {
   const { ctl, windowEffects } = makeController();
   ctl.userToggle();
-  ctl.windowFullscreenChanged(false); // user pressed Esc / OS shortcut
+  // The toggle never ran — the drop was not requested. userFullscreen stays
+  // true so the leave-full-screen handler re-asserts win.setFullScreen(true).
+  ctl.windowFullscreenChanged(false);
+  assert.equal(ctl.userFullscreen, true);
+  assert.equal(ctl.wantsWindowFullscreen, true);
+  assert.deepEqual(windowEffects(), [{ type: 'window-fullscreen', value: true }]); // no "off" effect
+});
+
+test('an intentional exit clears the intent BEFORE the OS event lands', () => {
+  const { ctl, windowEffects } = makeController();
+  ctl.userToggle(); // on
+  ctl.userToggle(); // off (F11 / Escape / maximize dot) — the effect sink drives the OS
   assert.equal(ctl.userFullscreen, false);
-  assert.equal(ctl.wantsWindowFullscreen, false);
+  // The OS leave-full-screen event arrives after the intent is gone: nothing
+  // to re-assert, and the drop must not resurrect the session.
+  ctl.windowFullscreenChanged(false);
+  assert.equal(ctl.userFullscreen, false);
   assert.deepEqual(windowEffects(), [
     { type: 'window-fullscreen', value: true },
     { type: 'window-fullscreen', value: false },

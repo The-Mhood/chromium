@@ -595,7 +595,7 @@ test('main process wiring (Electron stub)', async t => {
     }
   });
 
-  await t.test('fullscreen: pausing the media releases BOTH the media and the browser fullscreen', async () => {
+  await t.test('fullscreen: pausing the media keeps the session alive — only media-exit ends it', async () => {
     const { view } = await freshTab('fs-p', 'https://video.example.com/watch');
     const wc = view.webContents;
     // The user takes the browser fullscreen, then plays the video in
@@ -604,39 +604,51 @@ test('main process wiring (Electron stub)', async t => {
     assert.equal(winStub().__fullscreen, true, 'browser fullscreen entered');
     wc.emit('enter-html-full-screen');
     wc.__mediaState = { paused: false, ended: false };
-    // Playback: the session must persist (two poll cycles pass).
+    // Playback: the session must persist.
     await new Promise(resolve => setTimeout(resolve, 1200));
     assert.equal(winStub().__fullscreen, true, 'browser fullscreen persists while the media plays');
-    // The user pauses the video.
+    // The user pauses: the session PERSISTS. The field contract — the
+    // browser stays in fullscreen as long as the media is in fullscreen; a
+    // pause is not an exit, and there is no poll reading the media state to
+    // end the session.
     wc.__mediaState = { paused: true, ended: false };
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    assert.equal(winStub().__fullscreen, false, 'pausing released the browser fullscreen');
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    assert.equal(winStub().__fullscreen, true, 'pausing did NOT release the browser fullscreen');
+    // Resuming: it never left.
+    wc.__mediaState = { paused: false, ended: false };
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(winStub().__fullscreen, true, 'resume: still fullscreen');
+    // ONLY the media leaving fullscreen ends the session.
+    wc.emit('leave-html-full-screen');
+    assert.equal(winStub().__fullscreen, false, 'media-exit released the browser fullscreen');
     const state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
     assert.deepEqual(state.payload, { media: false, window: false }, 'the media session ended too');
     wc.__mediaState = null;
     await closeTabs('fs-p');
   });
 
-  await t.test('media: a transient pause (player remount / seek) does not end the fullscreen session', async () => {
-    // Inconsistent-fullscreen report: one stray "paused" reading used to
-    // drop the user out of fullscreen. Players remount their <video> on
-    // quality changes and read "paused" briefly on seek — the session may
-    // only end when the pause HOLDS across two consecutive polls.
+  await t.test('media: pausing — even a sustained pause — never ends the fullscreen session', async () => {
+    // The old behaviour polled the media element and released the session
+    // when the pause held across two polls. That dropped users out of
+    // fullscreen on a real pause, which the field contract forbids: ONLY the
+    // media leaving fullscreen ends the session. A sustained pause — and even
+    // the video finishing — must not.
     const { view } = await freshTab('fs-t', 'https://video.example.com/watch-2');
     const wc = view.webContents;
     calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
     wc.emit('enter-html-full-screen');
     wc.__mediaState = { paused: false, ended: false };
-    // A pause blip shorter than one poll period: at most one poll sees it.
+    // A sustained pause held well past the old poll period.
     wc.__mediaState = { paused: true, ended: false };
-    await new Promise(resolve => setTimeout(resolve, 60));
-    wc.__mediaState = { paused: false, ended: false };
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    assert.equal(winStub().__fullscreen, true, 'the transient pause did not end the session');
-    // A sustained pause (held across two polls) still ends the session.
-    wc.__mediaState = { paused: true, ended: false };
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    assert.equal(winStub().__fullscreen, false, 'a sustained pause ends the session');
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    assert.equal(winStub().__fullscreen, true, 'a sustained pause did not end the session');
+    // Even the video finishing does not tear down the fullscreen element.
+    wc.__mediaState = { paused: true, ended: true };
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(winStub().__fullscreen, true, 'the media ending did not end the session');
+    // Leaving fullscreen is the only exit — and it cleans up for later tests.
+    wc.emit('leave-html-full-screen');
+    assert.equal(winStub().__fullscreen, false, 'media-exit ended the session');
     wc.__mediaState = null;
     await closeTabs('fs-t');
   });
