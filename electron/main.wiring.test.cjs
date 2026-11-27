@@ -998,6 +998,161 @@ test('main process wiring (Electron stub)', async t => {
     }
   });
 
+  await t.test('a scripted window.open with a link-shaped disposition is verified, never published at once', async () => {
+    // The hivex.stream class of bug: the user makes a REAL click (fresh
+    // pipeline input) and the page's ad script fires window.open() INSIDE
+    // that gesture. Chromium reports the open with the same link-shaped
+    // disposition ("foreground-tab") a genuine anchor click gets, so the
+    // disposition and the fresh input are no evidence at all — only the
+    // isolated-world record (a window.open record, and NO matching anchor
+    // click) exposes it as scripted. Scripted opens take the conservative
+    // path: hidden verification, per-activation budget, popunder rule.
+    cdpStub.pageStateEnabled = true;
+    cdpStub.attachEnabled = true;
+    try {
+      const { view: page, known } = await freshTab('ad-1', 'https://victim.example.com/');
+      const started = Date.now();
+      while (!cdpMessageListener && Date.now() - started < 2000) await new Promise(resolve => setTimeout(resolve, 25));
+      emitCdp('Runtime.executionContextCreated', { context: { id: 4000, name: 'cc-links' } });
+      // window.open was called (an open record); no anchor click recorded
+      // a matching href (a real target=_blank click writes only a click
+      // record — window.open is never involved).
+      cdpStub.stateValue = {
+        open: { t: Date.now(), isTop: true, crossOrigin: false, frameHost: 'victim.example.com', topHost: 'victim.example.com' },
+        click: null,
+      };
+      clickOn(page.webContents);
+      // The user-reported domain itself is on the baseline now: a listed
+      // destination is denied at the declared URL, before anything exists.
+      page.webContents.__openHandler({ url: 'https://hivex.stream/landing', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!openPublished('https://hivex.stream/landing'), 'a listed ad destination is denied before any tab');
+      // Declared destination on the opener's own domain (unlisted): the
+      // scripted open still gets no immediate tab — it is verified in the
+      // hidden inspector.
+      page.webContents.__openHandler({ url: 'https://victim.example.com/redirect-start', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!openPublished('https://victim.example.com/redirect-start'), 'the scripted link-shaped open was not published at once');
+      const inspector = findInspector(known);
+      assert.ok(inspector, 'it went through the hidden verification instead');
+      // Its redirect chain stays checked: the classic popunder shape (the
+      // open starts on the opener's own domain, then the committed frame
+      // jumps to another one) is blocked before any tab appears — the jump
+      // rule applies because this open was classified as scripted.
+      inspector.webContents.__url = 'https://totally-different-domain.example.net/capture';
+      inspector.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(!openPublished('https://totally-different-domain.example.net/capture'), 'the committed redirect was blocked');
+      assert.ok(calls.sends.some(s => s.channel === 'core:popup-blocked'), 'the block was reported');
+    } finally {
+      await closeTabs('ad-1');
+      cdpStub.pageStateEnabled = false;
+      cdpStub.attachEnabled = false;
+      cdpStub.stateValue = null;
+    }
+  });
+
+  await t.test('DevTools down: the first open of a fresh click stays immediate, the rest of the burst is not', async () => {
+    // No CDP at all (the degraded path): the main-process fallback is a
+    // one-shot immediate slot per fresh user activation. The FIRST
+    // link-shaped open may be the user's own link (a page with a dead
+    // DevTools session must not feel broken); every FURTHER open of the
+    // same activation is treated as scripted — an ad script firing several
+    // window.open() calls in the user's click handler cannot take them all.
+    try {
+    const { view: page, known } = await freshTab('gap-1', 'https://victim.example.com/');
+    const url1 = 'https://docs.example.com/first-link';
+    const url2 = 'https://burst-two.example.com/open';
+    const url3 = 'https://burst-three.example.com/open';
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url: url1, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(openPublished(url1), 'the first open of the activation kept the immediate path');
+    assert.ok(!findInspector(known), 'it was not verified — no delay for the user link');
+    // Same activation, no new input: scripted handling kicks in.
+    page.webContents.__openHandler({ url: url2, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(!openPublished(url2), 'the second open was not published at once');
+    assert.ok(findInspector(known), 'the second open went through hidden verification');
+    page.webContents.__openHandler({ url: url3, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(!openPublished(url3), 'the third open of the activation was blocked');
+    assert.ok(calls.sends.some(s => s.channel === 'core:popup-blocked'), 'the block was reported');
+    // Settle the second open's inspector deterministically (a clean same-
+    // host commit) so no hidden view outlives the test.
+    const inspected = findInspector(known);
+    if (inspected) {
+      inspected.webContents.__url = url2;
+      inspected.webContents.emit('did-commit-navigation');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    // A NEW click restores the immediate path — the slot is per activation.
+    const url4 = 'https://docs.example.com/second-link';
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url: url4, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(openPublished(url4), 'a fresh click earns a fresh immediate slot');
+  } finally {
+    await closeTabs('gap-1');
+  }
+  });
+
+  await t.test('the immediate-tab redirect check survives an intermediate hop (no hung placeholder)', async () => {
+    // The hivex.stream "stuck on Loading" bug: the declared destination is
+    // clean and the tab is published at once, but the real destination is
+    // a redirect CHAIN (gate -> unlisted tracker hop -> listed ad). The
+    // watch must stay armed across hops: a watch that dies on its first
+    // redirect leaves every later hop unchecked and the tab hangs on its
+    // "Loading <url>" placeholder forever.
+    try {
+    const { view: page } = await freshTab('rt-2', 'https://victim.example.com/');
+    const url = 'https://redirector.example.com/gate';
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(openPublished(url), 'the click opened the tab at once');
+    const tab = await freshTab('rt-2-tab', url);
+    tab.view.webContents.emit('will-redirect', {}, 'https://trkhop.example.net/mid');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.ok(winStub().contentView.__views.includes(tab.view), 'the unlisted intermediate hop kept the tab open');
+    tab.view.webContents.emit('will-redirect', {}, 'https://pagead2.googlesyndication.com/landing');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.ok(!winStub().contentView.__views.includes(tab.view), 'the hop to a listed ad closed the tab');
+    assert.ok(calls.sends.some(s => s.channel === 'core:popup-blocked'), 'the block was reported');
+    } finally {
+    await closeTabs('rt-2', 'rt-2-tab');
+    }
+  });
+
+  await t.test('a slow double-click (second fresh click on the pending link) offers the dialog without CDP', async () => {
+    // Trackpad double-taps often land OUTSIDE the in-page 600 ms window or
+    // the page script never sees the second hit. The main process detects
+    // the same shape through the dedup state — a second FRESH click on the
+    // same link while the first tab is pending — and serves the same
+    // outcome: close the first tab, offer the link-options dialog.
+    try {
+    const { view: page } = await freshTab('tk-1', 'https://victim.example.com/');
+    const url = 'https://site.test/slow-tap';
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(openPublished(url), 'the first tap opened the tab at once');
+    const tab = await freshTab('tk-tab', url);
+    // Second tap: another real click a few hundred ms later (settle() ≈
+    // 300 ms), within the double-click window, no page message involved.
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+    await settle();
+    const dialogs = BrowserWindowStub.windows.filter(w => w.__dialog);
+    assert.equal(dialogs.length, 1, 'the second tap offered the link-options dialog');
+    assert.ok(!winStub().contentView.__views.includes(tab.view), 'the first tap tab was closed');
+    assert.ok(calls.sends.some(s => s.channel === 'core:tab-closed' && s.payload.id === 'tk-tab'), 'the renderer was told the tab closed');
+    dialogs[0].close();
+    } finally {
+    await closeTabs('tk-1', 'tk-tab');
+    }
+  });
+
   await t.test('double-click pipeline: the isolated link world opens the options dialog', async () => {
     cdpStub.pageStateEnabled = true;
     cdpStub.attachEnabled = true;

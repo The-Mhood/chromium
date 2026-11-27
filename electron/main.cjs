@@ -27,7 +27,7 @@ const { createProtectionEngine } = require('./protection.cjs');
 const { FullscreenController } = require('./fullscreen-state.cjs');
 const { browsingUrl, isAllowedDomain, trustedFilterUrl } = require('./security.cjs');
 const { buildShieldScript } = require('./youtube-shield.cjs');
-const { committedNavigationVerdict, pickAttribution } = require('./popup-blocker.cjs');
+const { committedNavigationVerdict, pickAttribution, sameAnchorHref } = require('./popup-blocker.cjs');
 
 let win;
 let engine;
@@ -299,12 +299,20 @@ function destroyTab(id) {
 // made ordinary links "refuse to click".
 const POPUP_STATE_EXPR = '(function () { var s = window.__ccPopupState; if (!s) return null; return { t: s.t || 0, open: s.lastOpen && Date.now() - s.lastOpen.t < 3000 ? s.lastOpen : null, click: s.lastClick && Date.now() - s.lastClick.t < 3000 ? s.lastClick : null }; })()';
 
-async function readPagePopupState(contents, atMs) {
+/**
+ * Read the isolated-world popup state of every frame.
+ * `options.partialMs`: when set, the read returns EARLY with whatever frames
+ * have settled by the deadline (instead of null) — the link-click routing
+ * probe uses this so a congested frame never withholds the top frame's
+ * record, and the whole read never holds a click up past the budget.
+ */
+async function readPagePopupState(contents, atMs, options = {}) {
   const entry = syncQueue.get(contents.id);
   if (!entry || contents.isDestroyed() || !contents.debugger.isAttached()) return null;
   const cdp = contents.debugger;
+  const partialMs = options.partialMs;
   try {
-    const tree = await withTimeout(cdp.sendCommand('Page.getFrameTree'), 'frame tree', 1500);
+    const tree = await withTimeout(cdp.sendCommand('Page.getFrameTree'), 'frame tree', partialMs || 1500);
     const frameIds = [];
     (function walk(node, depth) {
       if (!node || depth > 40 || frameIds.length >= 40) return;
@@ -312,17 +320,24 @@ async function readPagePopupState(contents, atMs) {
       for (const child of node.childFrames || []) walk(child, depth + 1);
     })(tree.frameTree, 0);
     if (!frameIds.length) return null;
-    const reads = await withTimeout(Promise.all(frameIds.map(async frameId => {
+    const settled = [];
+    const reads = Promise.all(frameIds.map(async frameId => {
       try {
         const context = await cdp.sendCommand('Runtime.getIsolatedContext', { frameId, worldName: POPUP_WORLD });
         const result = await cdp.sendCommand('Runtime.evaluate', { expression: POPUP_STATE_EXPR, contextId: context.contextId, returnByValue: true });
-        return (result && result.result && result.result.value) || null;
-      } catch { return null; }
-    })), 'popup state', 2500);
+        const value = (result && result.result && result.result.value) || null;
+        if (value) settled.push(value); // frames may settle out of order
+      } catch { /* one dead frame never withholds the rest */ }
+    }));
+    if (partialMs) {
+      await Promise.race([reads, new Promise(resolve => setTimeout(resolve, partialMs))]);
+    } else {
+      await withTimeout(reads, 'popup state', 2500);
+    }
     let lastActivityAt = 0;
     let open = null;
     let click = null;
-    for (const value of reads) {
+    for (const value of settled) {
       if (!value) continue;
       if (typeof value.t === 'number' && value.t > lastActivityAt) lastActivityAt = value.t;
       if (value.open && (!open || value.open.t > open.t)) open = value.open;
@@ -347,15 +362,32 @@ async function readPagePopupState(contents, atMs) {
 // Immediate link opens (genuine target=_blank / modifier clicks).
 //
 // A genuine link click is recognised SYNCHRONOUSLY from the browser's input
-// pipeline (before-mouse-event): it is fresh (milliseconds old), unspoofable
-// (synthetic element.click() never passes through the pipeline), and
-// CDP-independent. For such opens the tab is published at once — no hidden
-// inspector round trip, no DevTools state read on the critical path — and
-// the destination's redirects are checked as they happen (a commit to a
-// listed ad closes the tab promptly). Rapid repeat clicks on the same link
-// while the first tab is still materialising are DEDUPLICATED (dropped,
-// never queued), so a nervous user clicking five times gets one tab, not a
-// burst of five.
+// pipeline (before-mouse-event): it is fresh (milliseconds old) and
+// unspoofable (synthetic element.click() never passes through the
+// pipeline). For such opens the tab is published at once — no hidden
+// inspector round trip on the critical path — and the destination's
+// redirects are checked as they happen (a commit to a listed ad closes the
+// tab promptly). Rapid repeat clicks on the same link while the first tab
+// is still materialising are DEDUPLICATED (dropped, never queued), so a
+// nervous user clicking five times gets one tab, not a burst of five.
+//
+// The input-pipeline check alone is NOT sufficient, though: an ad script
+// can call window.open() INSIDE the user's own click handler, and the
+// browser reports that open with the same link-shaped disposition and a
+// fresh real click behind it. So the isolated-world records arbitrate:
+//   * a real anchor click writes a CLICK record whose href is EXACTLY the
+//     destination (target=_blank never calls window.open) -> immediate;
+//   * a window.open() call writes an OPEN record (never a matching click)
+//     -> the full conservative path (quota, repeat rule, hidden
+//     inspector, popunder domain-jump check on the commit);
+//   * no records at all (DevTools unavailable) -> the FIRST open of a
+//     fresh user activation keeps the immediate path (a page with a dead
+//     DevTools session must not feel broken), every further open of that
+//     activation is treated as scripted.
+// A second fresh click on the same link while the first tab is pending is
+// the DOUBLE-CLICK: it closes the first tab and offers the link-options
+// dialog (same outcome the in-page 600 ms detection produces, but decided
+// in the main process, so it also works for slow trackpad double-taps).
 //
 // Scripted opens (window.open with any non-link disposition) keep the full
 // conservative path: DevTools state read + classification + hidden
@@ -368,6 +400,7 @@ async function readPagePopupState(contents, atMs) {
 
 const LINK_DEDUP_MS = 1500;              // repeat clicks on the same destination are dropped within this window
 const LINK_PAGESTATE_BUDGET_MS = 150;    // the frame-attribution read on the click path must never hold the click up
+const LINK_SECOND_CLICK_MS = 600;        // a second fresh click this soon after the first is the double-click (matches the in-page window)
 const pendingLinkOpens = new Map();      // `${contentsId}\u001f${url}` -> { atMs } of the FIRST request
 const pendingImmediateOpens = [];        // { url, sourceUrl, sourceContentsId, sourceTabId, at } — matched when the tab materialises
 const immediateOpenWatches = new Map();  // new tab contents id -> { intendedUrl, sourceUrl, createdAt, viaLinkClick }
@@ -403,15 +436,75 @@ function releaseImmediateOpenTab(tabId) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Double-click bookkeeping.
+//
+// The in-page script detects a fast double-click on its own 600 ms window
+// and asks for the dialog (t:'dialog'); the main process detects the slower
+// kind (second fresh click on the same link while the first tab is pending)
+// through the dedup state. Both routes serve the SAME dialog through
+// serveLinkDialog, and the cooldown keeps a race between the two routes
+// from showing two dialogs or re-opening a tab for the pair.
+// ---------------------------------------------------------------------------
+const DIALOG_COOLDOWN_MS = 1200;
+const dialogCooldowns = new Map(); // `${contentsId}\u001f${url}` -> served-at ms
+
+function linkDialogCoolingDown(contentsId, url) {
+  const until = dialogCooldowns.get(contentsId + '\u001f' + url);
+  if (until === undefined) return false;
+  if (Date.now() >= until) { dialogCooldowns.delete(contentsId + '\u001f' + url); return false; }
+  return true;
+}
+
+/** Close the just-opened (or still pending) tab for a double-clicked link
+ *  and show the link-options dialog at the cursor. Returns false when the
+ *  dialog for this link was already served within the cooldown. */
+function serveLinkDialog({ url, sourceContentsId, sourceTabId, text, media }) {
+  const coolKey = sourceContentsId + '\u001f' + url;
+  const nowMs = Date.now();
+  if ((dialogCooldowns.get(coolKey) || 0) > nowMs) return false;
+  dialogCooldowns.set(coolKey, nowMs + DIALOG_COOLDOWN_MS);
+  // A double-click on a link that opens a new tab: the FIRST click already
+  // opened the tab (immediate single-click behaviour). The second click is
+  // the user choosing the options instead — close the just-opened tab,
+  // then show the dialog. (If the first click's tab has not materialised
+  // yet, its pending entry is dropped below and the renderer's tab, when
+  // navigated, finds no bookkeeping and simply behaves like an ordinary
+  // user tab.)
+  const pendingIdx = pendingImmediateOpens.findIndex(item => item.url === url && item.sourceTabId === sourceTabId && nowMs - item.at < 5000);
+  if (pendingIdx !== -1) pendingImmediateOpens.splice(pendingIdx, 1);
+  const info = immediateTabByOpenUrl.get(url);
+  if (info && info.sourceTabId === sourceTabId && nowMs - info.at < 5000) {
+    immediateTabByOpenUrl.delete(url);
+    releaseLinkOpen(info.sourceContentsId, url);
+    if (views.has(info.tabId)) {
+      destroyTab(info.tabId);
+      send('core:tab-closed', { id: info.tabId });
+    }
+  }
+  let point = { x: 0, y: 0 };
+  try { point = screen.getCursorScreenPoint(); } catch { /* headless */ }
+  openLinkDialog({
+    url,
+    title: typeof text === 'string' ? text : '',
+    media: media === true,
+    x: point.x,
+    y: point.y,
+    sourceTabId,
+  });
+  return true;
+}
+
 async function readPagePopupStateBounded(contents, atMs, budgetMs) {
   const budget = new Promise(resolve => setTimeout(resolve, budgetMs));
   const [pageState] = await Promise.all([readPagePopupState(contents, atMs), budget]);
   return pageState; // null on budget expiry (and on any failure)
 }
 
-/** A link-shaped open (Chromium disposition "foreground-tab") with a fresh
- *  real click behind it: decide and publish synchronously. */
-async function handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs, viaScriptCommit = false }) {
+/** A link-shaped open (Chromium disposition "foreground-tab") admitted to
+ *  the immediate path (see handleWindowOpen): decide and publish
+ *  synchronously. */
+async function handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs, viaScriptCommit = false, pageState: prePageState }) {
   const contentsId = contents.id;
   const source = safeHost(sourceUrl);
   const sourceTabId = tabIdOfContents(contents);
@@ -429,12 +522,22 @@ async function handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs
     return;
   }
 
+  // 1b) The dialog for this link was just served by a double-click: the
+  //     user's follow-up clicks belong to the dialog, not to new tabs.
+  if (linkDialogCoolingDown(contentsId, url)) {
+    logPopup({ source, url, disposition, frame, decision: 'deny', reason: 'dialog-cooldown', created: false });
+    return;
+  }
+
   // 2) Frame attribution (stale ad-iframe window.open records, sponsored
   //    click rate limit) from the isolated-world read — bounded: on a
   //    congested DevTools session the click is classified on the
   //    main-process evidence alone (listed-destination, tab budget, quota
-  //    still apply) instead of waiting for the read to finish.
-  const pageState = await readPagePopupStateBounded(contents, atMs, LINK_PAGESTATE_BUDGET_MS);
+  //    still apply) instead of waiting for the read to finish. (The routing
+  //    probe may have already read it; reuse that result.)
+  const pageState = prePageState !== undefined
+    ? prePageState
+    : await readPagePopupStateBounded(contents, atMs, LINK_PAGESTATE_BUDGET_MS);
   if (contents.isDestroyed()) return;
   const decision = engine.popupPolicy.classifyWindowOpen({
     url,
@@ -457,10 +560,22 @@ async function handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs
   }
 
   // 3) Deduplicate: rapid repeat clicks on the same link while the first
-  //    tab is still materialising are dropped, not queued — no burst of N
-  //    tabs when the user clicks the link five times.
+  //    tab is still materialising never queue up — no burst of N tabs when
+  //    the user clicks the link five times. A second FRESH click on the
+  //    same link IS the double-click: same outcome the in-page 600 ms
+  //    detection produces (close the first tab, offer the link-options
+  //    dialog), but decided in the main process against the dedup state —
+  //    so it also fires for slow trackpad double-taps that miss the in-page
+  //    window. Clicks later in the dedup window (not a double-click) are
+  //    dropped silently, as before.
   if (!claimLinkOpen(contentsId, url, atMs)) {
-    logPopup({ source, url, disposition, frame: logFrame, decision: 'deny', reason: 'dedup-pending', created: false });
+    const held = pendingLinkOpens.get(linkOpenKey(contentsId, url));
+    if (held && atMs - held.atMs <= LINK_SECOND_CLICK_MS) {
+      logPopup({ source, url, disposition, frame: logFrame, decision: 'deny', reason: 'double-click', created: false });
+      serveLinkDialog({ url, sourceContentsId: contentsId, sourceTabId, text: '', media: false });
+    } else {
+      logPopup({ source, url, disposition, frame: logFrame, decision: 'deny', reason: 'dedup-pending', created: false });
+    }
     return;
   }
 
@@ -498,14 +613,39 @@ async function handleWindowOpen(details, contents) {
     logPopup({ source: safeHost(sourceUrl), url: details.url, disposition, decision: 'deny', reason: 'scheme', created: false });
     return;
   }
-  // A LINK-SHAPED open (Chromium's "foreground-tab" for user-initiated
-  // foreground tab requests) with a fresh real click behind it is decided
-  // and published synchronously — no unbounded DevTools wait on the
-  // critical path. Everything else is a scripted open and keeps the full
-  // conservative path below (unbounded state read + hidden verification).
+  // A LINK-SHAPED open (Chromium's "foreground-tab") earns the immediate
+  // path only on POSITIVE link-click evidence: an isolated-world CLICK
+  // record whose href is exactly this destination (a real anchor click —
+  // window.open() never writes that). A window.open() call writes an OPEN
+  // record instead, and ad scripts can fire it inside the user's own click
+  // handler (same disposition, same fresh real input) — those keep the
+  // full conservative path below. With no records at all (DevTools down),
+  // the FIRST open of a fresh activation keeps the immediate path; every
+  // further open of the activation is treated as scripted.
+  let treatAsScripted = false;
+  let likelyLinkClick = false;
   if (disposition === 'foreground-tab') {
-    await handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs });
-    return;
+    // Bounded PROBE: whatever frames settle in the budget (the top frame's
+    // record is usually first) — a congested frame must not withhold it.
+    const probe = await readPagePopupState(contents, atMs, { partialMs: LINK_PAGESTATE_BUDGET_MS });
+    if (contents.isDestroyed()) return;
+    const attributed = pickAttribution({ url, pageState: probe });
+    const hasClickEvidence = !!attributed && attributed.via === 'click' && sameAnchorHref(attributed.href, url);
+    const hasOpenRecord = !!(probe && probe.open);
+    if (hasClickEvidence || (!hasOpenRecord && engine.popupPolicy.firstGapLinkOpen(contents.id))) {
+      engine.popupPolicy.noteLinkOpenUsed(contents.id);
+      await handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs, pageState: probe });
+      return;
+    }
+    // Scripted evidence (a window.open record) or a second+ open of the
+    // activation: classify as scripted so the quota, the repeat-popup rule
+    // and the hidden verification all apply. `likelyLinkClick` is the
+    // no-records gap case with a fresh real gesture: the popunder
+    // domain-jump check is then relaxed on the commit (an honest
+    // cross-domain redirect of the user's own link must keep working even
+    // without DevTools) while the list checks stay fully active.
+    treatAsScripted = true;
+    likelyLinkClick = !hasOpenRecord && engine.popupPolicy.freshInput(contents.id, atMs);
   }
 
   // Page state (isolated-world records) is read for EVERY scripted open: it
@@ -524,6 +664,7 @@ async function handleWindowOpen(details, contents) {
     pageState,
     contentsId: contents.id,
     atMs,
+    treatAsScripted,
   });
   // For the log: the frame that actually initiated this open (a window.open
   // record, or — for a target=_blank link click — the click record).
@@ -546,7 +687,12 @@ async function handleWindowOpen(details, contents) {
     return;
   }
   logPopup({ source: safeHost(sourceUrl), url, disposition, frame, decision: 'verify', reason: decision.reason, created: false });
-  startCommitVerification({ url, sourceUrl, viaLinkClick: false });
+  // `likelyLinkClick`: the no-records gap case (fresh gesture, no window.
+  // open record) — there the commit verdict relaxes the popunder jump rule
+  // so an honest cross-domain redirect of the user's own link still works
+  // without DevTools. A definite window.open record (or a plain scripted
+  // open) keeps the full jump rule.
+  startCommitVerification({ url, sourceUrl, viaLinkClick: likelyLinkClick });
 }
 
 // ---------------------------------------------------------------------------
@@ -681,10 +827,27 @@ function closeEarlierPopupTab(openUrl) {
 // finish in time (popunder fallback watch).
 const popunderWatches = new Map(); // contents id -> { intendedUrl, sourceUrl, createdAt, viaLinkClick }
 
+// Both redirect watches (popunder fallback + immediate-link) stay ARMED
+// across the whole redirect chain of the first load: a watch that dies on
+// its first will-navigate (the intended URL, which by definition passes)
+// would leave every later redirect unchecked — a tab that 302s to a listed
+// ad would then hang on its "Loading <url>" placeholder forever instead of
+// being closed. The watch is removed when the verdict blocks (the tab is
+// destroyed anyway), when the load commits (did-commit-navigation, wired at
+// arm time), when the tab goes away (destroyTab), or when it expires.
+function armedNavigationWatch(watches, contents) {
+  const watch = watches.get(contents.id);
+  if (!watch) return null;
+  if (Date.now() - watch.createdAt > engine.popupPolicy.WATCH_TTL_MS) {
+    watches.delete(contents.id);
+    return null;
+  }
+  return watch;
+}
+
 function checkPopunderNavigation(contents, url, tabId) {
-  const watch = popunderWatches.get(contents.id);
+  const watch = armedNavigationWatch(popunderWatches, contents);
   if (!watch) return false;
-  popunderWatches.delete(contents.id);
   const verdict = committedNavigationVerdict({
     intendedUrl: watch.intendedUrl,
     openerUrl: watch.sourceUrl,
@@ -695,6 +858,7 @@ function checkPopunderNavigation(contents, url, tabId) {
     viaLinkClick: watch.viaLinkClick === true,
   });
   if (!verdict.block) return false;
+  popunderWatches.delete(contents.id);
   recordBlocked(verdict.type || 'Pop-up', url, contents.getURL());
   noticePopupBlocked(url, contents.getURL(), verdict.reason);
   logPopup({ source: safeHost(watch.sourceUrl), url, decision: 'deny', reason: verdict.reason, created: true, stage: 'first-navigation' });
@@ -707,9 +871,8 @@ function checkPopunderNavigation(contents, url, tabId) {
 // redirects are checked as they happen — a redirect to a listed ad or a
 // popunder-style domain jump closes the tab promptly (reject, not queue).
 function checkImmediateNavigation(contents, url, tabId) {
-  const watch = immediateOpenWatches.get(contents.id);
+  const watch = armedNavigationWatch(immediateOpenWatches, contents);
   if (!watch) return false;
-  immediateOpenWatches.delete(contents.id);
   const verdict = committedNavigationVerdict({
     intendedUrl: watch.intendedUrl,
     openerUrl: watch.sourceUrl,
@@ -720,6 +883,7 @@ function checkImmediateNavigation(contents, url, tabId) {
     viaLinkClick: watch.viaLinkClick === true,
   });
   if (!verdict.block) return false;
+  immediateOpenWatches.delete(contents.id);
   recordBlocked(verdict.type || 'Pop-up', url, watch.sourceUrl);
   noticePopupBlocked(url, watch.sourceUrl, verdict.reason);
   logPopup({ source: safeHost(watch.sourceUrl), url, decision: 'deny', reason: verdict.reason, created: true, stage: 'first-navigation' });
@@ -956,34 +1120,15 @@ function handleLinkMessage(contents, raw) {
   if (payload.t === 'dialog') {
     let url;
     try { url = browsingUrl(payload.url); } catch { return; }
-    // A double-click on a link that opens a new tab: the FIRST click
-    // already opened the tab (immediate single-click behaviour). The
-    // second click is the user choosing the options instead — close the
-    // just-opened tab, then show the dialog. (If the first click's tab has
-    // not materialised yet, its pending entry is dropped below and the
-    // renderer's tab, when navigated, finds no bookkeeping and simply
-    // behaves like an ordinary user tab.)
     const sourceTabId = tabIdOfContents(contents);
-    const pendingIdx = pendingImmediateOpens.findIndex(item => item.url === url && item.sourceTabId === sourceTabId && Date.now() - item.at < 5000);
-    if (pendingIdx !== -1) pendingImmediateOpens.splice(pendingIdx, 1);
-    const info = immediateTabByOpenUrl.get(url);
-    if (info && info.sourceTabId === sourceTabId && Date.now() - info.at < 5000) {
-      immediateTabByOpenUrl.delete(url);
-      releaseLinkOpen(info.sourceContentsId, url);
-      if (views.has(info.tabId)) {
-        destroyTab(info.tabId);
-        send('core:tab-closed', { id: info.tabId });
-      }
-    }
-    let point = { x: 0, y: 0 };
-    try { point = screen.getCursorScreenPoint(); } catch { /* headless */ }
-    openLinkDialog({
+    // The fast (in-page) double-click route: same serve path as the
+    // main-process dedup route — the cooldown dedupes the two.
+    serveLinkDialog({
       url,
-      title: typeof payload.text === 'string' ? payload.text : '',
-      media: payload.media === true,
-      x: point.x,
-      y: point.y,
+      sourceContentsId: contents.id,
       sourceTabId,
+      text: payload.text,
+      media: payload.media,
     });
   } else if (payload.t === 'commit') {
     handleLinkCommit(contents, payload);
@@ -999,6 +1144,9 @@ function handleLinkMessage(contents, raw) {
 function closeLinkDialog() {
   if (linkDialogWin && !linkDialogWin.isDestroyed()) {
     try { linkDialogWin.close(); } catch { /* already gone */ }
+    // The options were consumed (or dismissed): the next double-click on
+    // any link gets a fresh dialog, not the cooldown's silence.
+    dialogCooldowns.clear();
   }
   linkDialogWin = null;
 }
@@ -1276,7 +1424,12 @@ function registerIPC() {
     const pending = verifiedPopupOpens.find(item => item.url === url && Date.now() - item.at < 10000);
     if (pending) {
       verifiedPopupOpens.splice(verifiedPopupOpens.indexOf(pending), 1);
-      if (pending.watch) popunderWatches.set(view.webContents.id, { intendedUrl: pending.url, sourceUrl: pending.sourceUrl, createdAt: pending.at, viaLinkClick: pending.viaLinkClick === true });
+      if (pending.watch) {
+        popunderWatches.set(view.webContents.id, { intendedUrl: pending.url, sourceUrl: pending.sourceUrl, createdAt: pending.at, viaLinkClick: pending.viaLinkClick === true });
+        // The watch covers the redirect chain up to the first commit; a
+        // clean commit disarms it (a later user navigation is not a popup).
+        view.webContents.once('did-commit-navigation', () => popunderWatches.delete(view.webContents.id));
+      }
       popupTabByOpenUrl.set(url, id);
     }
     // An IMMEDIATE link open (published at the click, before its tab

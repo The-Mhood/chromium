@@ -234,7 +234,28 @@ function createPopupPolicy(options = {}) {
     const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
     entry.lastInputAt = now();
     entry.opens = 0;
+    entry.linkOpenUsed = false; // a fresh user action gets a fresh immediate slot
     entry.observed = true;
+    pageInput.set(contentsId, entry);
+  }
+
+  /** True when THIS activation has not yet used its one immediate
+   *  link-shaped open slot. The main process uses this as the fallback
+   *  when the isolated-world records are unavailable (DevTools down): the
+   *  first open of a real click may be the user's own link, so it keeps the
+   *  immediate path; every further open of the same activation is treated
+   *  as scripted (quota + verification) — an ad script that fires several
+   *  window.open() calls in the user's click handler cannot take them all. */
+  function firstGapLinkOpen(contentsId) {
+    const entry = pageInput.get(contentsId);
+    return !entry || entry.linkOpenUsed !== true;
+  }
+
+  /** Consume the activation's immediate slot (called when a link-shaped
+   *  open is admitted to the immediate path). */
+  function noteLinkOpenUsed(contentsId) {
+    const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
+    entry.linkOpenUsed = true;
     pageInput.set(contentsId, entry);
   }
 
@@ -272,13 +293,21 @@ function createPopupPolicy(options = {}) {
    *                                 seconds on ad-heavy pages — measuring
    *                                 against "now" is what starved fresh
    *                                 clicks of their gesture).
+   * @param {boolean} [p.treatAsScripted] classify a link-shaped disposition
+   *                                 as scripted (see isLinkClick above).
    * @returns {{ allowed: boolean, reason: string, needsCommit?: boolean, earlierUrl?: string }}
    */
   function classifyWindowOpen(p) {
     const { url, sourceUrl, disposition, tabCount, pageState, contentsId } = p;
     const atMs = typeof p.atMs === 'number' ? p.atMs : now();
     const { protection, allowlist } = settingsOf();
-    const isLinkClick = disposition === 'foreground-tab';
+    // `treatAsScripted`: the main process uses the isolated-world records to
+    // decide whether a link-shaped ("foreground-tab") open is really a link
+    // click. When it cannot confirm one (a window.open() record instead, or
+    // no records at all), it classifies the open as scripted so the
+    // per-activation quota, the repeat-popup rule and the hidden
+    // verification all apply — the disposition alone is not evidence.
+    const isLinkClick = disposition === 'foreground-tab' && p.treatAsScripted !== true;
 
     if (!protection.enabled || protection.popups === false) return { allowed: true, reason: 'protection-off', needsCommit: false };
     if (isAllowedDomain(sourceUrl, allowlist)) return { allowed: true, reason: 'allowlisted', needsCommit: false };
@@ -394,6 +423,8 @@ function createPopupPolicy(options = {}) {
     classifyWindowOpen,
     observeInput,
     freshInput,
+    firstGapLinkOpen,
+    noteLinkOpenUsed,
     forget,
     getRegistrableDomain,
   };

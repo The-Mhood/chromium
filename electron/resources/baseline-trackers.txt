@@ -1,5 +1,5 @@
 # ChromiumCore desktop baseline (baseline-trackers).
-# Generated 2026-11-26 from EasyPrivacy domains
+# Generated 2026-11-27 from EasyPrivacy domains
 # (android-tv/app/src/main/assets/blocklists/trackers.txt). Copyright the EasyList authors.
 # Licensed under GPLv3 / CC BY-SA 3.0. Convenience subset, not a substitute
 # for the full upstream lists, which replace this baseline at runtime.

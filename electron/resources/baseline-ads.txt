@@ -1,5 +1,5 @@
 # ChromiumCore desktop baseline (baseline-ads).
-# Generated 2026-11-26 from EasyList domains
+# Generated 2026-11-27 from EasyList domains
 # (android-tv/app/src/main/assets/blocklists/ads.txt). Copyright the EasyList authors.
 # Licensed under GPLv3 / CC BY-SA 3.0. Convenience subset, not a substitute
 # for the full upstream lists, which replace this baseline at runtime.
@@ -18432,6 +18432,7 @@
 ||hitcpm.com^
 ||hityyzyxbadim.online^
 ||hivestenchtoffee.com^
+||hivex.stream^
 ||hivfareylsymh.online^
 ||hivingtaxites.com^
 ||hivrngopujhjn.online^
@@ -21384,6 +21385,7 @@
 ||joyouschalk.com^
 ||jozispfsxhbmg.space^
 ||jozvfaesigdre.site^
+||jp.hillscodger.qpon^
 ||jpackipmxsufz.online^
 ||jpadxrydoiorz.online^
 ||jpavgtzkbjpwi.site^
