@@ -57,6 +57,34 @@ test('allowlisted sites are exempt from popup blocking', () => {
   assert.equal(decision.needsCommit, false);
 });
 
+test('freshInput: only real click/key input within the gesture window counts', () => {
+  const { policy, at } = makePolicy();
+  at(1_000_000);
+  // No input observed at all.
+  assert.equal(policy.freshInput(1, 1_000_100), false, 'nothing observed is never fresh');
+  // A real click is fresh inside the 1.5 s window...
+  at(1_000_000);
+  policy.observeInput(1, 'mouseDown');
+  assert.equal(policy.freshInput(1, 1_000_100), true, 'a mouse click is fresh');
+  assert.equal(policy.freshInput(1, 1_001_499), true, '...right up to the window edge');
+  // ...and stale after it.
+  assert.equal(policy.freshInput(1, 1_001_501), false, 'a click older than the window is stale');
+  // Other contents are unaffected.
+  assert.equal(policy.freshInput(2, 1_000_100), false, 'input is per-contents');
+  // Hover, movement and scroll are NOT activation: a page whose only
+  // "input" is the cursor passing over it must not get popup activation.
+  at(2_000_000);
+  policy.observeInput(3, 'mouseEnter');
+  policy.observeInput(3, 'mouseLeave');
+  policy.observeInput(3, 'mouseMove');
+  policy.observeInput(3, 'mouseWheel');
+  assert.equal(policy.freshInput(3, 2_000_100), false, 'hover/move/scroll never count');
+  // Keyboard counts (Enter/Space on a focused link is a click).
+  at(2_000_000);
+  policy.observeInput(4, 'keyDown');
+  assert.equal(policy.freshInput(4, 2_000_100), true, 'key input counts');
+});
+
 test('listed ad or threat destinations are blocked even on a real gesture', () => {
   const { policy, at } = makePolicy();
   at(1_000_500);

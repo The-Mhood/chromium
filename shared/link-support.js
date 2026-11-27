@@ -5,20 +5,25 @@
  * runs, in its own isolated world (the page cannot observe, reset or fake
  * what happens here). It implements the DOUBLE-CLICK link options:
  *
- *   * a plain left click on a link suppresses ONLY the browser's default
+ *   * a plain left click on a target=_blank / _new link is NOT suppressed:
+ *     the browser opens the tab IMMEDIATELY (the intended single-click
+ *     behaviour — no waiting), and the main process applies the full popup
+ *     policy to that native open (real-input evidence, filters, dedup) and
+ *     publishes the tab at once. If a SECOND click lands on the same anchor
+ *     within the double window, the main process is asked to close the
+ *     just-opened tab and open the link-options dialog instead — the
+ *     double-click is detected at the user's own click interval (up to the
+ *     OS double-click window), not by racing a 300 ms timer;
+ *   * a plain left click on any OTHER link (same-frame, target=_top /
+ *     _parent, media, `download`) suppresses ONLY the browser's default
  *     navigation — the page's own handlers still run (we never stop
- *     propagation) — and defers the action COMMIT_DELAY_MS;
- *   * if a second click lands on the same anchor within the double window,
- *     the deferred navigation is cancelled and the main process is asked to
- *     open the link-options dialog (no single-click navigation ever happens
- *     for a double-click);
+ *     propagation) — and defers the action COMMIT_DELAY_MS; a second click
+ *     on the same anchor cancels the deferral and opens the dialog;
  *   * otherwise the click is committed exactly as the browser would have
- *     done it: same-frame navigation, target=_blank handled by the main
- *     process (so the full popup protection still applies), target=_top /
- *     _parent across origins handled by the main process, and media files
- *     or anchors with a `download` attribute routed to the main process
- *     download pipeline (which keeps the save dialog and the ad/threat
- *     checks);
+ *     done it: same-frame navigation, target=_top / _parent across origins
+ *     handled by the main process, and media files or anchors with a
+ *     `download` attribute routed to the main process download pipeline
+ *     (which keeps the save dialog and the ad/threat checks);
  *   * SPA guard: if the page's own handlers already changed the document URL
  *     (router pushState & co.) between the click and the commit, no second
  *     navigation is performed.
@@ -42,7 +47,7 @@
     var COMMIT_DELAY_MS = 300;  // how long a single click waits before it commits
     var SECOND_CLICK_MS = 600;  // a second click on the same anchor within this span is a double-click
 
-    var state = { pending: null, last: null, cooldownUntil: 0 };
+    var state = { pending: null, last: null, lastBlank: null, cooldownUntil: 0 };
 
     function emit(payload) {
       try { console.log(MAGIC + JSON.stringify(payload)); } catch (error) { /* channel unavailable; the page must not break */ }
@@ -125,12 +130,9 @@
           emit({ t: 'commit', url: p.href, target: 'download', isTop: info.isTop, crossOrigin: info.crossOrigin });
           return;
         }
-        if (target === '_blank' || target === '_new') {
-          // The main process opens the tab through the full popup policy
-          // (this commit came from a real click on a real anchor).
-          emit({ t: 'commit', url: p.href, target: 'blank', isTop: info.isTop, crossOrigin: info.crossOrigin });
-          return;
-        }
+        // (Plain target=_blank clicks are never deferred — they open the tab
+        // natively and immediately; the click handler does not route them
+        // through this commit path any more.)
         if ((target === '_top' || target === '_parent') && !info.isTop) {
           if (!info.crossOrigin) {
             try {
@@ -164,6 +166,30 @@
         if (!anchor) return;
         var href = safeHref(anchor);
         if (!href) return;
+
+        // Links that open a NEW TAB: do not touch the default action. The
+        // browser opens the tab immediately (a single click gets its tab
+        // NOW — waiting for a possible second click is what made new-tab
+        // links feel dead), and the main process applies the full popup
+        // policy to that native open and publishes the tab at once.
+        // A second click on the SAME anchor within the double window is a
+        // double-click: the main process closes the just-opened tab and
+        // shows the options dialog instead. (Media links and anchors with a
+        // `download` attribute keep the deferred path: their single click
+        // belongs to the download pipeline, and the dialog offers the
+        // "Download attached media" action.)
+        var target = (anchor.target || '').toLowerCase();
+        if ((target === '_blank' || target === '_new') && !anchor.download && !isMediaUrl(href)) {
+          state.last = { anchor: anchor, href: href, at: Date.now() };
+          if (state.lastBlank && state.lastBlank.anchor === anchor && Date.now() - state.lastBlank.at < SECOND_CLICK_MS) {
+            state.lastBlank = null;
+            state.cooldownUntil = Date.now() + 400;
+            openDialog();
+            return;
+          }
+          state.lastBlank = { anchor: anchor, href: href, at: Date.now() };
+          return;
+        }
 
         // Second click on the anchor we just deferred: a double-click.
         // Cancel the single-click navigation and open the options dialog —
@@ -203,13 +229,28 @@
     document.addEventListener('dblclick', function (event) {
       try {
         if (!event.isTrusted) return; // synthetic events are never a double-click
+        var nodes = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+        var i;
         if (state.pending) {
-          var nodes = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
-          for (var n = 0; n < nodes.length; n += 1) {
-            if (nodes[n] === state.pending.anchor) {
+          for (i = 0; i < nodes.length; i += 1) {
+            if (nodes[i] === state.pending.anchor) {
               var lastHref = state.pending.href;
               state.last = { anchor: state.pending.anchor, href: lastHref, at: Date.now() };
               cancelPending();
+              state.cooldownUntil = Date.now() + 400;
+              openDialog();
+              return;
+            }
+          }
+        }
+        // Same safety net for new-tab links: the first click already let the
+        // browser open the tab, so the dialog message here also tells the
+        // main process to close that tab.
+        if (state.lastBlank) {
+          for (i = 0; i < nodes.length; i += 1) {
+            if (nodes[i] === state.lastBlank.anchor) {
+              state.last = { anchor: state.lastBlank.anchor, href: state.lastBlank.href, at: Date.now() };
+              state.lastBlank = null;
               state.cooldownUntil = Date.now() + 400;
               openDialog();
               return;

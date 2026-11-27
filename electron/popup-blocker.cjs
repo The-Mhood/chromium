@@ -225,10 +225,12 @@ function createPopupPolicy(options = {}) {
   }
 
   /** The main process reports input delivered to the page. Only key/click
-   *  input grants popup activation: scrolling (mouseWheel) is continuous and
-   *  would let a page fire a popup on every scroll position. */
+   *  input grants popup activation: scrolling (mouseWheel), mouse movement
+   *  and hover (mouseEnter/mouseLeave) are continuous and would let a page
+   *  fire a popup on every position the user's cursor passed over — being
+   *  present is not the same as intending to act. */
   function observeInput(contentsId, type) {
-    if (!type || type === 'mouseMove' || type === 'keyUp' || type === 'mouseUp' || type === 'mouseWheel') return;
+    if (!type || type === 'mouseMove' || type === 'mouseEnter' || type === 'mouseLeave' || type === 'keyUp' || type === 'mouseUp' || type === 'mouseWheel') return;
     const entry = pageInput.get(contentsId) || { lastInputAt: 0, opens: 0, observed: false };
     entry.lastInputAt = now();
     entry.opens = 0;
@@ -370,6 +372,20 @@ function createPopupPolicy(options = {}) {
     repeatCrossOriginClicks.delete(contentsId);
   }
 
+  /** True when REAL input (click/key) was observed on this contents within
+   *  the gesture window — the synchronous, CDP-independent half of the
+   *  gesture check. The main process uses it to decide a genuine link
+   *  click WITHOUT waiting for the isolated-world state read (which can
+   *  take seconds on ad-heavy pages): every genuine click necessarily
+   *  passed through the browser's input pipeline, so if no input was seen
+   *  here, the open is not user-driven and can be denied immediately. */
+  function freshInput(contentsId, atMs) {
+    const entry = pageInput.get(contentsId);
+    if (!entry || !entry.lastInputAt) return false;
+    const stamp = typeof atMs === 'number' ? atMs : now();
+    return stamp - entry.lastInputAt <= GESTURE_WINDOW_MS;
+  }
+
   return {
     GESTURE_WINDOW_MS,
     REPEAT_WINDOW_MS,
@@ -377,6 +393,7 @@ function createPopupPolicy(options = {}) {
     WATCH_TTL_MS,
     classifyWindowOpen,
     observeInput,
+    freshInput,
     forget,
     getRegistrableDomain,
   };

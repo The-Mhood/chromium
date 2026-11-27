@@ -101,6 +101,7 @@ class MainActivity : Activity() {
 
     private var customView: View? = null
     private var customCallback: WebChromeClient.CustomViewCallback? = null
+    private var previousSystemUiVisibility: Int = 0
     private var cosmeticScript: String? = null
     private var cosmeticHandle: ScriptHandler? = null
     private var shieldTemplate: String? = null

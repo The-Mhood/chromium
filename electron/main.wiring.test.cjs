@@ -50,8 +50,16 @@ const calls = {
 //   worldContexts  context ids reported for each isolated world
 const cdpStub = { pageStateEnabled: false, stateValue: null, attachEnabled: false, delayMs: 0, injectedScripts: [] };
 cdpStub.worldContexts = new Map(); // worldName -> nextContextId
-let cdpMessageListener = null; // the main process' CDP 'message' listener
-const emitCdp = (method, params) => { if (cdpMessageListener) cdpMessageListener(method, params); };
+// CDP 'message' listeners are PER CONTENTS (each webContents registers its
+// own in syncPageScripts). The map keeps them all; the bare variable is the
+// LAST-registered one, so emitCdp(method, params) without a target keeps
+// working for single-tab scenarios.
+cdpStub.messageListeners = new Map(); // webContents -> fn
+let cdpMessageListener = null;
+const emitCdp = (method, params, targetWc = null) => {
+  const fn = targetWc ? cdpStub.messageListeners.get(targetWc) : cdpMessageListener;
+  if (fn) fn(method, params);
+};
 let nextPopupContext = 100;
 
 const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chromiumcore-wiring-'));
@@ -80,7 +88,16 @@ function makeWebContents(id) {
     send: (channel, payload) => calls.sends.push({ id, channel, payload }),
     setWindowOpenHandler: fn => { wc.__openHandler = fn; },
     on: (event, fn) => { listeners.set(event, [...(listeners.get(event) || []), fn]); },
-    emit: (event, ...args) => { for (const fn of listeners.get(event) || []) fn(...args); },
+    once: (event, fn) => {
+      const wrapper = (...args) => {
+        const fns = listeners.get(event) || [];
+        const idx = fns.indexOf(wrapper);
+        if (idx >= 0) fns.splice(idx, 1);
+        fn(...args);
+      };
+      listeners.set(event, [...(listeners.get(event) || []), wrapper]);
+    },
+    emit: (event, ...args) => { for (const fn of [...(listeners.get(event) || [])] || []) fn(...args); },
     debugger: {
       // attach() throws by default (the document-start script path stays
       // degraded — the real app's failure mode); scenarios that need the
@@ -92,7 +109,7 @@ function makeWebContents(id) {
         if (!cdpStub.attachEnabled && !cdpStub.pageStateEnabled) throw new Error('CDP unavailable in wiring smoke (degraded path)');
         debuggerAttached = true;
       },
-      on: (event, fn) => { if (event === 'message') cdpMessageListener = fn; },
+      on: (event, fn) => { if (event === 'message') { cdpStub.messageListeners.set(wc, fn); cdpMessageListener = fn; } },
       sendCommand: (method, params) => {
         if (!cdpStub.attachEnabled && !cdpStub.pageStateEnabled) return Promise.reject(new Error('no CDP'));
         const later = promise => (cdpStub.delayMs > 0 ? new Promise(resolve => setTimeout(() => resolve(promise), cdpStub.delayMs)) : Promise.resolve(promise));
@@ -155,7 +172,15 @@ class BrowserWindowStub {
     if (onceFn) { this.__once.delete(event); onceFn(...args); }
   }
   show() { this.__shown = true; }
-  close() { this.__destroyed = true; this.emit('closed'); }
+  focus() {}
+  // A closed window leaves BrowserWindow.getAllWindows(), as in real
+  // Electron — destroyed dialogs/windows must not leak into later counts.
+  close() {
+    this.__destroyed = true;
+    const i = BrowserWindowStub.windows.indexOf(this);
+    if (i >= 0) BrowserWindowStub.windows.splice(i, 1);
+    this.emit('closed');
+  }
   isDestroyed() { return this.__destroyed; }
   getContentSize() { return [1440, 1000]; }
   setFullScreen(value) { this.__fullscreen = value; }
@@ -680,15 +705,13 @@ test('main process wiring (Electron stub)', async t => {
       assert.ok(!openPublished('https://sponsored-landing.example.org/clickpay'), 'the click-to-ad open was blocked');
       assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
       // The SAME destination with a real click works (the user's link is
-      // not what we are stopping).
+      // not what we are stopping) — and opens at once, not after a
+      // verification round trip.
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://sponsored-landing.example.org/clickpay', disposition: 'foreground-tab' });
       await settle();
-      const inspector = findInspector(known);
-      assert.ok(inspector, 'the identical open with a real click is verified');
-      inspector.webContents.emit('did-commit-navigation');
-      await new Promise(resolve => setTimeout(resolve, 50));
-      assert.ok(openPublished('https://sponsored-landing.example.org/clickpay'), 'the real-click open was published');
+      assert.ok(!findInspector(known), 'the real-click open does not wait on an inspector');
+      assert.ok(openPublished('https://sponsored-landing.example.org/clickpay'), 'the real-click open was published at once');
       await closeTabs('h-15');
     } finally {
       cdpStub.pageStateEnabled = false;
@@ -719,15 +742,16 @@ test('main process wiring (Electron stub)', async t => {
     }
   });
 
-  await t.test('cross-origin iframe link clicks: the first is verified, the second is blocked', async () => {
+  await t.test('cross-origin iframe link clicks: the first opens at once, the second is blocked', async () => {
     cdpStub.pageStateEnabled = true;
     try {
       const { view: page, known } = await freshTab('h-13', 'https://victim.example.com/');
       // The user clicks a target=_blank link in a cross-origin iframe. No
       // window.open is ever called — the browser opens the tab directly and
       // the only record of who initiated it is the click record (cross-origin
-      // frame, href = the destination). First such click-open: allowed with
-      // commit verification (the destination is still vetted)...
+      // frame, href = the destination). First such click-open: allowed and
+      // published IMMEDIATELY (the click is real; the destination's own
+      // redirects stay checked as they happen)...
       cdpStub.stateValue = {
         open: null,
         click: { t: Date.now(), isTop: false, crossOrigin: true, frameHost: 'adunit.net', topHost: 'victim.example.com', href: 'https://sponsored-offers.example.org/deal' },
@@ -735,12 +759,8 @@ test('main process wiring (Electron stub)', async t => {
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://sponsored-offers.example.org/deal', disposition: 'foreground-tab' });
       await settle();
-      const inspector = findInspector(known);
-      assert.ok(inspector, 'the first cross-origin link click is verified, not blocked');
-      assert.ok(!openPublished('https://sponsored-offers.example.org/deal'), 'no chip before the commit');
-      inspector.webContents.emit('did-commit-navigation');
-      await new Promise(resolve => setTimeout(resolve, 50));
-      assert.ok(openPublished('https://sponsored-offers.example.org/deal'), 'the verified destination was published');
+      assert.ok(!findInspector(known), 'a real link click no longer waits on a hidden inspector');
+      assert.ok(openPublished('https://sponsored-offers.example.org/deal'), 'the first cross-origin link click was published at once');
       // An ad unit firing a SECOND cross-origin click-through within the
       // repeat window (same tab!) is blocked outright — the rate limit still
       // catches the click-to-paywall pattern a window.open-only check misses.
@@ -751,7 +771,7 @@ test('main process wiring (Electron stub)', async t => {
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://sponsored-offers.example.org/deal-3', disposition: 'foreground-tab' });
       await settle();
-      assert.ok(!findInspector(known), 'the second cross-origin click was blocked (no verification, nothing created)');
+      assert.ok(!findInspector(known), 'the second cross-origin click was blocked (nothing created)');
       assert.ok(!openPublished('https://sponsored-offers.example.org/deal-3'), 'no chip for the repeat');
     } finally {
       await closeTabs('h-13');
@@ -777,11 +797,8 @@ test('main process wiring (Electron stub)', async t => {
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://docs.example.com/guide', disposition: 'foreground-tab' });
       await settle();
-      const inspector = findInspector(known);
-      assert.ok(inspector, 'a top-frame link click is verified, not blocked');
-      inspector.webContents.emit('did-commit-navigation');
-      await new Promise(resolve => setTimeout(resolve, 50));
-      assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate top-frame link was published');
+      assert.ok(!findInspector(known), 'a top-frame link click is not held in an inspector');
+      assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate top-frame link was published at once');
     } finally {
       await closeTabs('h-14');
       cdpStub.pageStateEnabled = false;
@@ -789,19 +806,16 @@ test('main process wiring (Electron stub)', async t => {
     }
   });
 
-  await t.test('legitimate: a clicked link to an honest site still opens a working tab', async () => {
+  await t.test('legitimate: a clicked link to an honest site opens a working tab immediately', async () => {
     const { view: page, known } = await freshTab('h-12', 'https://victim.example.com/');
     const viewsBefore = winStub().contentView.__views.length;
     clickOn(page.webContents);
     page.webContents.__openHandler({ url: 'https://docs.example.com/guide', disposition: 'foreground-tab' });
     await settle();
-    const inspector = findInspector(known);
-    assert.ok(inspector, 'an inspector appeared');
-    assert.equal(inspector.__visible, false, 'verification stays invisible');
-    // The destination holds: no redirect, no jump.
-    inspector.webContents.emit('did-commit-navigation');
-    await new Promise(resolve => setTimeout(resolve, 50));
-    assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate link was published');
+    // The tab chip is published AT THE CLICK — no hidden inspector, no
+    // verification round trip, no DevTools state read on the critical path.
+    assert.ok(!findInspector(known), 'a real link click does not wait on verification');
+    assert.ok(openPublished('https://docs.example.com/guide'), 'the legitimate link was published at once');
     // The renderer opens it; the tab is a real, visible, navigated tab.
     const tab = await freshTab('tab-h12', 'https://docs.example.com/guide');
     known.add(tab.view);
@@ -847,11 +861,12 @@ test('main process wiring (Electron stub)', async t => {
     }
   });
 
-  await t.test('site links (the fmhy.net failure): a fresh click opens even when the destination redirects across domains', async () => {
+  await t.test('site links (the fmhy.net failure): a fresh click opens at once, no DevTools needed', async () => {
     // No CDP at all — the exact degraded path the packaged app was on.
-    // The click is still admitted because the main process observes it in
-    // the browser's input pipeline (before-mouse-event), independent of
-    // the DevTools read that fails on ad-heavy pages.
+    // The click is admitted SYNCHRONOUSLY from the browser's input pipeline
+    // (before-mouse-event): no DevTools state read on the critical path, so
+    // an ad-heavy page's congested DevTools session can neither delay nor
+    // deny the user's real click.
     cdpStub.pageStateEnabled = false;
     cdpStub.attachEnabled = false;
     try {
@@ -859,19 +874,105 @@ test('main process wiring (Electron stub)', async t => {
       clickOn(page.webContents);
       page.webContents.__openHandler({ url: 'https://fmhy.net/movie/watch-123', disposition: 'foreground-tab' });
       await settle();
-      const inspector = findInspector(known);
-      assert.ok(inspector, 'a fresh link click is allowed for verification, not blocked');
-      assert.ok(!openPublished('https://fmhy.net/movie/watch-123'), 'no chip before the destination commits');
-      // The site's 302 hops to its player/CDN domain. For a link click this
-      // is the user following the site's redirects — NOT a popunder — so the
-      // verified open is published (the chip carries the FINAL url: where
-      // the tab actually lands).
-      inspector.webContents.__url = 'https://player-cdn.example.net/embed/123';
-      inspector.webContents.emit('did-commit-navigation');
-      await new Promise(resolve => setTimeout(resolve, 50));
-      assert.ok(openPublished('https://player-cdn.example.net/embed/123'), 'the link click that redirected across domains was published');
+      assert.ok(!findInspector(known), 'the fresh link click is not held in an inspector');
+      assert.ok(openPublished('https://fmhy.net/movie/watch-123'), 'the fresh link click was published at once (no CDP)');
+      // The renderer materialises the tab. The site's 302 hops to its
+      // player/CDN domain — for a link click that is the user following the
+      // site's own redirects, and the redirect stays checked as it happens
+      // (a listed ad would close the tab; an honest CDN does not).
+      const tab = await freshTab('fmhy-tab-1', 'https://fmhy.net/movie/watch-123');
+      tab.view.webContents.emit('will-redirect', {}, 'https://player-cdn.example.net/embed/123');
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.ok(known.has(tab.view) || winStub().contentView.__views.includes(tab.view), 'the honest cross-domain redirect kept the tab');
     } finally {
-      await closeTabs('fmhy-1');
+      await closeTabs('fmhy-1', 'fmhy-tab-1');
+    }
+  });
+
+  await t.test('dedup: five rapid clicks on the same new-tab link open exactly ONE tab (dropped, never queued)', async () => {
+    const { view: page } = await freshTab('dd-1', 'https://victim.example.com/');
+    const url = 'https://docs.example.com/same-link';
+    const opens = () => calls.sends.filter(s => s.channel === 'core:open-tab' && s.payload.url === url).length;
+    const before = opens();
+    // Five rapid clicks: each click is REAL (fresh pipeline evidence every
+    // time), so the burst can only be stopped by dedup, not by evidence.
+    for (let i = 0; i < 5; i += 1) {
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+    await settle();
+    assert.equal(opens(), before + 1, 'exactly one tab was published for five clicks — nothing accumulated');
+    // The pending window has expired: a later deliberate click opens again
+    // (the user's link is not permanently stuck).
+    await new Promise(resolve => setTimeout(resolve, 1600));
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+    await settle();
+    assert.equal(opens(), before + 2, 'after the dedup window a new click opens a new tab');
+    await closeTabs('dd-1');
+  });
+
+  await t.test('an immediate link tab whose destination redirects to a listed ad is closed promptly', async () => {
+    const { view: page } = await freshTab('rt-1', 'https://victim.example.com/');
+    const url = 'https://redirector.example.com/gate';
+    clickOn(page.webContents);
+    page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+    await settle();
+    assert.ok(openPublished(url), 'the click opened the tab (the declared destination itself is not listed)');
+    // The renderer materialises the tab; the redirect check is armed.
+    const tab = await freshTab('rt-tab', url);
+    // The destination 302s to a listed ad network — checked as it happens,
+    // and the tab is rejected (closed) promptly, not "allowed and closed later".
+    tab.view.webContents.emit('will-redirect', {}, 'https://pagead2.googlesyndication.com/landing');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.ok(!winStub().contentView.__views.includes(tab.view), 'the redirect-to-ad closed the tab');
+    assert.ok(calls.sends.some(s => s.channel === 'core:popup-blocked'), 'the block was reported');
+    await closeTabs('rt-1', 'rt-tab');
+  });
+
+  await t.test('double-click on a new-tab link: the first click tab closes and the dialog opens', async () => {
+    cdpStub.pageStateEnabled = true;
+    cdpStub.attachEnabled = true;
+    try {
+      const { view: page } = await freshTab('db-1', 'https://site.test/page');
+      // Wait for syncPageScripts to attach CDP and register the message listener.
+      const started = Date.now();
+      while (!cdpMessageListener && Date.now() - started < 2000) await new Promise(resolve => setTimeout(resolve, 25));
+      const linkContextId = 4000;
+      emitCdp('Runtime.executionContextCreated', { context: { id: linkContextId, name: 'cc-links' } });
+      const url = 'https://site.test/article';
+      // Click 1: the browser opens the tab natively; main publishes it at once.
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(openPublished(url), 'the single click opened the tab');
+      // The renderer materialises the tab (what the real renderer does on core:open-tab).
+      const tab = await freshTab('db-tab', url);
+      assert.ok(winStub().contentView.__views.includes(tab.view), 'the first click tab exists');
+      // Click 2 within the double window: the isolated script emits the
+      // dialog message — from the PAGE's own world (targeted: each
+      // webContents has its own CDP message listener).
+      emitCdp('Runtime.consoleAPICalled', { type: 'log', executionContextId: linkContextId, args: [{ type: 'string', value: '%CC-LINK% ' + JSON.stringify({ t: 'dialog', url, text: 'Article', media: false, isTop: true, crossOrigin: false }) }] }, page.webContents);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.ok(!winStub().contentView.__views.includes(tab.view), 'the double-click closed the first click tab');
+      assert.ok(calls.sends.some(s => s.channel === 'core:tab-closed' && s.payload.id === 'db-tab'), 'the renderer was told the tab closed');
+      const dialogsNow = BrowserWindowStub.windows.filter(w => w.__dialog);
+      assert.equal(dialogsNow.length, 1, 'the link-options dialog opened');
+      assert.equal(dialogsNow.at(-1).__shown, true, 'the dialog is shown');
+      // "Open in new tab" from the dialog re-opens the link (the key was
+      // released when the tab closed) — the double-click did not eat the
+      // user's intent, it offered it as a choice.
+      const dialogEvent = { sender: dialogsNow.at(-1).webContents, senderFrame: dialogsNow.at(-1).webContents.mainFrame };
+      const opensBefore = calls.sends.filter(s => s.channel === 'core:open-tab' && s.payload.url === url).length;
+      await calls.ipcHandles.get('core:dialog')(dialogEvent, 'open-tab', { url, sourceTabId: 'db-1' });
+      await settle();
+      assert.equal(calls.sends.filter(s => s.channel === 'core:open-tab' && s.payload.url === url).length, opensBefore + 1, 'the dialog action re-opened the link');
+    } finally {
+      await closeTabs('db-1', 'db-tab');
+      for (const w of BrowserWindowStub.windows.filter(w => w.__dialog)) if (!w.__destroyed) w.close();
+      cdpStub.pageStateEnabled = false;
+      cdpStub.attachEnabled = false;
     }
   });
 
@@ -966,21 +1067,19 @@ test('main process wiring (Electron stub)', async t => {
       const commit = over => emitCdp('Runtime.consoleAPICalled', { type: 'log', executionContextId: linkContextId, args: [{ type: 'string', value: '%CC-LINK% ' + JSON.stringify(over) }] });
 
       // target=_blank with NO recent input (a page script "double-clicked"
-      // the anchor): the open is denied by the policy exactly like any other
-      // unattributed open.
+      // the anchor): the open is denied — no real input passed through the
+      // browser's input pipeline, so the commit carries no evidence.
       commit({ t: 'commit', url: 'https://site.test/blank-no-gesture', text: 'x', media: false, isTop: true, crossOrigin: false, target: 'blank' });
       await settle();
-      assert.ok(!openPublished('https://site.test/blank-no-gesture'), 'an unattributed blank commit is blocked');
+      assert.ok(!openPublished('https://site.test/blank-no-gesture'), 'a blank commit without real input is blocked');
 
-      // With a real click, the blank commit is verified and published.
+      // With a real click, the blank commit is published at once (the same
+      // immediate path a native target=_blank open gets).
       clickOn(page.webContents);
       commit({ t: 'commit', url: 'https://site.test/blank-ok', text: 'x', media: false, isTop: true, crossOrigin: false, target: 'blank' });
       await settle();
-      const inspector = findInspector(known);
-      assert.ok(inspector, 'the clicked blank commit is verified');
-      inspector.webContents.emit('did-commit-navigation');
-      await new Promise(resolve => setTimeout(resolve, 50));
-      assert.ok(openPublished('https://site.test/blank-ok'), 'the verified blank commit was published');
+      assert.ok(!findInspector(known), 'the clicked blank commit does not wait on verification');
+      assert.ok(openPublished('https://site.test/blank-ok'), 'the clicked blank commit was published at once');
 
       // A same-document commit navigates the TAB (no new window at all).
       const urlBefore = page.webContents.__url;
