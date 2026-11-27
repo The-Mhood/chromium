@@ -343,6 +343,26 @@ function createPopupPolicy(options = {}) {
         return { allowed: false, reason: 'repeat-cross-origin-click', needsCommit: false };
       }
     }
+    // CAPTCHA-GATED POPUP: the user's most recent real click happened in a
+    // THIRD-PARTY iframe (a reCAPTCHA checkbox is the canonical shape) and
+    // a top-frame script is now opening a window. Ad networks gate popups
+    // behind captcha completion to borrow a genuine user gesture: the open
+    // record looks scripted-with-fresh-input, and the destination names
+    // itself (window.open('https://adnet/…') commits to adnet, so intended
+    // === final and the domain-fidelity rule cannot see it). A scripted
+    // open FROM the widget's own frame is already blocked above
+    // (ad-iframe); a user who clicked a LINK in a third-party widget is a
+    // link click and never reaches this classify (exact-href routing).
+    if (!isLinkClick) {
+      const openRecord = pageState && pageState.open;
+      const clickRecord = pageState && pageState.click;
+      if (openRecord && openRecord.crossOrigin !== true &&
+          clickRecord && clickRecord.crossOrigin === true &&
+          typeof clickRecord.t === 'number' && typeof openRecord.t === 'number' &&
+          clickRecord.t <= openRecord.t + 2000) {
+        return { allowed: false, reason: 'gated-popup', needsCommit: false };
+      }
+    }
     if (tabCount >= maxTabs) return { allowed: false, reason: 'tab-budget', needsCommit: false };
 
     // Repeat rule (SCRIPTED opens only): this page already got a script

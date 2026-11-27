@@ -96,7 +96,21 @@ function makeWebContents(id) {
       }
       return Promise.resolve();
     },
-    executeJavaScript: async () => 96,
+    executeJavaScript: async (expr) => {
+      // The media-pause poll asks for the state of the media element under
+      // the document's fullscreen element; the release path asks the page
+      // to end its own fullscreen (which, in real Chromium, fires
+      // leave-html-full-screen — model that here so the test exercises the
+      // real event path).
+      if (typeof expr === 'string' && expr.includes('fullscreenElement') && expr.includes('paused')) {
+        return wc.__mediaState ? { paused: wc.__mediaState.paused, ended: wc.__mediaState.ended } : null;
+      }
+      if (typeof expr === 'string' && expr.includes('exitFullscreen')) {
+        if (wc.__mediaState) wc.emit('leave-html-full-screen');
+        return undefined;
+      }
+      return 96;
+    },
     insertCSS: async () => `css-${id}-${Math.random().toString(36).slice(2)}`,
     removeInsertedCSS: async () => {},
     close: () => {},
@@ -525,6 +539,71 @@ test('main process wiring (Electron stub)', async t => {
     await new Promise(resolve => setTimeout(resolve, 6600));
     assert.equal(view.__visible, true, 'the gate failed open after the timeout');
     await closeTabs('gate-2');
+  });
+
+  await t.test('hostile: a captcha-gated ad popup (click in a third-party iframe, open from the top frame) is blocked', async () => {
+    // Field bug: the user checks a reCAPTCHA box inside a third-party
+    // iframe; the ad script then window.opens its landing page from the
+    // TOP frame. The click is genuine and fresh, but it landed in a
+    // different frame than the scripted open — a third-party-widget click
+    // must not authorize a top-frame scripted open.
+    cdpStub.pageStateEnabled = true;
+    try {
+      const { view: page } = await freshTab('gate-3', 'https://victim.example.com/');
+      const viewsBefore = winStub().contentView.__views.length;
+      const now = Date.now();
+      cdpStub.stateValue = {
+        click: { t: now - 80, isTop: false, crossOrigin: true, frameHost: 'accounts.google.com', topHost: 'victim.example.com' },
+        open: { t: now, isTop: true, crossOrigin: false, frameHost: 'victim.example.com', topHost: 'victim.example.com' },
+      };
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: 'https://promo.example.com/landing', disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(!openPublished('https://promo.example.com/landing'), 'the captcha-gated popup was blocked');
+      assert.equal(winStub().contentView.__views.length, viewsBefore, 'nothing was created');
+      await closeTabs('gate-3');
+    } finally {
+      cdpStub.pageStateEnabled = false;
+      cdpStub.stateValue = null;
+    }
+  });
+
+  await t.test('fullscreen: pausing the media releases BOTH the media and the browser fullscreen', async () => {
+    const { view } = await freshTab('fs-p', 'https://video.example.com/watch');
+    const wc = view.webContents;
+    // The user takes the browser fullscreen, then plays the video in
+    // media fullscreen.
+    calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
+    assert.equal(winStub().__fullscreen, true, 'browser fullscreen entered');
+    wc.emit('enter-html-full-screen');
+    wc.__mediaState = { paused: false, ended: false };
+    // Playback: the session must persist (two poll cycles pass).
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(winStub().__fullscreen, true, 'browser fullscreen persists while the media plays');
+    // The user pauses the video.
+    wc.__mediaState = { paused: true, ended: false };
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(winStub().__fullscreen, false, 'pausing released the browser fullscreen');
+    const state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(state.payload, { media: false, window: false }, 'the media session ended too');
+    wc.__mediaState = null;
+    await closeTabs('fs-p');
+  });
+
+  await t.test('fullscreen: going back on the media tab releases the fullscreen session', async () => {
+    const { view } = await freshTab('fs-b', 'https://video.example.com/watch');
+    const wc = view.webContents;
+    calls.ipcOn.get('core:window')(fakeEvent(), 'fullscreen');
+    wc.emit('enter-html-full-screen');
+    wc.__mediaState = { paused: false, ended: false };
+    // The user presses the page's back button: a different document
+    // commits and the media session ends with it.
+    wc.emit('did-navigate', 'https://video.example.com/');
+    assert.equal(winStub().__fullscreen, false, 'back released the browser fullscreen');
+    const state = calls.sends.filter(s => s.channel === 'core:fullscreen-state').at(-1);
+    assert.deepEqual(state.payload, { media: false, window: false }, 'the media session ended too');
+    wc.__mediaState = null;
+    await closeTabs('fs-b');
   });
 
   // The vivarium-style burst: a page that fires one popup per click. The
