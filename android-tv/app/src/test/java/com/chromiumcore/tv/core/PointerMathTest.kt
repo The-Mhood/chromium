@@ -112,7 +112,9 @@ class PointerMathTest {
         // where OK clicks).
         assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.DOWN, bounds, firstStep, false, true))
         assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.UP, bounds, firstStep, false, true))
-        // Pointer 20px below the top — one press reaches it: UP keeps moving the pointer.
+        // Pointer 20px below the top — one press reaches it, landing EXACTLY on the top edge
+        // (y - step == top): UP must move the pointer there — the site header gets its hover —
+        // not jump straight to the toolbar.
         assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(20f, Direction.UP, bounds, firstStep, false, true))
         // Pointer at the very top of the page with nothing above: the press is aimed at
         // the toolbar (the caller fires it only on a fresh press, not on repeats).
@@ -135,12 +137,15 @@ class PointerMathTest {
     }
 
     @Test
-    fun anEmptyBoundsCannotBePushedIntoTheToolbar() {
-        // Not-yet-laid-out area (top == bottom): the "pointer at the very top" test must not
-        // fire, so an early press moves the pointer (which clamps) instead of jumping to the
-        // toolbar.
-        val empty = PointerBounds(0f, 5f, 0f, 5f)
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(5f, Direction.UP, empty, firstStep, false, false))
+    fun anUnlaidOutAreaCannotBePushedIntoTheToolbar() {
+        // Before the WebView has its first layout, pointerBounds() returns an inverted area
+        // (right < left, bottom < top). The "pointer at the very top" test must not fire on
+        // such an area, so an early press moves the pointer (which clamps) instead of jumping
+        // to the toolbar.
+        val inverted = PointerBounds(0f, 0f, -1f, -1f)
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(0f, Direction.UP, inverted, firstStep, false, false))
+        // And on a laid-out page the same press at the top of the page aims at the toolbar.
+        assertEquals(PointerAction.FOCUS_TOOLBAR, PointerMath.scrollDecision(0f, Direction.UP, bounds, firstStep, false, false))
     }
 
     @Test

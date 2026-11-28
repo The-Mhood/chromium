@@ -78,9 +78,11 @@ object PointerMath {
             Direction.UP -> when {
                 canScrollUp -> PointerAction.SCROLL_UP
                 // Page at the top: if the pointer can still climb the page, let it reach the
-                // site header; only when it is at the very top does the press aim at the
-                // toolbar. (The bounds guard keeps a not-yet-laid-out, empty area benign.)
-                bounds.bottom >= bounds.top && y - stepPx <= bounds.top -> PointerAction.FOCUS_TOOLBAR
+                // site header — it may land exactly on the top edge (y - stepPx == top),
+                // where OK clicks the header content — so only a press that would overshoot
+                // past the top aims at the toolbar. (The bounds guard keeps a not-yet-laid-out,
+                // inverted area benign.)
+                bounds.bottom >= bounds.top && y - stepPx < bounds.top -> PointerAction.FOCUS_TOOLBAR
                 else -> PointerAction.MOVE_POINTER
             }
             Direction.LEFT, Direction.RIGHT -> PointerAction.MOVE_POINTER
