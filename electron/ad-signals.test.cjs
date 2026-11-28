@@ -13,9 +13,12 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { looksLikeAdCampaignUrl } = require('./ad-signals.cjs');
+const { looksLikeAdCampaignUrl, adCampaignMatch } = require('./ad-signals.cjs');
 
 const LWTZ = 'https://lwtz.com/1838/en.html?pb=27275087&browser=other&campaignid=1808628&city=lagos&country=NG&device=desktop&expires=1795861524&p=105.127.10.165&md5lp=lyXB9Y38wVoXLAciW';
+// The second field shape (Nov 2026): a rotating ad router that redirects to
+// a gambling landing. The campaign value `nortb_fallback` is the signal.
+const CORONIS = 'https://coronisoralogy.cfd/iEXfrTLgLulHSulz/154553/?context_data=abc123&param_3=nortb_fallback&md=9f8a7b6c5d4e';
 
 test('the field interstitial (lwtz.com) is detected', () => {
   assert.equal(looksLikeAdCampaignUrl(LWTZ), true, 'the reported ad landing is flagged');
@@ -36,6 +39,31 @@ test('the strong+weak cluster is detected without an IP echo', () => {
 
 test('two strong parameters are detected on their own', () => {
   assert.equal(looksLikeAdCampaignUrl('https://sweep.example.net/p?md5lp=abc&clickid=zzz'), true);
+});
+
+test('the named campaign fallback (param_3=nortb_fallback) is detected', () => {
+  // The reported coronisoralogy.cfd router shape.
+  assert.equal(looksLikeAdCampaignUrl(CORONIS), true, 'the coronis router is flagged');
+  // The value is the signal: it fires WITHOUT any weak cluster, so a
+  // network dropping a tracking param cannot evade it.
+  assert.equal(looksLikeAdCampaignUrl('https://rotator.example.net/x/1/?param_3=nortb_fallback'), true);
+  // The alternate param spelling (param3) is the same router.
+  assert.equal(looksLikeAdCampaignUrl('https://rotator.example.net/x/1/?param3=nortb_fallback&other=1'), true);
+  // The rule names itself for diagnostics.
+  const m = adCampaignMatch(CORONIS);
+  assert.equal(m && m.name, 'named-campaign-fallback');
+  // Case-insensitive on the value.
+  assert.equal(looksLikeAdCampaignUrl('https://rotator.example.net/x/1/?param_3=NORTB_FALLBACK'), true);
+});
+
+test('a plain param_3 with an ordinary value is NOT a campaign', () => {
+  // param_3 is an ordinary-looking name; only the nortb_fallback value is
+  // the ad fingerprint. Legit sites use param_N freely.
+  assert.equal(looksLikeAdCampaignUrl('https://site.example.com/form?param_3=step3&param_1=a&param_2=b'), false);
+  assert.equal(looksLikeAdCampaignUrl('https://site.example.com/page?param3=blue'), false);
+  // The value must match exactly — a substring is not the fingerprint.
+  assert.equal(looksLikeAdCampaignUrl('https://site.example.com/page?param_3=nortb_fallbackx'), false);
+  assert.equal(looksLikeAdCampaignUrl('https://site.example.com/page?param_3=not_nortb_fallback'), false);
 });
 
 test('ordinary sites are never flagged', () => {

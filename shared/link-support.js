@@ -52,7 +52,13 @@
     // and a deliberate "double click" at desk or TV distance simply never
     // registered, which is the "double click doesn't work" report.
     var COMMIT_DELAY_MS = 600;
-    var SECOND_CLICK_MS = 1000; // a second click/tap on the same anchor within this span is a double-click
+    // A second click/tap on the same anchor within this span is a
+    // double-click. Must match LINK_SECOND_CLICK_MS in the main process
+    // (1500 ms): a MANUAL double (trackpad two-finger tap, TV remote, a
+    // deliberate "click again") runs well past 1 s, and the old 1000 ms
+    // ceiling left a dead zone where the second click did nothing — the
+    // "double click doesn't work" report.
+    var SECOND_CLICK_MS = 1500;
 
     var state = { pending: null, last: null, lastBlank: null, rightTap: null, cooldownUntil: 0 };
 

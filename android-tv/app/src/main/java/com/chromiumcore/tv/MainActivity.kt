@@ -252,6 +252,13 @@ class MainActivity : Activity() {
                 progress.visibility = View.INVISIBLE
                 showUrl(url)
                 injectFallbackCosmetics()
+                // Consent / cookie dialogs typically appear right around load:
+                // refresh the scroll probe so the D-pad sees the dialog's
+                // inner scroller (a body-locked top document would otherwise
+                // report "cannot scroll" and the keys would only move the
+                // pointer).
+                handler.postDelayed({ refreshScrollProbe() }, 300)
+                handler.postDelayed({ refreshScrollProbe() }, 1500)
             }
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
@@ -633,8 +640,19 @@ class MainActivity : Activity() {
         // aimed at the browser toolbar (see PointerMath.scrollDecision).
         val bounds = pointerBounds()
         val step = PointerMath.step(PointerMath.BASE_STEP_DP * density, repeat, PointerMath.speedFactor(settings.pointerSpeed))
+        // The page can scroll this way if the TOP-LEVEL document can OR the
+        // scrollable element under the pointer can — the consent dialog is
+        // an inner <div> behind a locked body, which canScrollVertically
+        // (top doc only) does not see. Without the inner state, UP/DOWN
+        // moved the pointer forever while the dialog sat still.
+        val canScrollUp = webView.canScrollVertically(-1) || (probeHasInner && probeCanUp)
+        val canScrollDown = webView.canScrollVertically(1) || (probeHasInner && probeCanDown)
+        when (direction) {
+            Direction.UP, Direction.DOWN -> refreshScrollProbe() // keep the state fresh for the next press
+            else -> Unit
+        }
         when (PointerMath.scrollDecision(pointerY, direction, bounds, step,
-            webView.canScrollVertically(-1), webView.canScrollVertically(1))
+            canScrollUp, canScrollDown
         ) {
             PointerAction.SCROLL_DOWN -> {
                 scrollLines(PointerMath.EDGE_SCROLL_LINES)
@@ -659,24 +677,46 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Sends a mouse-wheel event at the pointer so the scrollable element under it moves, as with
-     * a real mouse. Some TV WebView builds drop the generic-motion wheel event without moving
-     * anything — the "doesn't scroll down" report — so if the page's scroll position has not
-     * changed a moment later, fall back to the classic WebView scrollBy: a held key then still
-     * scrolls at a steady speed, on every build.
+     * Scrolls the page by `lines` (a wheel line is ~72 CSS px) in this order:
+     *
+     *  1. The scrollable element UNDER THE POINTER, via `el.scrollTop` — a
+     *     consent dialog (YouTube, Google) locks the body and scrolls an
+     *     INNER <div>. `WebView.scrollBy` and `WebView.scrollY` only ever
+     *     touch the top-level document, which the dialog has locked, so the
+     *     classic path can never move the dialog — the "the page never
+     *     scrolls to the dialog's Accept button" report. Only the element's
+     *     own scrollTop reaches it.
+     *  2. Otherwise (the pointer is over the top-level document, or there is
+     *     no inner scroller): the mouse-wheel event at the pointer, and —
+     *     because some TV WebView builds drop the generic-motion wheel event
+     *     without moving anything — the classic WebView scrollBy as the
+     *     fallback.
      */
     private fun scrollLines(lines: Int) {
+        if (customView != null) return // fullscreen video: nothing behind it to scroll
+        val px = (SCROLL_FALLBACK_LINES_PX * density * lines).toInt()
+        if (px == 0) return
+        wakePointer()
+        val (x, y) = toLocal(webView, pointerX, pointerY)
+        webView.evaluateJavascript(scrollElementScript(x, y, px)) { raw ->
+            when (raw) {
+                "\"ok\"" -> { refreshScrollProbe(); return@evaluateJavascript }
+                else -> Unit // 'none' / 'top' / 'edge': the top-document path below
+            }
+            topDocumentScroll(lines, px)
+        }
+    }
+
+    /** The top-level-document scroll: wheel event at the pointer, then scrollBy. */
+    private fun topDocumentScroll(lines: Int, px: Int) {
         val target = inputTarget()
         val before = webView.scrollY
         val (x, y) = toLocal(target, pointerX, pointerY)
         val event = mouseEvent(MotionEvent.ACTION_SCROLL, x, y, -lines.toFloat())
         target.dispatchGenericMotionEvent(event)
         event.recycle()
-        wakePointer()
-        if (customView != null) return // fullscreen video: nothing behind it to scroll
         handler.postDelayed({
             if (webView.scrollY != before) return@postDelayed
-            val px = (SCROLL_FALLBACK_LINES_PX * density * lines).toInt()
             if (px != 0) webView.scrollBy(0, px)
         }, 100)
     }
@@ -684,12 +724,90 @@ class MainActivity : Activity() {
     /** Pixels of scrollBy per wheel line, used only when the wheel event did not move the page. */
     private val SCROLL_FALLBACK_LINES_PX = 72f
 
+    // ---------------------------------------------------------------- inner-scroller probe
+    //
+    // The D-pad's UP/DOWN decide "scroll or move the pointer" from the
+    // page's scrollability. `WebView.canScrollVertically` only knows the
+    // TOP-LEVEL document, so with a body-locked consent dialog it says
+    // "can't scroll" and the keys move the pointer forever. The probe below
+    // learns the state of the scrollable element under the pointer (an
+    // inner dialog <div> when one is there) and feeds it into the decision.
+    // It is refreshed where the pointer's target can change: pointer moves
+    // (debounced), clicks (a click can conjure a dialog), and page loads
+    // (dialogs typically appear right after load).
+    private var probeHasInner = false
+    private var probeCanUp = false
+    private var probeCanDown = false
+    private var probeJob: Runnable? = null
+
+    /** (Debounced) re-read the scrollable element under the pointer. */
+    private fun refreshScrollProbe() {
+        probeJob?.let { handler.removeCallbacks(it) }
+        if (customView != null) {
+            probeHasInner = false; probeCanUp = false; probeCanDown = false
+            return
+        }
+        val job = Runnable {
+            val (x, y) = toLocal(webView, pointerX, pointerY)
+            webView.evaluateJavascript(scrollProbeScript(x, y)) { raw ->
+                try {
+                    val obj = org.json.JSONObject(raw ?: "null")
+                    probeHasInner = obj.optBoolean("hasInner", false)
+                    probeCanUp = obj.optBoolean("canUp", false)
+                    probeCanDown = obj.optBoolean("canDown", false)
+                } catch (_: Exception) {
+                    // Keep the last known state; the next refresh corrects it.
+                }
+            }
+        }
+        probeJob = job
+        handler.postDelayed(job, 120)
+    }
+
+    /**
+     * The wheel target under (x, y) — the first scrollable ancestor of the
+     * element at the point, falling back to the top-level document — plus
+     * whether it is an INNER element (a dialog) and which way it can still
+     * scroll. Coordinates are WebView view pixels, which equal CSS pixels
+     * here (zoom support is off, so view px == CSS px for the page).
+     */
+    private fun targetFinder(x: Float, y: Float): String =
+        "(function(){var el=document.elementFromPoint(${x},${y});" +
+        "var d=document.scrollingElement||document.documentElement;" +
+        "function scroller(e){if(!e||e.nodeType!==1)return null;" +
+        "if(e===d)return(e.scrollHeight>e.clientHeight+1)?e:null;" +
+        "var s=window.getComputedStyle(e);var oy=s.overflowY;" +
+        "if((oy==='auto'||oy==='scroll')&&e.scrollHeight>e.clientHeight+1)return e;" +
+        "return null;}" +
+        "var t=null;while(el){t=scroller(el);if(t)break;el=el.parentElement;}" +
+        "return t||scroller(d);})()"
+
+    /** Probe: can the element under the pointer scroll up/down? */
+    private fun scrollProbeScript(x: Float, y: Float): String =
+        "(function(){var t=" + targetFinder(x, y) + ";" +
+        "if(!t)return JSON.stringify({hasInner:false,canUp:false,canDown:false});" +
+        "var d=document.scrollingElement||document.documentElement;" +
+        "return JSON.stringify({hasInner:t!==d,canUp:t.scrollTop>0," +
+        "canDown:t.scrollTop+t.clientHeight<t.scrollHeight-1});})()"
+
+    /** Scroll the element under the pointer by `px`; 'ok' only for an inner element. */
+    private fun scrollElementScript(x: Float, y: Float, px: Int): String =
+        "(function(){var t=" + targetFinder(x, y) + ";" +
+        "if(!t)return 'none';" +
+        "var d=document.scrollingElement||document.documentElement;" +
+        "if(t===d)return 'top';" +
+        "var px=" + px + ";" +
+        "if(px>0&&t.scrollTop+t.clientHeight>=t.scrollHeight-1)return 'edge';" +
+        "if(px<0&&t.scrollTop<=0)return 'edge';" +
+        "t.scrollTop+=px;return 'ok';})()"
+
     private fun dispatchHover() {
         val target = inputTarget()
         val (x, y) = toLocal(target, pointerX, pointerY)
         val event = mouseEvent(MotionEvent.ACTION_HOVER_MOVE, x, y, 0f)
         target.dispatchGenericMotionEvent(event)
         event.recycle()
+        refreshScrollProbe() // the pointer's scroll target may have changed under it
     }
 
     private fun clickPointer() {
@@ -709,6 +827,9 @@ class MainActivity : Activity() {
             target.dispatchTouchEvent(up)
             up.recycle()
         }, 55)
+        // A click can conjure a dialog (sign-in, consent, "are you sure?"):
+        // re-probe so the D-pad scrolls it instead of moving the pointer.
+        handler.postDelayed({ refreshScrollProbe() }, 400)
     }
 
     private fun mouseEvent(action: Int, x: Float, y: Float, scroll: Float): MotionEvent {
