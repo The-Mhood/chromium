@@ -1654,6 +1654,73 @@ test('main process wiring (Electron stub)', async t => {
     await calls.ipcHandles.get('core:close')(fakeEvent(), 'fs-tab');
   });
 
+  // ------------------------------------------------------------------
+  // Interstitial-ad fingerprint: rotating ad domains are in NO filter
+  // list, so the campaign-parameter signature of their URLs is what
+  // identifies them (see electron/ad-signals.cjs + popup-blocker.cjs).
+  // ------------------------------------------------------------------
+  const LWTZ = 'https://lwtz.com/1838/en.html?pb=27275087&browser=other&campaignid=1808628&city=lagos&country=NG&device=desktop&expires=1795861524&p=105.127.10.165&md5lp=lyXB9Y38wVoXLAciW';
+
+  await t.test('interstitial: a window.open to a campaign-shaped URL is blocked even on a real click', async () => {
+    const { view: page } = await freshTab('ad-1', 'https://movies.example.com/watch/1838');
+    try {
+      const opensBefore = calls.sends.filter(s => s.channel === 'core:open-tab').length;
+      const noticesBefore = calls.sends.filter(s => s.channel === 'core:popup-blocked').length;
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url: LWTZ, disposition: 'foreground-tab' });
+      await settle();
+      assert.equal(calls.sends.filter(s => s.channel === 'core:open-tab').length, opensBefore,
+        'no tab was opened for the interstitial landing');
+      assert.equal(calls.sends.filter(s => s.channel === 'core:popup-blocked').length, noticesBefore + 1,
+        'the block was reported with the interstitial reason');
+      assert.equal(calls.sends.filter(s => s.channel === 'core:popup-blocked').at(-1).payload.reason, 'interstitial-ad');
+    } finally {
+      await closeTabs('ad-1');
+    }
+  });
+
+  await t.test('interstitial: a renderer redirect into a campaign URL is blocked in-tab (the ad takeover)', async () => {
+    // The field bug: the movie tab morphs into the "answer 2 quick
+    // questions" sweep. The redirect goes into a domain in no list, so
+    // only the URL fingerprint can catch it.
+    const { view } = await freshTab('ad-2', 'https://movies.example.com/watch/1838');
+    const contents = view.webContents;
+    try {
+      // The renderer's ad script redirects (after the user lock expired).
+      // (The event carries preventDefault like a real Electron event.)
+      contents.emit('will-redirect', { preventDefault() {} }, LWTZ);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const blocked = calls.sends.filter(s => s.channel === 'core:navigation-blocked' && s.payload.id === 'ad-2');
+      assert.equal(blocked.length, 1, 'the tab was told its navigation was blocked');
+      assert.equal(blocked.at(-1).payload.type, 'Ad');
+      assert.equal(view.__visible, false, 'the old page is held back behind the blocked card');
+      // The user's "Try again" / reload recovers the tab: the retry's
+      // document commits and the view returns.
+      await calls.ipcHandles.get('core:tab-action')(fakeEvent(), 'ad-2', 'reload');
+      contents.emit('did-finish-load');
+      assert.equal(view.__visible, true, 'the retry brings the tab back');
+    } finally {
+      await closeTabs('ad-2');
+    }
+  });
+
+  await t.test('interstitial: an address-bar navigation to a campaign URL is honoured (the user typed it)', async () => {
+    // The fingerprint checks RENDERER-initiated navigation and popup
+    // opens. An explicit user navigation (the user lock) is the user's
+    // own choice and must load — the allowlist and the address bar stay
+    // the escape hatches.
+    const { view } = await freshTab('ad-3', 'https://movies.example.com/home');
+    const contents = view.webContents;
+    try {
+      await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'ad-3', LWTZ, 1);
+      assert.equal(contents.__url, LWTZ, 'the explicitly typed URL loaded');
+      assert.ok(!calls.sends.some(s => s.channel === 'core:navigation-blocked' && s.payload.id === 'ad-3'),
+        'an explicit navigation is never blocked');
+    } finally {
+      await closeTabs('ad-3');
+    }
+  });
+
   await t.test('quitting persists the workspace atomically', () => {
     const store = path.join(userDataDir, 'workspace.json');
     appListeners.get('before-quit').forEach(fn => fn());

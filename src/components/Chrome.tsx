@@ -22,9 +22,16 @@ export function Chrome() {
   const bookmarked = bookmarks.find(item => item.url === active.url);
 
   useEffect(() => setAddress(active.url === 'core://newtab' ? '' : active.url), [active.url, active.id]);
+  // Keep the active external tab's view ON SCREEN. The second argument is
+  // "show an external view for this tab" — it was `!popover` before, which
+  // told the main process to HIDE the page whenever a popover (or any
+  // state change with one open, e.g. submitting the address bar) touched
+  // this effect: the tab dropped back to its loading card right under the
+  // popover. Keyboard focus is the main process's own call now (it never
+  // steals it from the chrome UI), so the popover needs no special case.
   useEffect(() => {
-    if (window.chromiumCore && getPage(active.url) === 'external') window.chromiumCore.focusTab(active.id, !popover);
-  }, [popover, active.id, active.url]);
+    if (window.chromiumCore && getPage(active.url) === 'external') window.chromiumCore.focusTab(active.id, true);
+  }, [active.id, active.url]);
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey)) return;

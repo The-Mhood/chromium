@@ -81,7 +81,7 @@ async function readCacheMeta(metaFile) {
  * getCosmeticsFilters on instances). In the desktop app it is
  * ElectronBlocker; in tests it is FiltersEngine.
  */
-function createProtectionCore({ getSettings, engineFactory, loadBaseline = null, cacheDir = null, fetch: fetchImpl, log = console.warn } = {}) {
+function createProtectionCore({ getSettings, engineFactory, loadBaseline = null, cacheDir = null, fetch: fetchImpl, isInterstitialAd = null, log = console.warn } = {}) {
   if (!engineFactory || !engineFactory.parse) throw new Error('createProtectionCore requires an engineFactory');
   // Injectable fetch (tests); the app uses the runtime's global fetch.
   const doFetch = typeof fetchImpl === 'function' ? fetchImpl : (url, options) => fetch(url, options);
@@ -319,6 +319,7 @@ function createProtectionCore({ getSettings, engineFactory, loadBaseline = null,
       if (group === 'threats') return matchMainFrame(url, sourceUrl, 'threats') !== null;
       return matchMainFrame(url, sourceUrl) !== null;
     },
+    isInterstitialAd: isInterstitialAd ? isInterstitialAd : null,
   });
 
   return {
@@ -338,7 +339,7 @@ function createProtectionCore({ getSettings, engineFactory, loadBaseline = null,
  * Electron adapter. Requires Electron-only modules lazily so the rest of this
  * file stays loadable in plain Node (unit tests).
  */
-function createProtectionEngine({ browsingSession, cacheDir, getSettings, recordBlocked, onMainframeBlocked, log = console.warn }) {
+function createProtectionEngine({ browsingSession, cacheDir, getSettings, recordBlocked, onMainframeBlocked, isInterstitialAd = null, log = console.warn }) {
   const { ElectronBlocker } = require('@ghostery/adblocker-electron');
   const { webContents } = require('electron');
   const resourcesDir = path.join(__dirname, 'resources');
@@ -346,6 +347,7 @@ function createProtectionEngine({ browsingSession, cacheDir, getSettings, record
   const core = createProtectionCore({
     getSettings,
     recordBlocked,
+    isInterstitialAd,
     log,
     cacheDir,
     engineFactory: ElectronBlocker,

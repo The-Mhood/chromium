@@ -26,6 +26,7 @@ const crypto = require('node:crypto');
 const { createProtectionEngine } = require('./protection.cjs');
 const { FullscreenController } = require('./fullscreen-state.cjs');
 const { browsingUrl, isAllowedDomain, trustedFilterUrl } = require('./security.cjs');
+const { looksLikeAdCampaignUrl } = require('./ad-signals.cjs');
 const { buildShieldScript } = require('./youtube-shield.cjs');
 const { committedNavigationVerdict, pickAttribution, sameAnchorHref } = require('./popup-blocker.cjs');
 
@@ -879,6 +880,15 @@ async function handleWindowOpen(details, contents) {
 
 function startCommitVerification({ url, sourceUrl, viaLinkClick = false }) {
   if (!win || win.isDestroyed()) return;
+  // Campaign-shaped destinations never even get a hidden load: the URL is
+  // already the ad landing, so no redirect chain can be vetted — deny now
+  // (saves the 6 s stall and a hidden page load the user never sees).
+  if (looksLikeAdCampaignUrl(url)) {
+    logPopup({ source: safeHost(sourceUrl), url, disposition: 'verify', decision: 'deny', reason: 'interstitial-ad', created: false, stage: 'commit' });
+    recordBlocked('Ad', url, sourceUrl);
+    noticePopupBlocked(url, sourceUrl, 'interstitial-ad');
+    return;
+  }
   const view = new WebContentsView({ webPreferences: { session: browsingSession, contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, navigateOnDragDrop: false } });
   const contents = view.webContents;
   // A SCRIPTED open that passes verification still gets its tab's first
@@ -922,6 +932,7 @@ function startCommitVerification({ url, sourceUrl, viaLinkClick = false }) {
       nowMs: Date.now(),
       createdAt: record.openedAt,
       viaLinkClick: record.viaLinkClick,
+      isInterstitialAd: looksLikeAdCampaignUrl,
     });
     if (hit) resolveInspector(contents, { block: true, type: hit, reason: 'listed-destination', url: finalUrl });
     else if (verdict.block) resolveInspector(contents, { block: true, type: verdict.type, reason: verdict.reason, url: finalUrl });
@@ -1029,6 +1040,7 @@ function checkPopunderNavigation(contents, url, tabId) {
     nowMs: Date.now(),
     createdAt: watch.createdAt,
     viaLinkClick: watch.viaLinkClick === true,
+    isInterstitialAd: looksLikeAdCampaignUrl,
   });
   if (!verdict.block) return false;
   popunderWatches.delete(contents.id);
@@ -1054,6 +1066,7 @@ function checkImmediateNavigation(contents, url, tabId) {
     nowMs: Date.now(),
     createdAt: watch.createdAt,
     viaLinkClick: watch.viaLinkClick === true,
+    isInterstitialAd: looksLikeAdCampaignUrl,
   });
   if (!verdict.block) return false;
   immediateOpenWatches.delete(contents.id);
@@ -1109,8 +1122,12 @@ function wireBrowsingContents(contents, id, opts = {}) {
   contents.on('did-commit-navigation', () => releaseGate(contents.id, id, 'commit'));
   // A new navigation (retry, unblock-reload, user typing) ends the blocked /
   // failed card: let the document through again (hidden until it commits).
+  // The layout must be re-applied HERE: clearing the hold-back without a
+  // layout pass leaves the view in whatever visibility it had — the exact
+  // "card vanished but the page never comes back" (or never left) defect.
   contents.on('did-start-navigation', () => {
     issueHidden.delete(id);
+    if (onLayout) applyLayout();
     // Self-heal the document-start scripts (popup shield, YouTube shield,
     // double-click channel): a no-op fast path on a healthy tab; a re-attach
     // plus reinstall for a tab whose debugger was detached — otherwise one
@@ -1167,6 +1184,27 @@ function wireBrowsingContents(contents, id, opts = {}) {
     } catch { /* never break input */ }
   });
 
+  // Interstitial fingerprint (rotating ad domains in NO list): a
+  // JS/meta/redirect navigation INTO a campaign-shaped URL is the in-tab ad
+  // takeover — the movie tab morphing into the "answer 2 quick questions"
+  // page. Block it like a listed main frame so the tab explains itself.
+  // (Address-bar / app navigations carry the user lock and never reach
+  // this: an explicitly typed URL stays the user's choice.)
+  const blockInterstitial = (event, url, logLabel) => {
+    if (!looksLikeAdCampaignUrl(url)) return false;
+    event.preventDefault();
+    recordBlocked('Ad', url, contents.getURL());
+    logPopup({ source: safeHost(contents.getURL()), url, decision: 'deny', reason: 'interstitial-ad', created: false, stage: logLabel });
+    if (onIssue) {
+      issueHidden.add(id);
+      send('core:navigation-blocked', { id, url, type: 'Ad' });
+      // The card must be ON SCREEN: hold the view back now, not at some
+      // later, unrelated layout pass.
+      if (onLayout) applyLayout();
+    }
+    return true;
+  };
+
   contents.on('will-navigate', (event, url) => {
     try { browsingUrl(url); } catch { event.preventDefault(); return; }
     // Navigations we started (address bar, app logic) keep the user's intent;
@@ -1176,11 +1214,16 @@ function wireBrowsingContents(contents, id, opts = {}) {
     try {
       if (checkPopunderNavigation(contents, url, id)) { event.preventDefault(); return; }
       if (checkImmediateNavigation(contents, url, id)) { event.preventDefault(); return; }
+      if (blockInterstitial(event, url, 'navigation')) return;
       const hit = engine.matchMainFrame(url, contents.getURL());
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
-        if (onIssue) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type: hit }); }
+        if (onIssue) {
+          issueHidden.add(id);
+          send('core:navigation-blocked', { id, url, type: hit });
+          if (onLayout) applyLayout(); // the blocked card must be on screen now
+        }
       }
     } catch (error) { console.warn('Navigation check failed:', error.message); }
   });
@@ -1190,11 +1233,16 @@ function wireBrowsingContents(contents, id, opts = {}) {
     try {
       if (checkPopunderNavigation(contents, url, id)) { event.preventDefault(); return; }
       if (checkImmediateNavigation(contents, url, id)) { event.preventDefault(); return; }
+      if (blockInterstitial(event, url, 'redirect')) return;
       const hit = engine.matchMainFrame(url, contents.getURL());
       if (hit && !isAllowedDomain(contents.getURL(), state.allowlist)) {
         event.preventDefault();
         recordBlocked(hit, url, contents.getURL());
-        if (onIssue) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type: hit }); }
+        if (onIssue) {
+          issueHidden.add(id);
+          send('core:navigation-blocked', { id, url, type: hit });
+          if (onLayout) applyLayout(); // the blocked card must be on screen now
+        }
       }
     } catch (error) { console.warn('Redirect check failed:', error.message); }
   });
@@ -1206,7 +1254,11 @@ function wireBrowsingContents(contents, id, opts = {}) {
     if (errorCode === -3) return; // ERR_ABORTED: superseded or cancelled, not a failure
     if (validatedURL && lastRequested.get(contents.id) === validatedURL) {
       lastRequested.delete(contents.id);
-      if (onIssue) { issueHidden.add(id); send('core:load-failed', { id, url: validatedURL }); }
+      if (onIssue) {
+        issueHidden.add(id);
+        send('core:load-failed', { id, url: validatedURL });
+        if (onLayout) applyLayout(); // the failed card must be on screen now
+      }
     }
   });
 
@@ -1832,6 +1884,12 @@ function registerIPC() {
     // already-loaded tab (no seq, or the same seq) keeps the old guard.
     const freshNav = typeof seq === 'number' && seq > (lastNavSeq.get(id) ?? -1);
     if (typeof seq === 'number') lastNavSeq.set(id, seq);
+    // A user navigation SUPERSEDES any earlier blocked/failed/frozen state
+    // for this tab: the renderer cleared its card when it issued this
+    // navigation, so the main side must release the view immediately —
+    // holding it back (issueHidden) is what left the tab on blank space
+    // between "the card went away" and "the new document commits".
+    issueHidden.delete(id);
     const view = views.get(id) || makeTab(id);
     // User-initiated navigation: the content shows live (no loading card).
     // This covers the address bar, the home page, quick links, and the
@@ -1884,7 +1942,15 @@ function registerIPC() {
     // switching tabs never reloads the page.
     const contents = view.webContents;
     if (contents.isDestroyed()) return;
-    const shouldLoad = freshNav || (contents.getURL() !== url && !contents.isLoadingMainFrame());
+    // Compare against the url the tab is TRYING TO REACH (lastRequested),
+    // not the last committed document: while a load is in flight
+    // getURL() still reports the old page, and treating that as
+    // "already at the target" is what let a freshly typed address be
+    // dropped behind a slow in-flight load ("nothing happens"). A typed
+    // url that differs from the target always loads — it interrupts the
+    // in-flight load (ERR_ABORTED, swallowed below).
+    const currentTarget = lastRequested.get(contents.id) || contents.getURL();
+    const shouldLoad = freshNav || currentTarget !== url;
     if (shouldLoad) {
       recoverFrozenRenderer(contents); // typing a new address into a frozen tab must not queue behind the dead JS either
       navigationLocks.set(contents.id, { url, at: Date.now() });
@@ -1899,14 +1965,30 @@ function registerIPC() {
       showExternal = external === true;
       const contents = views.get(id)?.webContents;
       const mediaIsFullscreen = !!(contents && !contents.isDestroyed() && contents.isFullscreen());
-      fsCtl.tabFocused(id, { mediaIsFullscreen });
-      fsCtl.tick({ windowFocused: win?.isFocused() ?? false, showingExternal: showExternal, cursorMoved: false });
+      // The state machine is best-effort here: a fault in it must NEVER
+      // reject this invoke — the renderer used to chain the navigation
+      // behind the focus promise, and a rejected focus was the whole
+      // "tab never navigates, spinner forever" defect.
+      try {
+        fsCtl.tabFocused(id, { mediaIsFullscreen });
+        fsCtl.tick({ windowFocused: win?.isFocused() ?? false, showingExternal: showExternal, cursorMoved: false });
+      } catch (error) { console.warn('Fullscreen state fault during focus:', error.message); }
     } finally {
-      // A tab switch must never be lost: even if the state machine throws,
-      // the right view comes on screen and takes keyboard focus.
-      applyLayout();
+      // A tab switch must never be lost: even if anything above threw,
+      // the right view comes on screen.
+      try { applyLayout(); } catch (error) { console.warn('Layout fault during focus:', error.message); }
+      // Keyboard focus: the page view takes it only when the chrome UI
+      // (address bar, popovers) does not already own it. Unconditional
+      // focus() here is what stole typing away from the address bar —
+      // every renderer focusTab (tab switch, popover change, navigation)
+      // yanked the keyboard back into the page.
       const view = views.get(id);
-      if (view && !view.webContents.isDestroyed()) { try { view.webContents.focus(); } catch { /* transitional */ } }
+      if (view && !view.webContents.isDestroyed()) {
+        try {
+          const chromeOwnsFocus = !!(win && !win.isDestroyed() && win.webContents.isFocused());
+          if (!chromeOwnsFocus) view.webContents.focus();
+        } catch { /* transitional */ }
+      }
     }
   });
   handle('core:close', id => destroyTab(id));
@@ -1919,7 +2001,17 @@ function registerIPC() {
       issueHidden.delete(id); // a retry dismisses the blocked/failed card (the view stays hidden until the retry commits)
       recoverFrozenRenderer(contents); // the frozen tab's "Reload page": a plain reload() would queue behind the dead JS
       navigationLocks.set(contents.id, { url: contents.getURL(), at: Date.now() });
-      contents.reload();
+      lastRequested.set(contents.id, contents.getURL());
+      if (contents.isCrashed()) {
+        // A crashed renderer does not honour reload() — the request dies
+        // with the process and the tab sits on the frozen frame forever.
+        // loadURL() spawns the fresh renderer and lands the navigation.
+        contents.loadURL(contents.getURL()).catch(error => {
+          if (error.code !== 'ERR_ABORTED' && error.errno !== -3) console.warn('Reload failed:', error.message);
+        });
+      } else {
+        contents.reload();
+      }
     }
   });
   handle('core:protection', async input => {
@@ -2156,10 +2248,13 @@ app.whenReady().then(() => {
     cacheDir: path.join(app.getPath('userData'), 'filters'),
     getSettings: () => state,
     recordBlocked,
+    isInterstitialAd: looksLikeAdCampaignUrl,
     onMainframeBlocked: (webContentsId, url, type) => {
       // The page will never load — tell the renderer so the tab shows why
-      // instead of sitting on a placeholder that reads like a prompt.
-      for (const [id, view] of views) if (view.webContents.id === webContentsId) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type }); break; }
+      // instead of sitting on a placeholder that reads like a prompt. The
+      // layout pass is what puts the card on screen: without it the old
+      // (or blank) page view stays painted over the card.
+      for (const [id, view] of views) if (view.webContents.id === webContentsId) { issueHidden.add(id); send('core:navigation-blocked', { id, url, type }); applyLayout(); break; }
       // A commit inspector's main frame was cancelled: the open dies here,
       // before any chip exists — surface it as a blocked popup.
       if (inspectors.has(webContentsId)) noticePopupBlocked(url, inspectors.get(webContentsId).sourceUrl, 'listed-destination');

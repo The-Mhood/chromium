@@ -215,6 +215,13 @@ function createPopupPolicy(options = {}) {
   const getSettings = options.getSettings || (() => ({ protection: { enabled: true, popups: true }, allowlist: [] }));
   const maxTabs = options.maxTabs || 60;
   const isAllowedDomain = options.isAllowedDomain || (() => false);
+  // Interstitial-ad URL detector (rotating ad domains that are never in the
+  // filter lists — see electron/ad-signals.cjs). A high-precision
+  // fingerprint of the campaign query-string, checked on the DESTINATION:
+  // a listed-or-unlisted landing that carries the campaign machinery is an
+  // ad no matter how it was opened. The allowlist/protection-off checks
+  // below still run first: an explicit user choice always wins.
+  const isInterstitialAd = options.isInterstitialAd || (() => false);
   const log = options.log || (() => {});
 
   // Main-process input tracking (unspoofable: it reflects OS-level input
@@ -322,6 +329,15 @@ function createPopupPolicy(options = {}) {
 
     if (matchRequest(url, sourceUrl, 'popup') || matchRequest(url, sourceUrl, 'main_frame')) {
       return { allowed: false, reason: 'listed-destination', needsCommit: false };
+    }
+    // The unlisted case: rotating interstitial-ad domains are in NO filter
+    // list, but their landing URLs carry a fixed campaign-parameter
+    // fingerprint (see electron/ad-signals.cjs). A campaign-shaped
+    // destination is an ad whether it arrived as a link click, a scripted
+    // open or a redirect. Checked here (after the lists) so a destination
+    // that IS listed keeps its 'listed-destination' reason for the stats.
+    if (isInterstitialAd(url)) {
+      return { allowed: false, reason: 'interstitial-ad', needsCommit: false };
     }
     // A hidden background tab is never a user workflow.
     if (disposition === 'background-tab') {
@@ -481,12 +497,24 @@ function createPopupPolicy(options = {}) {
  *   then does NOT apply: a page may legitimately redirect the user across
  *   registrable domains (player/CDN/sister domains). Scripted keeps are
  *   still vetted against the filter lists above.
+ * @param {function} [p.isInterstitialAd] (url) => bool — the campaign-URL
+ *   fingerprint (electron/ad-signals.cjs). Applied to BOTH the intended and
+ *   the final URL: the intended one is the click/open request (an ad network
+ *   that names its own landing at request time is already caught), and the
+ *   final one catches the redirect into a campaign URL. Unlike the domain
+ *   jump rule this applies to LINK CLICKS too — a user who clicks through
+ *   into an interstitial still does not want to browse it.
  * @returns {{ block: boolean, reason: string, type: 'Ad'|'Threat'|'Pop-up'|null }}
  */
 function committedNavigationVerdict(p) {
   const { intendedUrl, openerUrl, finalUrl, matchRequest, nowMs, createdAt } = p;
   const viaLinkClick = p.viaLinkClick === true;
   if (nowMs - createdAt > WATCH_TTL_MS) return { block: false, reason: 'expired', type: null };
+
+  const isInterstitialAd = typeof p.isInterstitialAd === 'function' ? p.isInterstitialAd : null;
+  if (isInterstitialAd && (isInterstitialAd(finalUrl) || isInterstitialAd(intendedUrl))) {
+    return { block: true, reason: 'interstitial-ad', type: 'Ad' };
+  }
 
   if (matchRequest(finalUrl, intendedUrl, 'main_frame') || matchRequest(finalUrl, openerUrl, 'main_frame')) {
     const threat = matchRequest(finalUrl, intendedUrl, 'main_frame', 'threats') || matchRequest(finalUrl, openerUrl, 'main_frame', 'threats');
