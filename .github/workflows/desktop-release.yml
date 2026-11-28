@@ -235,18 +235,25 @@ jobs:
             # failure annotation below always shows the exact failing call.
             API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
             AUTH="Authorization: Bearer ${GH_TOKEN}"
+            # A release for this tag may already exist (a re-tag after a failed
+            # publish): delete it so THIS tag's build is the one that ships.
+            EXISTING=$(curl -sS -o /dev/null -w "%{http_code}" "$API/tags/v$TAG" -H "$AUTH" -H "Accept: application/vnd.github+json")
+            if [ "$EXISTING" = "200" ]; then
+              echo "Release v$TAG already exists — removing it before publishing this build."
+              curl -sS -f -X DELETE "$API/tags/v$TAG" -H "$AUTH" -H "Accept: application/vnd.github+json" > /dev/null
+            fi
             PAYLOAD=$(jq -n --arg tag "v$TAG" --arg target "$GITHUB_SHA" --arg title "ChromiumCore v$TAG" --arg body "$NOTES" \
               '{tag_name: $tag, target_commitish: $target, name: $title, body: $body, draft: false, prerelease: false}')
             echo "Creating release v$TAG (target $GITHUB_SHA)..."
             RELEASE_JSON=$(curl -sS -f -X POST "$API" -H "$AUTH" -H "Accept: application/vnd.github+json" -d "$PAYLOAD")
             echo "Release created: $(echo "$RELEASE_JSON" | jq -r .html_url)"
             UPLOAD_URL=$(echo "$RELEASE_JSON" | jq -r .upload_url | sed 's/{?name,label}//')
-            for f in "${FILES[@]}"; do
+            for f in SHA256SUMS.txt "${FILES[@]}"; do
               echo "Uploading $(basename "$f") ($(du -h "$f" | cut -f1))..."
               curl -sS -f -X PUT "${UPLOAD_URL}?name=$(basename "$f")" -H "$AUTH" -H "Content-Type: application/octet-stream" --data-binary "@$f" > /dev/null
               echo "  done."
             done
-            echo "Published release v$TAG with ${#FILES[@]} assets."
+            echo "Published release v$TAG with $(( ${#FILES[@]} + 1 )) assets."
           ) > release.log 2>&1
           status=$?
           cat release.log
