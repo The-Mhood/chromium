@@ -107,10 +107,10 @@ class PointerMathTest {
         // (it is never swallowed); UP still scrolls the page back up.
         assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(590f, Direction.DOWN, bounds, firstStep, true, false))
         assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(590f, Direction.UP, bounds, firstStep, true, false))
-        // Page at the very top, pointer mid-screen: DOWN moves the pointer into the page,
-        // UP pulls the pointer up toward the site header (it stops on any header link,
-        // where OK clicks).
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.DOWN, bounds, firstStep, false, true))
+        // Page at the very top, pointer mid-screen: DOWN SCROLLS the page (there is content
+        // below — that is the wheel), while UP moves the pointer up toward the site header
+        // (it stops on any header link, where OK clicks).
+        assertEquals(PointerAction.SCROLL_DOWN, PointerMath.scrollDecision(300f, Direction.DOWN, bounds, firstStep, false, true))
         assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.UP, bounds, firstStep, false, true))
         // Pointer 20px below the top — one press reaches it, landing EXACTLY on the top edge
         // (y - step == top): UP must move the pointer there — the site header gets its hover —
