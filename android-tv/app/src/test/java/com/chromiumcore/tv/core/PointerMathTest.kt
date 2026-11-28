@@ -6,7 +6,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PointerMathTest {
+    // A 1000x600 viewport (roughly a 720p TV's web area). At these densities the default
+    // first press steps 20px (10dp x 2) and a fully held key caps at 60px.
     private val bounds = PointerBounds(0f, 0f, 1000f, 600f)
+    private val firstStep = PointerMath.step(PointerMath.BASE_STEP_DP * 2f, 0, PointerMath.speedFactor(1))
 
     @Test
     fun movesInTheRequestedDirection() {
@@ -77,69 +80,67 @@ class PointerMathTest {
         assertEquals(1, PointerMath.EDGE_SCROLL_LINES)
     }
 
+    // The D-pad is the page's SCROLL WHEEL (PointerMath.scrollDecision). The cases below use
+    // the pointer's first-press step (20px at the test density) — the pointer can reach the
+    // very top in one press whenever it is within 20px of it.
+
     @Test
-    fun theScrollBandStartsBeforeTheEdge() {
-        val zone = 48f
-        // Bottom band: the band starts 48px above the bottom (600 - 48 = 552).
-        assertTrue(PointerMath.inScrollBand(500f, 560f, Direction.DOWN, bounds, zone))
-        assertTrue(PointerMath.inScrollBand(500f, 552f, Direction.DOWN, bounds, zone))
-        assertFalse(PointerMath.inScrollBand(500f, 551f, Direction.DOWN, bounds, zone))
-        // Top band: it ends 48px below the top (48).
-        assertTrue(PointerMath.inScrollBand(500f, 40f, Direction.UP, bounds, zone))
-        assertTrue(PointerMath.inScrollBand(500f, 0f, Direction.UP, bounds, zone))
-        assertFalse(PointerMath.inScrollBand(500f, 49f, Direction.UP, bounds, zone))
-        // Mid-screen is never in a band, and sideways keys never scroll.
-        assertFalse(PointerMath.inScrollBand(500f, 300f, Direction.DOWN, bounds, zone))
-        assertFalse(PointerMath.inScrollBand(500f, 300f, Direction.UP, bounds, zone))
-        assertFalse(PointerMath.inScrollBand(40f, 300f, Direction.LEFT, bounds, zone))
-        assertFalse(PointerMath.inScrollBand(960f, 300f, Direction.RIGHT, bounds, zone))
+    fun downScrollsThePageFromAnywhereWhileItCanScrollDown() {
+        // Mid-screen, screen quarter, bottom: DOWN scrolls. No travel to an edge needed —
+        // this is the "TV doesn't scroll down" fix: from the middle of YouTube, one press
+        // scrolls.
+        assertEquals(PointerAction.SCROLL_DOWN, PointerMath.scrollDecision(300f, Direction.DOWN, bounds, firstStep, false, true))
+        assertEquals(PointerAction.SCROLL_DOWN, PointerMath.scrollDecision(75f, Direction.DOWN, bounds, firstStep, false, true))
+        assertEquals(PointerAction.SCROLL_DOWN, PointerMath.scrollDecision(590f, Direction.DOWN, bounds, firstStep, false, true))
     }
 
     @Test
-    fun theScrollZoneIsAQuarterOfThePageWithAFloor() {
-        // 600px-tall page at density 2: a quarter is 150px — the pointer only has to travel
-        // that far (from the middle: one held second) before scrolling starts.
-        assertEquals(150f, PointerMath.scrollZonePx(600f, 2f), 0.001f)
-        // Very short viewport (120px): the quarter (30px) loses to the 48dp floor (96px at d2).
-        assertEquals(96f, PointerMath.scrollZonePx(120f, 2f), 0.001f)
+    fun upScrollsThePageFromAnywhereWhileItCanScrollUp() {
+        // The "get back up YouTube" path: held UP anywhere scrolls the page up.
+        assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(300f, Direction.UP, bounds, firstStep, true, true))
+        assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(590f, Direction.UP, bounds, firstStep, true, false))
     }
 
     @Test
-    fun downInTheBottomZoneScrollsThePage() {
-        // Bottom quarter (600 - 150 = 450 and below) at a scrollable page: DOWN scrolls.
-        assertEquals(PointerAction.SCROLL_DOWN, PointerMath.scrollDecision(500f, 560f, Direction.DOWN, bounds, 150f, true, true))
-        assertEquals(PointerAction.SCROLL_DOWN, PointerMath.scrollDecision(500f, 450f, Direction.DOWN, bounds, 150f, true, true))
-        // At the very bottom of the page (nothing to scroll down into) the press is not
-        // swallowed — it moves the pointer.
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(500f, 560f, Direction.DOWN, bounds, 150f, true, false))
-        // Mid-screen and top-zone DOWN move the pointer (the pointer must reach the page).
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(500f, 300f, Direction.DOWN, bounds, 150f, true, true))
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(500f, 60f, Direction.DOWN, bounds, 150f, true, true))
-    }
-
-    @Test
-    fun upInTheBottomZoneScrollsBackUp() {
-        // The "get back up YouTube" path: held UP in the bottom quarter scrolls the page
-        // up instead of merely nudging the pointer out of the zone.
-        assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(500f, 560f, Direction.UP, bounds, 150f, true, true))
-        // If the page cannot scroll up, the pointer leaves the zone as before.
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(500f, 560f, Direction.UP, bounds, 150f, false, true))
-    }
-
-    @Test
-    fun upAtTheTopOfThePageReachesTheToolbarOnlyWhenThereIsNothingAbove() {
-        // Scrollable page: UP in the top quarter scrolls up.
-        assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(500f, 60f, Direction.UP, bounds, 150f, true, true))
-        // At the very top with nothing above: the press is aimed at the toolbar (the caller
-        // fires it only on a fresh press, not on repeats).
-        assertEquals(PointerAction.FOCUS_TOOLBAR, PointerMath.scrollDecision(500f, 60f, Direction.UP, bounds, 150f, false, true))
-        assertEquals(PointerAction.FOCUS_TOOLBAR, PointerMath.scrollDecision(500f, 0f, Direction.UP, bounds, 150f, false, false))
+    fun whenThePageCannotScrollTheArrowsMoveThePointer() {
+        // At the bottom of the page, DOWN cannot scroll — the press must move the pointer
+        // (it is never swallowed); UP still scrolls the page back up.
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(590f, Direction.DOWN, bounds, firstStep, true, false))
+        assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(590f, Direction.UP, bounds, firstStep, true, false))
+        // Page at the very top, pointer mid-screen: DOWN moves the pointer into the page,
+        // UP pulls the pointer up toward the site header (it stops on any header link,
+        // where OK clicks).
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.DOWN, bounds, firstStep, false, true))
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.UP, bounds, firstStep, false, true))
+        // Pointer 20px below the top — one press reaches it: UP keeps moving the pointer.
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(20f, Direction.UP, bounds, firstStep, false, true))
+        // Pointer at the very top of the page with nothing above: the press is aimed at
+        // the toolbar (the caller fires it only on a fresh press, not on repeats).
+        assertEquals(PointerAction.FOCUS_TOOLBAR, PointerMath.scrollDecision(0f, Direction.UP, bounds, firstStep, false, true))
+        assertEquals(PointerAction.FOCUS_TOOLBAR, PointerMath.scrollDecision(10f, Direction.UP, bounds, firstStep, false, false))
+        // ...but the toolbar press must NOT fire while the page still has content above,
+        // even with the pointer at the top — that press scrolls up instead.
+        assertEquals(PointerAction.SCROLL_UP, PointerMath.scrollDecision(0f, Direction.UP, bounds, firstStep, true, false))
+        // A tiny page that fits the viewport (cannot scroll either way): arrows are pure
+        // pointer movement, with the toolbar reachable from the top.
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.DOWN, bounds, firstStep, false, false))
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(300f, Direction.UP, bounds, firstStep, false, false))
+        assertEquals(PointerAction.FOCUS_TOOLBAR, PointerMath.scrollDecision(0f, Direction.UP, bounds, firstStep, false, false))
     }
 
     @Test
     fun sidewaysKeysNeverScroll() {
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(500f, 560f, Direction.LEFT, bounds, 150f, true, true))
-        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(500f, 560f, Direction.RIGHT, bounds, 150f, true, true))
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(590f, Direction.LEFT, bounds, firstStep, true, true))
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(0f, Direction.RIGHT, bounds, firstStep, false, false))
+    }
+
+    @Test
+    fun anEmptyBoundsCannotBePushedIntoTheToolbar() {
+        // Not-yet-laid-out area (top == bottom): the "pointer at the very top" test must not
+        // fire, so an early press moves the pointer (which clamps) instead of jumping to the
+        // toolbar.
+        val empty = PointerBounds(0f, 5f, 0f, 5f)
+        assertEquals(PointerAction.MOVE_POINTER, PointerMath.scrollDecision(5f, Direction.UP, empty, firstStep, false, false))
     }
 
     @Test
