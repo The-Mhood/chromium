@@ -653,7 +653,7 @@ class MainActivity : Activity() {
         }
         when (PointerMath.scrollDecision(pointerY, direction, bounds, step,
             canScrollUp, canScrollDown
-        ) {
+        )) {
             PointerAction.SCROLL_DOWN -> {
                 scrollLines(PointerMath.EDGE_SCROLL_LINES)
                 return
