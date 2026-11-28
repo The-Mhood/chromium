@@ -46,9 +46,16 @@ export default function App() {
     const offPopup = bridge.onPopupBlocked(() => notify('Blocked an unwanted popup.', 'info'));
     const offNavBlocked = bridge.onNavigationBlocked(info => setTabIssue(info.id, { kind: 'blocked', url: info.url, type: info.type }));
     const offLoadFailed = bridge.onLoadFailed(info => setTabIssue(info.id, { kind: 'failed', url: info.url }));
+    const offTabUnresponsive = bridge.onTabUnresponsive(info => setTabIssue(info.id, { kind: 'unresponsive', url: info.url, crashed: info.crashed === true }));
+    const offTabResponsive = bridge.onTabResponsive(info => {
+      // Only the frozen/crashed card clears on recovery — a blocked or
+      // failed card is unrelated to the renderer's responsiveness.
+      const current = useBrowser.getState().tabIssues[info.id];
+      if (current && current.kind === 'unresponsive') setTabIssue(info.id, null);
+    });
     const offTabClosed = bridge.onTabClosed(info => removeTab(info.id));
     const offToast = bridge.onToast(info => notify(info.text, info.tone));
-    return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); offNavBlocked(); offLoadFailed(); offTabClosed(); offToast(); };
+    return () => { offStats(); offTab(); offOpen(); offChrome(); offFullscreen(); offPopup(); offNavBlocked(); offLoadFailed(); offTabUnresponsive(); offTabResponsive(); offTabClosed(); offToast(); };
   }, [setNativeStats, updateTab, newTab, removeTab, notify, setFullscreenState, setTabIssue]);
   // activeNavSeq is the retry token: it bumps only when THIS tab is navigated,
   // so the effect re-fires even when the url string is unchanged (the "Try

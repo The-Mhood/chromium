@@ -78,6 +78,12 @@ function makeWebContents(id) {
     isLoading: () => false,
     isLoadingMainFrame: () => false,
     isFullscreen: () => false,
+    // Crash/freeze model for the recovery path: __crashed mirrors a dead
+    // renderer; forcefullyCrashRenderer (the main process's recovery action
+    // for a FROZEN renderer) kills it and — as in real Electron — the
+    // render-process-gone the test then emits is what main must suppress.
+    isCrashed: () => wc.__crashed === true,
+    forcefullyCrashRenderer: () => { wc.__crashCalls = (wc.__crashCalls || 0) + 1; wc.__crashed = true; },
     loadFile: () => Promise.resolve(),
     loadURL: url => {
       wc.__url = url;
@@ -115,6 +121,11 @@ function makeWebContents(id) {
     removeInsertedCSS: async () => {},
     close: () => {},
     focus: () => {},
+    // The smart reload (tab-action 'reload') calls contents.reload(); the
+    // test drives the retry's commit explicitly (did-finish-load), so this
+    // only needs to exist — as in a frozen renderer, nothing happens until
+    // a fresh process lands the navigation.
+    reload: () => {},
     send: (channel, payload) => calls.sends.push({ id, channel, payload }),
     setWindowOpenHandler: fn => { wc.__openHandler = fn; },
     on: (event, fn) => { listeners.set(event, [...(listeners.get(event) || []), fn]); },
@@ -518,6 +529,124 @@ test('main process wiring (Electron stub)', async t => {
   };
   const findInspector = known => winStub().contentView.__views.find(v => !known.has(v));
   const closeTabs = async (...ids) => { for (const id of ids) await calls.ipcHandles.get('core:close')(fakeEvent(), id); };
+
+  await t.test('a frozen tab gets a recovery card; reload force-crashes the renderer', async () => {
+    // The field report: cinelove.live loaded to its language dialog, then
+    // the tab "didn't respond" — an ad pinned the renderer's main thread.
+    // Before the recovery path, that tab painted forever with no way out.
+    const { view } = await freshTab('freeze-1', 'https://adfarm.example.com/heavy');
+    const contents = view.webContents;
+    try {
+      assert.equal(view.__visible, true, 'the tab is live before it freezes');
+
+      // Electron fires 'unresponsive' once the renderer stops pumping events.
+      const frozenBefore = calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length;
+      contents.emit('unresponsive');
+      const frozen = calls.sends.filter(s => s.channel === 'core:tab-unresponsive');
+      assert.equal(frozen.length, frozenBefore + 1, 'core:tab-unresponsive was sent');
+      assert.equal(frozen.at(-1).payload.id, 'freeze-1');
+      assert.equal(frozen.at(-1).payload.crashed, undefined, 'a freeze is not a crash');
+      assert.equal(view.__visible, false, 'the frozen view is held back so the recovery card is on screen');
+
+      // The card's "Reload page" is the SMART reload: a plain reload() would
+      // queue behind the frozen JS, so the main process kills the renderer
+      // first and the retry spawns a fresh one.
+      assert.equal(contents.__crashCalls || 0, 0);
+      await calls.ipcHandles.get('core:tab-action')(fakeEvent(), 'freeze-1', 'reload');
+      assert.equal(contents.__crashCalls, 1, 'the reload force-crashed the frozen renderer');
+
+      // The resulting render-process-gone is our own recovery action — it
+      // must not re-raise the card the retry just dismissed (the renderer
+      // already cleared the card when the button was clicked).
+      const goneBefore = calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length;
+      contents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 0 });
+      assert.equal(calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length, goneBefore,
+        'the recovery crash is suppressed: no second card');
+
+      // The retry's document commits: the view returns. (No responsive
+      // event is expected here — the recovery already cleared the state;
+      // the event path is covered by the thaw and lost-event cases below.)
+      contents.emit('did-finish-load');
+      assert.equal(view.__visible, true, 'the view is back after the retry commits');
+
+      // Safety net: if a card IS still up when a document commits without
+      // a 'responsive' in between (a lost event), the commit itself clears
+      // it for the renderer.
+      const frozen2 = calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length;
+      contents.emit('unresponsive');
+      assert.equal(calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length, frozen2 + 1,
+        'the card is re-raised for a fresh freeze');
+      const responsiveBefore = calls.sends.filter(s => s.channel === 'core:tab-responsive').length;
+      contents.emit('did-finish-load');
+      assert.equal(calls.sends.filter(s => s.channel === 'core:tab-responsive').length, responsiveBefore + 1,
+        'a committed document clears a stale frozen card');
+      assert.equal(view.__visible, true);
+    } finally {
+      await closeTabs('freeze-1');
+    }
+  });
+
+  await t.test('a renderer that thaws on its own restores the tab without user action', async () => {
+    const { view } = await freshTab('thaw-1', 'https://adfarm.example.com/thaw');
+    try {
+      view.webContents.emit('unresponsive');
+      assert.equal(view.__visible, false, 'hidden while the card is up');
+      view.webContents.emit('responsive');
+      assert.equal(calls.sends.filter(s => s.channel === 'core:tab-responsive').at(-1).payload.id, 'thaw-1');
+      assert.equal(view.__visible, true, 'the thawed view is restored automatically');
+      // A redundant 'responsive' for a tab that never froze is a no-op.
+      const before = calls.sends.filter(s => s.channel === 'core:tab-responsive').length;
+      view.webContents.emit('responsive');
+      assert.equal(calls.sends.filter(s => s.channel === 'core:tab-responsive').length, before,
+        'a responsive without a prior freeze is ignored');
+    } finally {
+      await closeTabs('thaw-1');
+    }
+  });
+
+  await t.test('a crashed renderer raises the card (crashed) and recovers on reload', async () => {
+    const { view } = await freshTab('crash-1', 'https://adfarm.example.com/crash');
+    const contents = view.webContents;
+    try {
+      const before = calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length;
+      contents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 134 });
+      const sent = calls.sends.filter(s => s.channel === 'core:tab-unresponsive');
+      assert.equal(sent.length, before + 1, 'the crash raised the card');
+      assert.equal(sent.at(-1).payload.crashed, true, 'the card is the crashed variant');
+      assert.equal(view.__visible, false, 'the dead view is held back behind the card');
+      // Expected teardowns are not page faults.
+      contents.emit('render-process-gone', {}, { reason: 'clean-exit', exitCode: 0 });
+      assert.equal(calls.sends.filter(s => s.channel === 'core:tab-unresponsive').length, before + 1,
+        'a clean exit does not re-raise the card');
+      // Reload of a truly dead renderer: the process is already gone (the
+      // mock mirrors that with __crashed), so no force-crash is needed —
+      // the reload itself re-spawns it.
+      contents.__crashed = true;
+      await calls.ipcHandles.get('core:tab-action')(fakeEvent(), 'crash-1', 'reload');
+      assert.equal(contents.__crashCalls || 0, 0, 'no force-crash on an already-dead renderer');
+      contents.emit('did-finish-load');
+      assert.equal(view.__visible, true, 'the view is back after the retry commits');
+    } finally {
+      await closeTabs('crash-1');
+    }
+  });
+
+  await t.test('typing a new address into a frozen tab recovers instead of queueing', async () => {
+    const { view } = await freshTab('navfreeze-1', 'https://adfarm.example.com/frozen');
+    try {
+      view.webContents.emit('unresponsive');
+      assert.equal(view.__visible, false);
+      // The user types a new URL (the store cleared the card and bumped
+      // navSeq, so core:navigate sees a fresh navigation).
+      await calls.ipcHandles.get('core:navigate')(fakeEvent(), 'navfreeze-1', 'https://calm.example.com/', 1);
+      assert.equal(view.webContents.__crashCalls, 1, 'the frozen renderer was killed before the new load');
+      assert.equal(view.webContents.__url, 'https://calm.example.com/');
+      view.webContents.emit('did-finish-load');
+      assert.equal(view.__visible, true, 'the new page paints live');
+    } finally {
+      await closeTabs('navfreeze-1');
+    }
+  });
 
   await t.test('user-navigated tabs paint live: no loading card blanks the page between a click and its document', async () => {
     // Field report: every link first blanked to the loading card ("I need

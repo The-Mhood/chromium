@@ -50,6 +50,19 @@ const views = new Map();
 // "blocked" / "couldn't reach" card is the thing on screen.
 const firstCommitted = new Set(); // webContents ids with a document
 const issueHidden = new Set();    // tab ids with a blocked/failed card showing
+// Renderers that stopped responding (a page that LOADED and then froze —
+// the field's "didn't respond", an ad-heavy site pinning the main thread)
+// or died outright (crash/OOM). Their view is held back via issueHidden and
+// the renderer shows a "stopped responding" card with Reload and Close —
+// the recovery path that never existed: a frozen tab painted forever, and
+// reloads typed into it queued behind the dead JS. Keyed by webContents id;
+// the tab id is always in handler scope where this is consulted.
+const unresponsiveContents = new Set();
+// webContents ids whose renderer we killed ON PURPOSE to recover a frozen
+// tab (forcefullyCrashRenderer during reload/navigate). The resulting
+// render-process-gone is our recovery action, not a page failure — it must
+// not re-raise the card the retry just dismissed.
+const suppressProcessGone = new Set();
 // Tabs the USER explicitly navigated (address bar, quick link, an admitted
 // link click, the home page): their content paints LIVE from the first
 // frame, like an ordinary browser — the loading card would blank the page
@@ -78,6 +91,23 @@ function releaseGate(contentsId, tabId, signal) {
   }
   console.info(`[layout] tab ${tabId ?? '?'} gate released via ${signal}`);
   applyLayout();
+}
+
+// A frozen or crashed renderer cannot process a plain reload()/loadURL —
+// the request queues behind the dead JS thread and the tab paints its
+// frozen frame forever. Kill the process so the caller's navigation spawns
+// a FRESH renderer and actually lands. The render-process-gone that follows
+// is suppressed (suppressProcessGone): it is our own recovery action, not a
+// page failure, and the caller has already dismissed the frozen-state card.
+function recoverFrozenRenderer(contents) {
+  if (!contents || contents.isDestroyed()) return;
+  const frozen = unresponsiveContents.has(contents.id);
+  const crashed = contents.isCrashed();
+  if (!frozen && !crashed) return; // a healthy renderer needs no recovery
+  if (frozen) suppressProcessGone.add(contents.id);
+  unresponsiveContents.delete(contents.id);
+  if (crashed) return; // already dead; the navigation re-spawns the renderer
+  try { contents.forcefullyCrashRenderer(); } catch { /* transitional state */ }
 }
 const navigationLocks = new Map();
 // The URL each tab's main frame is currently trying to reach, so a
@@ -399,6 +429,8 @@ function destroyTab(id) {
   firstCommitted.delete(contents.id);
   liveTabs.delete(id);
   issueHidden.delete(id);
+  unresponsiveContents.delete(contents.id);
+  suppressProcessGone.delete(contents.id);
   if (gateForceTimers.has(id)) { clearTimeout(gateForceTimers.get(id)); gateForceTimers.delete(id); }
   // A closed tab must not keep a page-script heal timer armed: the retry
   // would re-attach a destroyed renderer (and, in the wiring smoke, clobber
@@ -1178,6 +1210,47 @@ function wireBrowsingContents(contents, id, opts = {}) {
     }
   });
 
+  // A page can LOAD and then freeze: an ad-heavy site pins the renderer's
+  // main thread and the tab paints the same frame forever (the field report
+  // "it didn't respond" — cinelove.live reached its language dialog, then
+  // nothing). Before this the tab had no recovery path at all: the view
+  // stayed on screen, a reload queued behind the frozen JS, and the app UI
+  // sat behind the opaque view. Surface the same card slot the blocked /
+  // failed flow uses: hold the view back (issueHidden) and let the renderer
+  // show a "stopped responding" card with Reload and Close.
+  contents.on('unresponsive', () => {
+    if (!onIssue) return;
+    unresponsiveContents.add(contents.id);
+    issueHidden.add(id);
+    send('core:tab-unresponsive', { id, url: contents.getURL() });
+    if (onLayout) applyLayout();
+  });
+  contents.on('responsive', () => {
+    if (!onIssue) return;
+    // The page thawed on its own: the view comes back and the card clears.
+    if (!unresponsiveContents.delete(contents.id)) return;
+    issueHidden.delete(id);
+    send('core:tab-responsive', { id });
+    if (onLayout) applyLayout();
+  });
+  contents.on('render-process-gone', (_event, details) => {
+    if (!onIssue) return;
+    if (suppressProcessGone.delete(contents.id)) {
+      // Our own recovery crash (recoverFrozenRenderer): the retry's load is
+      // already in flight and its commit clears the state. Not a page fault.
+      unresponsiveContents.delete(contents.id);
+      return;
+    }
+    const reason = details && details.reason;
+    if (reason === 'clean-exit' || reason === 'killed') return; // expected teardown
+    // The renderer is dead: 'responsive' will never come, and the card is
+    // the only way back (Reload spawns a fresh renderer for the frame).
+    unresponsiveContents.add(contents.id);
+    issueHidden.add(id);
+    send('core:tab-unresponsive', { id, url: contents.getURL(), crashed: true });
+    if (onLayout) applyLayout();
+  });
+
   if (onMedia) {
     // A background tab can't own media fullscreen: the user is looking at a
     // different tab, and maximising the window for a hidden video would be a
@@ -1263,6 +1336,9 @@ function wireBrowsingContents(contents, id, opts = {}) {
   contents.on('did-finish-load', () => {
     onTitle(contents.getTitle() || safeHost(contents.getURL() || 'https://example.com'));
     issueHidden.delete(id); // a finished load has no blocked/failed state
+    // A committed document also ends any frozen/crashed state: the retry
+    // landed (the card the store dismissed is confirmed stale — clear it).
+    if (unresponsiveContents.delete(contents.id)) send('core:tab-responsive', { id });
     releaseGate(contents.id, id, 'finish');
     if (onLayout) applyLayout();
     engine.applyCosmetics(contents).catch(console.warn);
@@ -1275,6 +1351,8 @@ function wireBrowsingContents(contents, id, opts = {}) {
     lastRequested.delete(contents.id);
     popunderWatches.delete(contents.id);
     immediateOpenWatches.delete(contents.id);
+    unresponsiveContents.delete(contents.id);
+    suppressProcessGone.delete(contents.id);
   });
 }
 
@@ -1808,6 +1886,7 @@ function registerIPC() {
     if (contents.isDestroyed()) return;
     const shouldLoad = freshNav || (contents.getURL() !== url && !contents.isLoadingMainFrame());
     if (shouldLoad) {
+      recoverFrozenRenderer(contents); // typing a new address into a frozen tab must not queue behind the dead JS either
       navigationLocks.set(contents.id, { url, at: Date.now() });
       lastRequested.set(contents.id, url);
       try { await contents.loadURL(url); }
@@ -1838,6 +1917,7 @@ function registerIPC() {
     if (action === 'forward' && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
     if (action === 'reload') {
       issueHidden.delete(id); // a retry dismisses the blocked/failed card (the view stays hidden until the retry commits)
+      recoverFrozenRenderer(contents); // the frozen tab's "Reload page": a plain reload() would queue behind the dead JS
       navigationLocks.set(contents.id, { url: contents.getURL(), at: Date.now() });
       contents.reload();
     }

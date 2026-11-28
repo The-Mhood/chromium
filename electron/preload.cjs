@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld('chromiumCore', {
   onPopupBlocked: subscribe('core:popup-blocked'),
   onNavigationBlocked: subscribe('core:navigation-blocked'),
   onLoadFailed: subscribe('core:load-failed'),
+  onTabUnresponsive: subscribe('core:tab-unresponsive'),
+  onTabResponsive: subscribe('core:tab-responsive'),
   onTabClosed: subscribe('core:tab-closed'),
   onToast: subscribe('core:toast'),
   onDialogData: subscribe('core:dialog-data'),

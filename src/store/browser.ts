@@ -45,6 +45,7 @@ interface BrowserState {
   setPreference: (key: 'theme' | 'searchEngine' | 'doNotTrack', value: string | boolean) => void;
   setNativeStats: (stats: NativeStats) => void;
   setTabIssue: (id: string, issue: TabIssue | null) => void;
+  retryUnresponsive: () => void;
   removeTab: (id: string) => void;
   clearActivity: () => void;
   notify: (text: string, tone?: 'success' | 'info' | 'error') => void;
@@ -163,6 +164,21 @@ export const useBrowser = create<BrowserState>()(persist((set, get) => ({
     if (issue) tabIssues[id] = issue; else delete tabIssues[id];
     return { tabIssues };
   }),
+  retryUnresponsive: () => {
+    // The unresponsive card's "Reload page": the SMART reload. The main
+    // process force-crashes the frozen renderer before reloading, so the
+    // retry actually lands (a plain reload queues behind the dead JS). This
+    // is not a navigation — no history entry, no navSeq bump. If the retry
+    // then fails to load, main raises a 'failed' card; when its document
+    // commits, core:tab-responsive clears this card (a no-op by then).
+    const id = get().activeTabId;
+    window.chromiumCore?.tabAction(id, 'reload');
+    set(state => {
+      const tabIssues = { ...state.tabIssues };
+      delete tabIssues[id];
+      return { tabIssues };
+    });
+  },
   clearActivity: () => set({ activityCleared: true, nativeStats: { ads: 0, trackers: 0, popups: 0, threats: 0, events: [] } }),
   notify: (text, tone = 'success') => set({ toast: { text, tone, key: Date.now() } }),
   dismissToast: () => set({ toast: null }),
