@@ -793,3 +793,109 @@ test('gated popup rule does not fire for same-origin clicks or opens that preced
   });
   assert.notEqual(openFirst.reason, 'gated-popup', 'an open that preceded the click is not gated');
 });
+
+// ---------------------------------------------------------------------------
+// Interstitial-ad URL fingerprint (rotating ad domains in no filter list)
+// ---------------------------------------------------------------------------
+
+const LWTZ = 'https://lwtz.com/1838/en.html?pb=27275087&browser=other&campaignid=1808628&city=lagos&country=NG&device=desktop&expires=1795861524&p=105.127.10.165&md5lp=lyXB9Y38wVoXLAciW';
+const interstitialStub = url => /lwtz\.com$|\.lwtz\.com$/.test(new URL(url).hostname) || url.includes('clientip=105.127.10.165');
+
+test('classify: a campaign-shaped destination is blocked even on a real click (interstitial-ad)', () => {
+  const policy = createPopupPolicy({
+    now: () => 1_000_000,
+    matchRequest: () => false, // the domain is in NO list
+    getSettings: () => ({ protection: { enabled: true, popups: true }, allowlist: [] }),
+    isAllowedDomain,
+    isInterstitialAd: interstitialStub,
+  });
+  // The field shape: a genuine fresh click, link-shaped, but the
+  // destination carries the campaign fingerprint. No gesture can save it.
+  const d = policy.classifyWindowOpen({
+    url: LWTZ,
+    sourceUrl: 'https://movies.test/watch/1838',
+    disposition: 'foreground-tab',
+    tabCount: 1,
+    pageState: { ageMs: 0, click: { t: 1_000_000, isTop: true, crossOrigin: false, href: LWTZ } },
+    contentsId: 1,
+    atMs: 1_000_000,
+  });
+  assert.equal(d.allowed, false);
+  assert.equal(d.reason, 'interstitial-ad');
+  assert.equal(d.needsCommit, false);
+});
+
+test('classify: the interstitial check yields to an explicit allowlist choice', () => {
+  const policy = createPopupPolicy({
+    now: () => 1_000_000,
+    matchRequest: () => false,
+    getSettings: () => ({ protection: { enabled: true, popups: true }, allowlist: ['movies.test'] }),
+    isAllowedDomain,
+    isInterstitialAd: () => true, // matches everything
+  });
+  const d = policy.classifyWindowOpen({
+    url: 'https://anything.test/open',
+    sourceUrl: 'https://movies.test/page',
+    disposition: 'foreground-tab',
+    tabCount: 1,
+    pageState: { ageMs: 0 },
+    contentsId: 1,
+    atMs: 1_000_000,
+  });
+  assert.equal(d.allowed, true);
+  assert.equal(d.reason, 'allowlisted');
+});
+
+test('classify: without a detector wired in, behaviour is exactly as before', () => {
+  const { classify } = makePolicy();
+  const d = classify({ pageState: { ageMs: 0 } });
+  assert.equal(d.allowed, true, 'a fresh gesture still opens unlisted destinations');
+});
+
+test('verdict: a commit to a campaign-shaped URL is blocked (type Ad), for every kind of open', () => {
+  // Scripted open that commits straight to its (ad) destination:
+  const scripted = verdict({
+    intendedUrl: 'https://redirector.test/offer',
+    finalUrl: LWTZ,
+    isInterstitialAd: interstitialStub,
+  });
+  assert.equal(scripted.block, true);
+  assert.equal(scripted.reason, 'interstitial-ad');
+  assert.equal(scripted.type, 'Ad');
+  // A LINK CLICK that redirects into the campaign URL (the viaLinkClick
+  // exemption from the domain-jump rule must NOT exempt the fingerprint):
+  const link = verdict({
+    intendedUrl: 'https://movies.test/watch/1838',
+    openerUrl: 'https://movies.test/home',
+    finalUrl: LWTZ,
+    viaLinkClick: true,
+    isInterstitialAd: interstitialStub,
+  });
+  assert.equal(link.block, true);
+  assert.equal(link.reason, 'interstitial-ad');
+  assert.equal(link.type, 'Ad');
+  // An IP-echo in the final URL is enough on its own:
+  const ipEcho = verdict({
+    intendedUrl: 'https://movies.test/watch/1838',
+    finalUrl: 'https://sweep-net.test/p?x=1&clientip=105.127.10.165',
+    viaLinkClick: true,
+    isInterstitialAd: interstitialStub,
+  });
+  assert.equal(ipEcho.block, true);
+  assert.equal(ipEcho.reason, 'interstitial-ad');
+});
+
+test('verdict: ordinary destinations are unaffected by the fingerprint', () => {
+  const ordinary = verdict({
+    intendedUrl: 'https://site.test/page',
+    openerUrl: 'https://site.test/page',
+    finalUrl: 'https://site.test/page?step=2&token=abc&expires=1795861524',
+    viaLinkClick: true,
+    isInterstitialAd: interstitialStub,
+  });
+  assert.equal(ordinary.block, false, 'benign campaign-looking session params are not ads');
+  // No detector wired in: a SCRIPTED open that commits straight to its own
+  // (ad) destination passes the historical verdict — exactly the gap the
+  // fingerprint closes. (A cross-domain jump would already be a popunder.)
+  assert.equal(verdict({ intendedUrl: LWTZ, finalUrl: LWTZ }).block, false, 'without the detector a direct commit to the ad URL passes');
+});

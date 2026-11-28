@@ -65,9 +65,15 @@ export default function App() {
   useEffect(() => {
     const bridge = window.chromiumCore;
     if (!bridge) return;
-    bridge.focusTab(active.id, page === 'external').then(() => {
-      if (page === 'external') return bridge.navigate(active.id, active.url, activeNavSeq);
-    }).catch(() => notify('This page could not be opened. Try another address.', 'error'));
+    // Focus and navigate are INDEPENDENT: the navigation is not chained
+    // behind the focus promise. A focus invoke that rejects or stalls must
+    // not leave the tab on its loading card forever — that chain is the
+    // "the tab refuses the address I type" defect. Each call reports its
+    // own failure; focus is best-effort (layout only).
+    bridge.focusTab(active.id, page === 'external').catch(() => {});
+    if (page === 'external') {
+      bridge.navigate(active.id, active.url, activeNavSeq).catch(() => notify('This page could not be opened. Try another address.', 'error'));
+    }
   }, [active.id, active.url, page, activeNavSeq, notify]);
   useEffect(() => { window.chromiumCore?.setProtection(protection).catch(() => notify('Protection settings could not be applied.', 'error')); }, [protection, notify]);
   useEffect(() => { window.chromiumCore?.setAllowlist(allowlist).catch(() => notify('Allowlist could not be applied.', 'error')); }, [allowlist, notify]);

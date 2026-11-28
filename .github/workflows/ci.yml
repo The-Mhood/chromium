@@ -23,7 +23,26 @@ jobs:
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       # Download-page artifact checks are excluded until real release binaries are published.
-      - run: npx playwright test --grep-invert "download|platform buttons|unavailable|file removed"
+      # The github reporter turns each failed test into a check annotation, and
+      # the tee'd log is thrown as an error annotation on failure — job logs
+      # are not always downloadable from every environment.
+      - run: |
+          npx playwright test --grep-invert "download|platform buttons|unavailable|file removed" --reporter=line,github 2>&1 | tee playwright-test.log
+          exit "${PIPESTATUS[0]}"
+      - if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let tail = '';
+            try {
+              tail = fs.readFileSync('playwright-test.log', 'utf8').trim().split('\n').slice(-80).join('\n');
+            } catch (e) { /* no log captured */ }
+            throw new Error(
+              'ChromiumCore frontend e2e failed on ubuntu-latest (node ' + process.version +
+              '), commit ' + (context.sha || '?') + '.\n--- log tail ---\n' +
+              (tail || '(no output captured)')
+            );
 
   electron:
     runs-on: ubuntu-latest
