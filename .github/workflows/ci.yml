@@ -58,7 +58,12 @@ jobs:
       # This project stores a base64 recovery copy of gradle-wrapper.jar; the
       # packaging script restores it, runs unit tests, assembles and verifies the APK.
       - name: Build the Android TV app
-        run: node scripts/package-android.mjs 2>&1 | tee android-tv-build.log
+        run: |
+          # tee the log for the failure annotation below, but propagate the BUILD's exit
+          # code: without PIPESTATUS the step reported success even when Gradle failed, and
+          # the failure only surfaced two steps later as "APK not found".
+          node scripts/package-android.mjs 2>&1 | tee android-tv-build.log
+          exit "${PIPESTATUS[0]}"
       # Keep the compilation ZIP (the thing users download to build on their
       # own machines) building on every change too.
       - run: node scripts/package-android-source.mjs

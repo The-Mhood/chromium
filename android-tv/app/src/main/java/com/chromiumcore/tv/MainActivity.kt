@@ -65,9 +65,11 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * ChromiumCore for Android TV: a WebView browser operated entirely with a remote control.
  *
- * The D-pad drives an on-screen pointer. While the pointer is active, arrow keys move it, OK clicks,
- * pushing it against the top or bottom edge scrolls, and pushing up at the top of a page reaches the
- * address bar. Real taps and mouse input still work if the TV supports them.
+ * The D-pad drives an on-screen pointer and is the page's SCROLL WHEEL: while the pointer is
+ * active, UP/DOWN scroll the page from anywhere (the pointer stays put), OK clicks, and on a
+ * page that cannot scroll a direction the arrows move the pointer instead — at the top of a
+ * page, UP climbs to the site header, then to the address bar. Real taps and mouse input still
+ * work if the TV supports them.
  */
 class MainActivity : Activity() {
 
@@ -459,12 +461,16 @@ class MainActivity : Activity() {
     private fun focusAddressBar() {
         urlField.requestFocus()
         urlField.selectAll()
-        showKeyboard(urlField)
+        // Many TVs have no on-screen keyboard: the request fails silently and the field would
+        // look dead. Report it so the user knows the field IS focused and ready for whatever
+        // keys the TV does have (a connected keyboard's letters go straight into it).
+        if (!showKeyboard(urlField)) {
+            toast("Address bar is ready. This TV has no on-screen keyboard to type with.")
+        }
     }
 
-    private fun showKeyboard(view: View) {
+    private fun showKeyboard(view: View): Boolean =
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
-    }
 
     private fun hideKeyboard() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(urlField.windowToken, 0)
@@ -618,14 +624,16 @@ class MainActivity : Activity() {
     }
 
     private fun movePointer(direction: Direction, repeat: Int) {
-        // SCROLL ZONE: the page scrolls while the pointer is inside the top or bottom quarter
-        // of the page (see PointerMath.scrollDecision) — it no longer has to travel to the very
-        // edge first (half a screen away on a TV, which is what made YouTube feel unscrollable,
-        // and what the old 48dp band still failed to fix). The pointer stays put while the page
-        // moves, so keeping the key held scrolls steadily at one line per repeat.
+        // The D-pad is the page's SCROLL WHEEL: UP/DOWN scroll the page from anywhere on the
+        // screen while the page can scroll that way, and the pointer stays put — exactly like
+        // a mouse wheel, so holding the key scrolls steadily at one line per repeat. When the
+        // page CANNOT scroll in the pressed direction, the key moves the pointer instead: at
+        // the top of a page, UP pulls the pointer up into the site's header (it stops on any
+        // header link, where OK clicks), and once the pointer is at the very top the press is
+        // aimed at the browser toolbar (see PointerMath.scrollDecision).
         val bounds = pointerBounds()
-        val zone = PointerMath.scrollZonePx(bounds.bottom - bounds.top, density)
-        when (PointerMath.scrollDecision(pointerX, pointerY, direction, bounds, zone,
+        val step = PointerMath.step(PointerMath.BASE_STEP_DP * density, repeat, PointerMath.speedFactor(settings.pointerSpeed))
+        when (PointerMath.scrollDecision(pointerY, direction, bounds, step,
             webView.canScrollVertically(-1), webView.canScrollVertically(1))
         ) {
             PointerAction.SCROLL_DOWN -> {
@@ -642,7 +650,6 @@ class MainActivity : Activity() {
             }
             PointerAction.MOVE_POINTER -> Unit
         }
-        val step = PointerMath.step(PointerMath.BASE_STEP_DP * density, repeat, PointerMath.speedFactor(settings.pointerSpeed))
         val move = PointerMath.move(pointerX, pointerY, direction, step, bounds)
         pointerX = move.x
         pointerY = move.y
@@ -651,15 +658,31 @@ class MainActivity : Activity() {
         dispatchHover()
     }
 
-    /** Sends a mouse-wheel event at the pointer so the scrollable element under it moves, as with a real mouse. */
+    /**
+     * Sends a mouse-wheel event at the pointer so the scrollable element under it moves, as with
+     * a real mouse. Some TV WebView builds drop the generic-motion wheel event without moving
+     * anything — the "doesn't scroll down" report — so if the page's scroll position has not
+     * changed a moment later, fall back to the classic WebView scrollBy: a held key then still
+     * scrolls at a steady speed, on every build.
+     */
     private fun scrollLines(lines: Int) {
         val target = inputTarget()
+        val before = webView.scrollY
         val (x, y) = toLocal(target, pointerX, pointerY)
         val event = mouseEvent(MotionEvent.ACTION_SCROLL, x, y, -lines.toFloat())
         target.dispatchGenericMotionEvent(event)
         event.recycle()
         wakePointer()
+        if (customView != null) return // fullscreen video: nothing behind it to scroll
+        handler.postDelayed({
+            if (webView.scrollY != before) return@postDelayed
+            val px = (SCROLL_FALLBACK_LINES_PX * density * lines).toInt()
+            if (px != 0) webView.scrollBy(0, px)
+        }, 100)
     }
+
+    /** Pixels of scrollBy per wheel line, used only when the wheel event did not move the page. */
+    private val SCROLL_FALLBACK_LINES_PX = 72f
 
     private fun dispatchHover() {
         val target = inputTarget()
@@ -859,11 +882,12 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
             .setTitle("Remote controls")
             .setMessage(
-                "Arrow keys: move the pointer. Hold to move faster.\n" +
+                "Up / Down: scroll the page. Hold to keep scrolling — the pointer stays put.\n" +
+                    "Left / Right: move the pointer sideways.\n" +
+                    "When the page cannot scroll a way, that arrow moves the pointer instead.\n" +
                     "OK / Select: click at the pointer.\n" +
-                    "Pointer near the top or bottom edge: keep pressing to scroll the page.\n" +
-                    "Channel or Page Up / Down: scroll the page.\n" +
-                    "Pointer at the top of a page: press Up again to reach the toolbar.\n" +
+                    "At the top of a page: press Up to reach the toolbar and address bar.\n" +
+                    "Channel or Page Up / Down: scroll several lines.\n" +
                     "Menu or Info: open this menu. Search: edit the address.\n" +
                     "Back: go back, or leave full-screen video.",
             )

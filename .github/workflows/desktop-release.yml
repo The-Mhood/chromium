@@ -192,3 +192,42 @@ jobs:
           name: ChromiumCore-all-in-one
           path: ChromiumCore-all-in-one.zip
           if-no-files-found: error
+
+  # Publish the artifacts as a real GitHub RELEASE with attached assets. Run
+  # artifacts expire after 90 days; release assets do not, and their download
+  # URLs are stable (https://github.com/.../releases/download/<tag>/<file>).
+  # Tag pushes only — manual workflow_dispatch runs never touch the releases.
+  release:
+    needs: [package, android-tv, bundle]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Attach every build to the tag's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          FILES=(
+            artifacts/ChromiumCore-win32-x64/ChromiumCore-1.0.0-win32-x64.exe
+            artifacts/ChromiumCore-darwin-arm64/ChromiumCore-1.0.0-darwin-arm64.zip
+            artifacts/ChromiumCore-darwin-x64/ChromiumCore-1.0.0-darwin-x64.zip
+            artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-universal.apk
+            artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-tv-source.zip
+            artifacts/ChromiumCore-android-tv-app/ChromiumCore-1.0.0-android-tv-app.zip
+            artifacts/ChromiumCore-all-in-one/ChromiumCore-all-in-one.zip
+          )
+          for f in "${FILES[@]}"; do
+            if [ ! -f "$f" ]; then echo "Missing expected release file: $f" >&2; exit 1; fi
+          done
+          # Checksum file for every asset, by basename, plus the unsigned-preview note.
+          for f in "${FILES[@]}"; do sha256sum "$f" | awk -v n="$(basename "$f")" '{print $1"  "n}'; done > SHA256SUMS.txt
+          printf '\nEvery build is unsigned (a preview release). On first run:\n  - Windows: SmartScreen "More info" -> "Run".\n  - macOS: right-click the app -> Open (or run: xattr -dr com.apple.quarantine /Applications/ChromiumCore.app).\n  - Android TV: allow installs from unknown sources, then sideload the APK.\n' >> SHA256SUMS.txt
+          NOTES=$(printf "ChromiumCore v%s\n\n- Windows (64-bit): ChromiumCore-1.0.0-win32-x64.exe — NSIS installer.\n- macOS Apple Silicon: ChromiumCore-1.0.0-darwin-arm64.zip\n- macOS Intel: ChromiumCore-1.0.0-darwin-x64.zip\n- Android TV: ChromiumCore-1.0.0-android-universal.apk (or the all-in-one / tv-app ZIPs).\n\nThis release rebuilds the Android TV navigation: the D-pad is now the page's scroll wheel (UP/DOWN scroll from anywhere, the pointer stays put), and when the page cannot scroll a direction the arrows move the pointer instead — at the top of a page UP climbs to the site header, then to the address bar. If a TV's WebView drops the wheel event, scrolling falls back to the classic scroll path so a held key still works, and TVs without an on-screen keyboard tell you so when you open the address bar. The YouTube shield (bundled from shared/ into the TV build) is unchanged — you can now actually reach YouTube to see it work.\n\nSHA-256 sums for every asset are in SHA256SUMS.txt." "$TAG")
+          gh release create "v$TAG" --title "ChromiumCore v$TAG" --target "${GITHUB_SHA}" --notes "$NOTES" SHA256SUMS.txt "${FILES[@]}"
+          echo "Published release v$TAG with ${#FILES[@]} assets."

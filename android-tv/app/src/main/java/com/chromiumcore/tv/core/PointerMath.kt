@@ -28,27 +28,10 @@ object PointerMath {
     const val BASE_STEP_DP = 10f
     const val MAX_RAMP_REPEATS = 12
     const val MAX_RAMP_FACTOR = 3.0f
-    /** Width of the top/bottom band where arrow presses scroll the page instead of moving the
-     *  pointer. Without a band, scrolling only started at the very edge — half a screen away on
-     *  a TV — which made long pages (YouTube first of all) feel impossible to scroll. */
-    const val SCROLL_ZONE_DP = 48f
-    /** Lines of scroll per press at the edge band. Deliberately CONSTANT: the OS repeats a held
-     *  key faster and faster, so a per-press amount that grew with repeat count made the page
-     *  crawl at first and then zoom out of control. One line per press = steady speed. */
+    /** Lines of scroll per press. Deliberately CONSTANT: the OS repeats a held key faster and
+     *  faster, so a per-press amount that grew with the repeat count made the page crawl at
+     *  first and then zoom out of control. One line per press = steady speed. */
     const val EDGE_SCROLL_LINES = 1
-    /** Fraction of the page height (top or bottom) where a direction press scrolls the page
-     *  instead of moving the pointer. The old fixed 48dp band sat so close to the edge that
-     *  the pointer first had to travel half the TV screen before scrolling could begin —
-     *  which is why YouTube still felt unscrollable after the band was added. A quarter of
-     *  the page means a press from the middle of the screen reaches the zone in one or two
-     *  steps, and a held key starts scrolling almost immediately. */
-    const val SCROLL_ZONE_FRACTION = 0.25f
-    /** Floor so the zone stays usable on very short viewports — the old fixed 48dp width. */
-    const val MIN_SCROLL_ZONE_DP = 48f
-
-    /** Scroll-zone width in px for a page of [viewportPx] (fraction, with a dp floor). */
-    fun scrollZonePx(viewportPx: Float, density: Float): Float =
-        (viewportPx * SCROLL_ZONE_FRACTION).coerceAtLeast(MIN_SCROLL_ZONE_DP * density)
 
     /** Holding a direction key speeds the pointer up gradually, from 1x to a capped 3x. The cap
      *  (old: about 6.6x) keeps a held key from zooming across the screen — the ramp should feel
@@ -65,44 +48,41 @@ object PointerMath {
         else -> 1f
     }
 
-    /** True when the pointer sits inside the scroll band on the side being pressed, so scrolling
-     *  starts before the pointer has to travel all the way to the edge. LEFT/RIGHT never scroll
-     *  (horizontal pages are rare on a TV, and sideways pointer travel must stay pointer travel). */
-    fun inScrollBand(x: Float, y: Float, direction: Direction, bounds: PointerBounds, zonePx: Float): Boolean = when (direction) {
-        Direction.DOWN -> bounds.bottom >= bounds.top && y >= bounds.bottom - zonePx
-        Direction.UP -> bounds.bottom >= bounds.top && y <= bounds.top + zonePx
-        Direction.LEFT, Direction.RIGHT -> false
-    }
-
     /**
-     * Decide what ONE direction-key press does at the pointer's position. The zones are
-     * deliberately asymmetric:
-     *  - DOWN in the bottom zone scrolls down (when the page can); at the very bottom of the
-     *    page it just moves the pointer, so the press is never swallowed;
-     *  - UP in the bottom zone scrolls the page back up when it can — the "get back up
-     *    YouTube" path — and otherwise lets the pointer leave the zone;
-     *  - UP in the top zone scrolls up when the page can, otherwise the press is aimed at
-     *    the toolbar (the caller applies its fresh-press rule);
-     *  - DOWN in the top zone ALWAYS moves the pointer: the pointer must be able to travel
-     *    from the top into the page, that is where every navigation starts.
-     * LEFT/RIGHT never scroll (horizontal pages are rare on a TV).
+     * Decide what ONE direction-key press does at the pointer's position.
+     *
+     * The D-pad is the page's SCROLL WHEEL first: UP/DOWN scroll the page from ANYWHERE on
+     * screen while the page can scroll that way, and the pointer stays where it is — exactly
+     * like a mouse wheel. (The previous model required the pointer to travel into a top/bottom
+     * quarter of the screen before scrolling began: from the middle of a TV that was a quarter
+     * screen of arrow presses, and in the top quarter UP scrolled instead of moving, so the
+     * pointer could never reach a site's header. "Couldn't scroll down", "can't get to the
+     * header", "can't even reach YouTube".)
+     *
+     * When the page CANNOT scroll in the pressed direction, the key moves the pointer instead,
+     * so at the top of a page UP pulls the pointer up into the site header (stopping on any
+     * header link, where OK clicks). With the pointer at the very top of the page, the press is
+     * aimed at the browser toolbar instead — the caller fires that only on a fresh press, not
+     * on repeats. LEFT/RIGHT always move the pointer (horizontal pages are rare on a TV).
      */
     fun scrollDecision(
-        x: Float,
         y: Float,
         direction: Direction,
         bounds: PointerBounds,
-        zonePx: Float,
+        stepPx: Float,
         canScrollUp: Boolean,
         canScrollDown: Boolean
     ): PointerAction {
-        val topZone = bounds.bottom >= bounds.top && y <= bounds.top + zonePx
-        val bottomZone = bounds.bottom >= bounds.top && y >= bounds.bottom - zonePx
         return when (direction) {
-            Direction.DOWN -> if (bottomZone && canScrollDown) PointerAction.SCROLL_DOWN else PointerAction.MOVE_POINTER
+            Direction.DOWN -> if (canScrollDown) PointerAction.SCROLL_DOWN else PointerAction.MOVE_POINTER
             Direction.UP -> when {
-                topZone -> if (canScrollUp) PointerAction.SCROLL_UP else PointerAction.FOCUS_TOOLBAR
-                bottomZone -> if (canScrollUp) PointerAction.SCROLL_UP else PointerAction.MOVE_POINTER
+                canScrollUp -> PointerAction.SCROLL_UP
+                // Page at the top: if the pointer can still climb the page, let it reach the
+                // site header — it may land exactly on the top edge (y - stepPx == top),
+                // where OK clicks the header content — so only a press that would overshoot
+                // past the top aims at the toolbar. (The bounds guard keeps a not-yet-laid-out,
+                // inverted area benign.)
+                bounds.bottom >= bounds.top && y - stepPx < bounds.top -> PointerAction.FOCUS_TOOLBAR
                 else -> PointerAction.MOVE_POINTER
             }
             Direction.LEFT, Direction.RIGHT -> PointerAction.MOVE_POINTER
