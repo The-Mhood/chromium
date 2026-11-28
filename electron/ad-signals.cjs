@@ -33,6 +33,11 @@ const WEAK_PARAMS = new Set(['pb', 'expires', 'token', 'sign', 'sig', 'camp', 'c
 // Parameters that carry an IP address value. A query param holding the
 // VISITOR'S IPv4 address is ad fingerprinting, full stop.
 const IP_ECHO_PARAMS = new Set(['p', 'ip', 'clientip', 'userip', 'remoteip', 'visitorip', 'visitoripaddress']);
+// Named campaign fallbacks: the network's router parameter when the
+// original placement (a "north" traffic source) failed. Field evidence
+// (Nov 2026): coronisoralogy.cfd/…/?param_3=nortb_fallback&md=…
+const NAMED_CAMPAIGN_PARAMS = new Set(['param_3', 'param3']);
+const NAMED_CAMPAIGN_VALUES = new Set(['nortb_fallback']);
 
 function ipv4(value) {
   if (typeof value !== 'string') return false;
@@ -54,7 +59,11 @@ function ipv4(value) {
  *   1. an IP-echo parameter holds an IPv4 address (visitor IP fingerprint);
  *   2. at least one STRONG ad-network parameter is present AND at least one
  *      WEAK campaign parameter is present (the full cluster);
- *   3. two or more STRONG ad-network parameters are present.
+ *   3. two or more STRONG ad-network parameters are present;
+ *   4. a NAMED campaign-fallback parameter holds a known campaign value
+ *      (param_3=nortb_fallback) — the coronisoralogy.cfd -> playnaja.com
+ *      router shape. The value itself is the signal (no weak cluster
+ *      needed; see adCampaignMatch).
  *
  * Anything else — including ordinary marketing parameters (utm_*, ref, id,
  * token, expires alone) — passes. `input` that is not a parseable http(s)
@@ -64,21 +73,41 @@ function ipv4(value) {
  * @returns {boolean}
  */
 function looksLikeAdCampaignUrl(input) {
-  if (typeof input !== 'string' || !input) return false;
+  return adCampaignMatch(input) !== null;
+}
+
+/**
+ * The ad-campaign rule that fires for `input`, or null. Same rules as
+ * looksLikeAdCampaignUrl, but names the rule so the caller can log WHY a
+ * gate fired (which is what "works in tests, dead in the field" needs).
+ *
+ * @param {string} input
+ * @returns {?{name: string, detail: string}}
+ */
+function adCampaignMatch(input) {
+  if (typeof input !== 'string' || !input) return null;
   let url;
-  try { url = new URL(input); } catch { return false; }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  try { url = new URL(input); } catch { return null; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
 
   let strongHits = 0;
   let weakHits = 0;
+  let namedFallback = null;
   for (const [name, value] of url.searchParams) {
     const key = name.toLowerCase();
     if (STRONG_PARAMS.has(key)) strongHits += 1;
     else if (WEAK_PARAMS.has(key)) weakHits += 1;
-    else if (IP_ECHO_PARAMS.has(key) && ipv4(value)) return true;
+    else if (IP_ECHO_PARAMS.has(key) && ipv4(value)) return { name: 'ip-echo', detail: `${name}=${value}` };
+    else if (NAMED_CAMPAIGN_PARAMS.has(key) && NAMED_CAMPAIGN_VALUES.has(value.toLowerCase())) namedFallback = `${name}=${value}`;
   }
-  if (strongHits >= 2) return true;
-  return strongHits >= 1 && weakHits >= 1;
+  if (strongHits >= 2) return { name: 'strong-cluster', detail: `${strongHits} strong params` };
+  if (strongHits >= 1 && weakHits >= 1) return { name: 'strong-weak-cluster', detail: `1+ strong with ${weakHits} weak` };
+  // The named campaign fallback is unmistakable on its own: a legitimate
+  // site never emits param_3=nortb_fallback, so no weak cluster is needed
+  // (and requiring one would miss the shape the moment the network drops
+  // a single tracking param).
+  if (namedFallback) return { name: 'named-campaign-fallback', detail: namedFallback };
+  return null;
 }
 
-module.exports = { looksLikeAdCampaignUrl };
+module.exports = { looksLikeAdCampaignUrl, adCampaignMatch };

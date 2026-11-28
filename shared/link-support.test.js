@@ -140,20 +140,39 @@ test('a second click on the same anchor cancels the commit and opens the dialog'
   assert.equal(page.location.href, 'https://site.example/home', 'no navigation after a double-click');
 });
 
-test('a MANUAL double (slower than an OS double-click, up to 1000 ms apart) still opens the dialog', () => {
+test('a MANUAL double (slower than an OS double-click, inside the same-frame commit window) opens the dialog', () => {
   // The field failure: a deliberate double-click at desk or TV distance is
-  // slower than the OS double-click window. With the old 300 ms commit
-  // delay the first click committed long before the second landed and the
-  // dialog never opened. The commit must wait for the full manual window.
+  // slower than the OS double-click window (~300 ms). For SAME-FRAME links
+  // the effective double window is the commit delay (the first click is
+  // held that long before it navigates), so the second click must land
+  // before the commit — 500 ms is a realistic manual double that the old
+  // 300 ms window missed.
   const page = makePage();
   page.fire('click');
-  page.clock.advance(950); // past the old 300/600 ms commit delays
+  page.clock.advance(500); // inside the 600 ms commit window, past the OS double
   const second = page.fire('click');
   assert.equal(second.defaultPrevented, true, 'the late second click still cancels the first');
   assert.equal(page.ccMessages().filter((m) => m.t === 'dialog').length, 1, 'the dialog opened');
   page.clock.advance(5000);
   page.clock.flush();
   assert.equal(page.location.href, 'https://site.example/home', 'and nothing navigated');
+});
+
+test('a MANUAL double on a new-tab link (up to 1500 ms apart) opens the dialog', () => {
+  // The (1000,1500] ms field gap: for _blank links the first click opens
+  // the tab natively (never deferred), so the double window is
+  // SECOND_CLICK_MS itself. The old 1000 ms ceiling missed manual doubles
+  // at 1000-1500 ms ("double click does nothing"); the window now matches
+  // LINK_SECOND_CLICK_MS (1500) in the main process.
+  const page = makePage({ target: '_blank' });
+  page.fire('click');
+  page.clock.advance(1400); // past the old 1000 ms ceiling, inside the 1500 ms window
+  const second = page.fire('click');
+  assert.equal(second.defaultPrevented, true, 'the late second click is the double, not a second tab');
+  assert.equal(page.ccMessages().filter((m) => m.t === 'dialog').length, 1, 'the dialog opened');
+  page.clock.advance(5000);
+  page.clock.flush();
+  assert.equal(page.location.href, 'https://site.example/home', 'the source page did not navigate');
 });
 
 test('a second click on a DIFFERENT anchor does not trigger the dialog; the latest click wins', () => {
@@ -219,7 +238,7 @@ test('two-finger tap then a plain click (the other mixed order) also opens the d
 test('a tap older than the double window does not combine with a later click', () => {
   const page = makePage();
   page.fire('contextmenu');
-  page.clock.advance(1500); // far past the 1000 ms window
+  page.clock.advance(1600); // past the 1500 ms window
   const click = page.fire('click');
   assert.equal(click.defaultPrevented, true, 'a fresh click is still held for ITS own double window');
   assert.equal(page.ccMessages().filter((m) => m.t === 'dialog').length, 0, 'the stale tap was ignored');

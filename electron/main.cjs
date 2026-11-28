@@ -26,9 +26,10 @@ const crypto = require('node:crypto');
 const { createProtectionEngine } = require('./protection.cjs');
 const { FullscreenController } = require('./fullscreen-state.cjs');
 const { browsingUrl, isAllowedDomain, trustedFilterUrl } = require('./security.cjs');
-const { looksLikeAdCampaignUrl } = require('./ad-signals.cjs');
+const { looksLikeAdCampaignUrl, adCampaignMatch } = require('./ad-signals.cjs');
 const { buildShieldScript } = require('./youtube-shield.cjs');
-const { committedNavigationVerdict, pickAttribution, sameAnchorHref } = require('./popup-blocker.cjs');
+const { committedNavigationVerdict, pickAttribution, sameAnchorHref, getRegistrableDomain } = require('./popup-blocker.cjs');
+const { createAppLogger } = require('./log.cjs');
 
 let win;
 let engine;
@@ -569,7 +570,21 @@ async function readPagePopupState(contents, atMs, options = {}) {
 
 const LINK_DEDUP_MS = 1500;              // repeat clicks on the same destination are dropped within this window
 const LINK_PAGESTATE_BUDGET_MS = 150;    // the frame-attribution read on the click path must never hold the click up
-const LINK_SECOND_CLICK_MS = 1000;       // a second fresh click this soon after the first is the double-click (matches the in-page window; a manual "double" at TV/trackpad distances is slower than an OS double-click)
+// A second fresh click this soon after the first is the double-click. The
+// OS gesture itself is ~300 ms, but a MANUAL double (trackpad two-finger
+// tap, TV remote, or a deliberate "click again" on the Mac) runs well past
+// 1 s. The old 1000 ms ceiling left a (1000,1500] ms dead zone where the
+// second click was silently deduped — the "double click does nothing" field
+// report. Set equal to the dedup window so EVERY second click inside the
+// window becomes the dialog (no silent-dedup gap), while a re-click after
+// the window still opens a tab as before.
+const LINK_SECOND_CLICK_MS = 1500;
+// A window.open whose URL is the SAME destination as a link request made
+// this long before it (same frame) is that link's click handler re-firing
+// the open (ad iframes call window.open on mousedown AND on mouseup, and
+// re-fire on timers). It is not a user click and must not open a tab —
+// this was the coronisoralogy.cfd -> playnaja.com ad tab.
+const LINK_CLICK_HIJACK_MS = 2500;
 const pendingLinkOpens = new Map();      // `${contentsId}\u001f${url}` -> { atMs } of the FIRST request
 const pendingImmediateOpens = [];        // { url, sourceUrl, sourceContentsId, sourceTabId, at } — matched when the tab materialises
 const immediateOpenWatches = new Map();  // new tab contents id -> { intendedUrl, sourceUrl, createdAt, viaLinkClick }
@@ -781,6 +796,22 @@ async function handleWindowOpen(details, contents) {
     // mailto:, ...) never open a browsing context in this browser.
     logPopup({ source: safeHost(sourceUrl), url: details.url, disposition, decision: 'deny', reason: 'scheme', created: false });
     return;
+  }
+  // Slow double-click, CDP-INDEPENDENT: the second fresh open of the same
+  // destination while the first is still pending (the claim made by the
+  // first click in handleLinkClickOpen). It decides on the dedup state
+  // alone — no isolated-world records, no debugger, no input-pipeline
+  // probe — so a manual double-click (trackpad two-finger tap, remote,
+  // deliberate re-click) still gets the link-options dialog on machines
+  // where every CDP route is dead. The dialog cooldown dedupes it against
+  // the in-page and before-mouse-event routes.
+  {
+    const held = pendingLinkOpens.get(linkOpenKey(contents.id, url));
+    if (held && atMs - held.atMs <= LINK_SECOND_CLICK_MS) {
+      logPopup({ source: safeHost(sourceUrl), url, disposition, decision: 'deny', reason: 'double-click', created: false, stage: 'window-open' });
+      serveLinkDialog({ url, sourceContentsId: contents.id, sourceTabId: tabIdOfContents(contents), text: '', media: false });
+      return;
+    }
   }
   // A LINK-SHAPED open (Chromium's "foreground-tab") earns the immediate
   // path only on POSITIVE link-click evidence: an isolated-world CLICK
@@ -1140,20 +1171,25 @@ function wireBrowsingContents(contents, id, opts = {}) {
 
   // ---------------------------------------------------------------- double-click (main side)
   // The isolated link world is the PRIMARY double-click route; this is the
-  // fallback for when that world cannot run (repeated attach failure — the
-  // very "works in tests, dead in the field" gap). It works from the OS-level
-  // mouse events the main process observes anyway, and resolves the anchor
-  // under the cursor through CDP (the same capability the popup state reads
-  // already use).
+  // fallback for when that world's CHANNEL is dead — no CDP attach at all,
+  // or a debugger that was attached and then held/detached (DevTools open,
+  // renderer restart, repeated attach failure): the world may be installed
+  // but its console.log dialog is emitted into a void. The detach handler
+  // nulls linkIdentifier, so this route arms exactly then. It works from
+  // the OS-level mouse events the main process observes anyway, and
+  // resolves the anchor under the cursor WITHOUT the debugger
+  // (executeJavaScript — see resolveDoubleClickedAnchor), so it is fully
+  // CDP-independent: the field environment where no double-click route
+  // used to work.
   //
-  // CRITICAL: this only arms when the in-page world is ABSENT (no
-  // linkIdentifier). before-mouse-event fires in the input pipeline BEFORE
-  // the click reaches the page, so an always-on fallback would win the race
-  // against the in-page route and substitute cursor-coordinate +
-  // elementFromPoint guesses for the in-page route's exact trusted-DOM
-  // anchor. On a healthy tab the in-page route is strictly better, so stand
-  // down; on a degraded tab it is the only route left. serveLinkDialog's
-  // cooldown still dedupes any rare overlap.
+  // CRITICAL: this stands down when the in-page world is present AND its
+  // channel is alive (linkIdentifier set). before-mouse-event fires in the
+  // input pipeline BEFORE the click reaches the page, so an always-on
+  // fallback would win the race against the in-page route and substitute
+  // cursor-coordinate + elementFromPoint guesses for the in-page route's
+  // exact trusted-DOM anchor. On a healthy tab the in-page route is
+  // strictly better. serveLinkDialog's cooldown still dedupes any rare
+  // overlap.
   //
   // The second press only counts when the page did NOT navigate in between
   // (a same-frame link that already navigated is unrecoverable — the second
@@ -1194,7 +1230,7 @@ function wireBrowsingContents(contents, id, opts = {}) {
     if (!looksLikeAdCampaignUrl(url)) return false;
     event.preventDefault();
     recordBlocked('Ad', url, contents.getURL());
-    logPopup({ source: safeHost(contents.getURL()), url, decision: 'deny', reason: 'interstitial-ad', created: false, stage: logLabel });
+    logPopup({ source: safeHost(contents.getURL()), url, decision: 'deny', reason: 'interstitial-ad', created: false, stage: logLabel, rule: (adCampaignMatch(url) || {}).name || null });
     if (onIssue) {
       issueHidden.add(id);
       send('core:navigation-blocked', { id, url, type: 'Ad' });
@@ -1754,9 +1790,7 @@ function refreshLinkContexts(contents, entry) {
  *  main-process double-click fallback (see before-mouse-event in
  *  wireBrowsingContents). */
 async function resolveDoubleClickedAnchor(contents, x, y) {
-  const entry = syncQueue.get(contents.id);
-  if (!entry || !contents.debugger.isAttached() || contents.isDestroyed()) return null;
-  const cdp = contents.debugger;
+  if (contents.isDestroyed()) return null;
   const zoom = (typeof contents.getZoomFactor === 'function') ? (contents.getZoomFactor() || 1) : 1;
   const expr = "(() => { const px = " + JSON.stringify(Number((x / zoom).toFixed(2))) + ", py = " + JSON.stringify(Number((y / zoom).toFixed(2))) +
     "; let n = document.elementFromPoint(px, py);" +
@@ -1765,9 +1799,25 @@ async function resolveDoubleClickedAnchor(contents, x, y) {
     " const u = new URL(n.href, location.href);" +
     " if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;" +
     " return u.href; })()";
-  const result = await withTimeout(cdp.sendCommand('Runtime.evaluate', { expression: expr, returnByValue: true }), 'double-click anchor', 2000);
-  const href = result && result.result && result.result.value;
-  return typeof href === 'string' && href ? href : null;
+  // Primary: CDP Runtime.evaluate (the debugger channel). Fallback:
+  // executeJavaScript — IPC straight to the renderer, NO debugger attach
+  // required. The fallback is the whole point of the field fix: on a
+  // machine where the debugger is held (DevTools open, renderer restart,
+  // repeated attach failure) the in-page world's console channel is dead
+  // AND a CDP-only resolver returns null, so NO double-click route worked
+  // ("works in tests, dead in the field"). executeJavaScript keeps this
+  // route alive in exactly that environment.
+  if (!contents.isDestroyed() && contents.debugger.isAttached()) {
+    try {
+      const result = await withTimeout(contents.debugger.sendCommand('Runtime.evaluate', { expression: expr, returnByValue: true }), 'double-click anchor', 2000);
+      const href = result && result.result && result.result.value;
+      return typeof href === 'string' && href ? href : null;
+    } catch { /* debugger flaky: try the IPC route below */ }
+  }
+  try {
+    const href = await withTimeout(contents.executeJavaScript(expr), 'double-click anchor (ipc)', 2000);
+    return typeof href === 'string' && href ? href : null;
+  } catch { return null; }
 }
 
 function syncPageScripts(contents) {
@@ -2191,6 +2241,52 @@ function createWindow() {
 }
 
 app.setName('ChromiumCore');
+
+// ---------------------------------------------------------------------------
+// Field diagnostics: the main process keeps one small log file
+// (userData/chromiumcore.log — %APPDATA%/ChromiumCore on Windows,
+// ~/Library/Application Support/ChromiumCore on macOS). Reports come from
+// machines we cannot attach to ("the dialog never appears", "fullscreen
+// never engages", "a JavaScript error occurred in the main process"); this
+// file is how we find out what actually happened: every popup decision,
+// CDP attach/install state, link message, dialog lifecycle event,
+// fullscreen transition, and every crash that used to kill the app below.
+const log = (() => {
+  try { return createAppLogger(path.join(app.getPath('userData'), 'chromiumcore.log')); }
+  catch { return { info: () => {}, warn: () => {}, error: () => {}, event: () => {}, logFile: null }; }
+})();
+// Mirror the main-process console into the file: [popup], [fullscreen] and
+// the navigation warnings all flow through console, so one wrap catches them.
+for (const level of ['log', 'warn', 'error']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => { original(...args); log[level === 'log' ? 'info' : level](...args); };
+}
+// The main process must NEVER die from a background fault. The field case:
+// Node's undici HTTP parser throws `assert(!this.paused)` inside a socket
+// callback when a filter-list download is cut off mid-TLS — an UNCAUGHT
+// exception (not a fetch rejection, so no try/catch can see it) that used
+// to take the entire browser session down with the "A JavaScript error
+// occurred in the main process" dialog. Log it and keep running: the
+// affected subsystem (a filter refresh) already falls back to cache/baseline.
+// The __ccCrashGuard marker lets the wiring test invoke the exact handler
+// without emitting process events (the test runner owns its own
+// uncaughtException listener and would fail the test on a real emit).
+let lastCrashLogAt = 0;
+const onUncaughtException = (error) => {
+  const nowMs = Date.now();
+  if (nowMs - lastCrashLogAt > 5000) {
+    log.error('UNCAUGHT EXCEPTION (app kept alive):', (error && error.stack) ? error.stack : String(error));
+    lastCrashLogAt = nowMs;
+  }
+};
+onUncaughtException.__ccCrashGuard = 'uncaughtException';
+process.on('uncaughtException', onUncaughtException);
+const onUnhandledRejection = (reason) => {
+  log.error('UNHANDLED REJECTION (handled):', (reason && reason.stack) ? reason.stack : String(reason));
+};
+onUnhandledRejection.__ccCrashGuard = 'unhandledRejection';
+process.on('unhandledRejection', onUnhandledRejection);
+
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   storePath = path.join(app.getPath('userData'), 'workspace.json');

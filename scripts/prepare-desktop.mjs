@@ -31,7 +31,7 @@ const manifest = {
   name: 'chromiumcore', productName: 'ChromiumCore', version: '1.0.0', private: true,
   description: 'A Chromium-powered desktop browser with built-in ad and tracker blocking.',
   author: 'ChromiumCore', license: 'MIT', main: 'electron/main.cjs',
-  scripts: { start: 'electron-forge start', package: 'electron-forge package', make: 'electron-forge make', test: 'node --test electron/popup-blocker.test.cjs electron/ad-signals.test.cjs electron/fullscreen-state.test.cjs electron/protection.test.cjs electron/youtube-shield.test.cjs electron/main.wiring.test.cjs shared/link-support.test.js' },
+  scripts: { start: 'electron-forge start', package: 'electron-forge package', make: 'electron-forge make', test: 'node --test electron/popup-blocker.test.cjs electron/ad-signals.test.cjs electron/fullscreen-state.test.cjs electron/protection.test.cjs electron/youtube-shield.test.cjs electron/log.test.cjs electron/main.wiring.test.cjs shared/link-support.test.js' },
   config: { forge: './forge.config.cjs' },
   dependencies: { '@ghostery/adblocker-electron': '2.20.3', '@ghostery/adblocker': '2.20.3', 'cross-fetch': '^4.1.0', tldts: '^7.0.0' },
   devDependencies: { electron: '45.5.0', '@electron-forge/cli': '7.11.2', '@electron-forge/maker-zip': '7.11.2', '@electron-forge/maker-dmg': '7.11.2', '@electron-forge/maker-squirrel': '7.11.2' },

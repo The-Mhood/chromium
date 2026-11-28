@@ -1241,23 +1241,63 @@ test('main process wiring (Electron stub)', async t => {
     const url = 'https://docs.example.com/same-link';
     const opens = () => calls.sends.filter(s => s.channel === 'core:open-tab' && s.payload.url === url).length;
     const before = opens();
-    // Five rapid clicks: each click is REAL (fresh pipeline evidence every
-    // time), so the burst can only be stopped by dedup, not by evidence.
-    for (let i = 0; i < 5; i += 1) {
+    try {
+      // Five rapid clicks: each click is REAL (fresh pipeline evidence every
+      // time), so the burst can only be stopped by dedup, not by evidence.
+      for (let i = 0; i < 5; i += 1) {
+        clickOn(page.webContents);
+        page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+        await new Promise(resolve => setTimeout(resolve, 30));
+      }
+      await settle();
+      assert.equal(opens(), before + 1, 'exactly one tab was published for five clicks — nothing accumulated');
+      // The SECOND click of the burst is the double-click: the same outcome
+      // the in-page world serves on a healthy tab (one dialog, no tab for
+      // the pair) — the dialog's cooldown absorbs clicks 3-5.
+      const dialogs = BrowserWindowStub.windows.filter(w => w.__dialog);
+      assert.equal(dialogs.length, 1, 'the second click offered the link-options dialog (the double-click)');
+      dialogs.forEach(w => w.close());
+      // The pending window has expired: a later deliberate click opens again
+      // (the user's link is not permanently stuck).
+      await new Promise(resolve => setTimeout(resolve, 1600));
       clickOn(page.webContents);
       page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
-      await new Promise(resolve => setTimeout(resolve, 30));
+      await settle();
+      assert.equal(opens(), before + 2, 'after the dedup window a new click opens a new tab');
+    } finally {
+      await closeTabs('dd-1');
+      for (const w of BrowserWindowStub.windows.filter(w => w.__dialog)) if (!w.__destroyed) w.close();
     }
-    await settle();
-    assert.equal(opens(), before + 1, 'exactly one tab was published for five clicks — nothing accumulated');
-    // The pending window has expired: a later deliberate click opens again
-    // (the user's link is not permanently stuck).
-    await new Promise(resolve => setTimeout(resolve, 1600));
-    clickOn(page.webContents);
-    page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
-    await settle();
-    assert.equal(opens(), before + 2, 'after the dedup window a new click opens a new tab');
-    await closeTabs('dd-1');
+  });
+
+  await t.test('slow double-click at 1200 ms (outside the old 1000 ms ceiling) offers the dialog without CDP', async () => {
+    // The field regression: a MANUAL double (trackpad two-finger tap, TV
+    // remote, a deliberate "click again") lands at 1000-1500 ms. The old
+    // 1000 ms window dropped the second click as a SILENT dedup — "double
+    // click does nothing". The window now spans the whole dedup window.
+    const { view: page } = await freshTab('sd-1', 'https://victim.example.com/');
+    const url = 'https://site.test/slow-double';
+    try {
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+      await settle();
+      assert.ok(openPublished(url), 'the first tap opened the tab at once');
+      const tab = await freshTab('sd-tab', url);
+      // The second tap lands ~1.25 s after the first (settle + 900 ms wait):
+      // inside the new 1500 ms window, outside the old 1000 ms one — the
+      // exact (1000,1500] ms zone the old code dropped silently.
+      await new Promise(resolve => setTimeout(resolve, 900));
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+      await settle();
+      const dialogs = BrowserWindowStub.windows.filter(w => w.__dialog);
+      assert.equal(dialogs.length, 1, 'the slow second tap offered the link-options dialog (not a silent drop)');
+      assert.ok(!winStub().contentView.__views.includes(tab.view), 'the first tap tab was closed for the dialog');
+      dialogs.forEach(w => w.close());
+    } finally {
+      await closeTabs('sd-1', 'sd-tab');
+      for (const w of BrowserWindowStub.windows.filter(w => w.__dialog)) if (!w.__destroyed) w.close();
+    }
   });
 
   await t.test('an immediate link tab whose destination redirects to a listed ad is closed promptly', async () => {
@@ -1660,6 +1700,9 @@ test('main process wiring (Electron stub)', async t => {
   // identifies them (see electron/ad-signals.cjs + popup-blocker.cjs).
   // ------------------------------------------------------------------
   const LWTZ = 'https://lwtz.com/1838/en.html?pb=27275087&browser=other&campaignid=1808628&city=lagos&country=NG&device=desktop&expires=1795861524&p=105.127.10.165&md5lp=lyXB9Y38wVoXLAciW';
+  // The second field shape (Nov 2026): the coronis router (a domain in NO
+  // filter list) that escapes to the playnaja.com gambling landing.
+  const CORONIS = 'https://coronisoralogy.cfd/iEXfrTLgLulHSulz/154553/?context_data=abc123&param_3=nortb_fallback&md=9f8a7b6c5d4e';
 
   await t.test('interstitial: a window.open to a campaign-shaped URL is blocked even on a real click', async () => {
     const { view: page } = await freshTab('ad-1', 'https://movies.example.com/watch/1838');
@@ -1676,6 +1719,54 @@ test('main process wiring (Electron stub)', async t => {
       assert.equal(calls.sends.filter(s => s.channel === 'core:popup-blocked').at(-1).payload.reason, 'interstitial-ad');
     } finally {
       await closeTabs('ad-1');
+    }
+  });
+
+  await t.test('interstitial: the coronis router (param_3=nortb_fallback) is blocked on a scripted open, no CDP', async () => {
+    // The field escape: an ad fires window.open to a rotating router domain
+    // (in no filter list) that redirects to a gambling landing. The URL's
+    // named campaign fallback (param_3=nortb_fallback) is the fingerprint.
+    // Tested on the DEGRADED path (no CDP, no page state) — exactly the
+    // environment where the old fingerprint (which needed the md5lp/clickid
+    // cluster) missed this shape.
+    const { view: page, known } = await freshTab('ad-c1', 'https://movies.example.com/watch/1838');
+    try {
+      const logFile = path.join(userDataDir, 'chromiumcore.log');
+      const logBefore = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').length : 0;
+      // A scripted open: NO fresh input, NO click record (the ad fires it).
+      page.webContents.__openHandler({ url: CORONIS, disposition: 'default' });
+      await settle();
+      assert.ok(!openPublished(CORONIS), 'no tab was opened for the coronis router');
+      assert.ok(!findInspector(known), 'no hidden inspector either — a campaign destination is denied before any load');
+      // The decision is logged with the fingerprint reason (the field log is
+      // the assertion surface: the user-visible notice is rate-limited to one
+      // per five seconds and an earlier test may own the slot).
+      const logAfter = fs.readFileSync(logFile, 'utf8');
+      const entry = logAfter.slice(logBefore).split('\n').find(l => l.includes('coronisoralogy.cfd'));
+      assert.ok(entry, 'the open was logged as a decision');
+      assert.ok(entry.includes('"reason":"interstitial-ad"'), 'the reason names the interstitial fingerprint');
+      assert.ok(entry.includes('"decision":"deny"'), 'the decision was deny');
+    } finally {
+      await closeTabs('ad-c1');
+    }
+  });
+
+  await t.test('interstitial: a movie tab that redirects into the coronis router is blocked in-tab (the playnaja escape)', async () => {
+    // The full escape chain: the movie tab is redirected (after the user
+    // lock) into the coronis router, which would then 302 to playnaja.com.
+    // Blocking at the coronis hop stops the chain before the gambling
+    // landing is ever reached.
+    const { view } = await freshTab('ad-c2', 'https://movies.example.com/watch/1838');
+    const contents = view.webContents;
+    try {
+      contents.emit('will-redirect', { preventDefault() {} }, CORONIS);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const blocked = calls.sends.filter(s => s.channel === 'core:navigation-blocked' && s.payload.id === 'ad-c2');
+      assert.equal(blocked.length, 1, 'the tab was told its navigation was blocked at the coronis hop');
+      assert.equal(blocked.at(-1).payload.type, 'Ad');
+      assert.equal(view.__visible, false, 'the movie page is held back behind the blocked card');
+    } finally {
+      await closeTabs('ad-c2');
     }
   });
 
@@ -1719,6 +1810,42 @@ test('main process wiring (Electron stub)', async t => {
     } finally {
       await closeTabs('ad-3');
     }
+  });
+
+  await t.test('crash guard: main-process faults are logged, never fatal (the Windows undici assert)', async () => {
+    // The field crash: Node's undici HTTP parser throws
+    // `assertion failed: !this.paused` inside a socket callback when a
+    // filter-list download is cut off mid-TLS. It is an UNCAUGHT exception
+    // (not a fetch rejection — no try/catch can see it) and used to take
+    // the whole session down with "A JavaScript error occurred in the main
+    // process". The guard must absorb both fault classes and keep the
+    // app alive: the affected subsystem (a filter refresh) already falls
+    // back to cache/baseline.
+    // The app's own guards (tagged in main.cjs) must be registered — the
+    // test runner owns additional listeners, so identify the app's rather
+    // than emit process events (a real emit would fail the test by design).
+    const guards = process.listeners('uncaughtException').concat(process.listeners('unhandledRejection'))
+      .filter(fn => fn.__ccCrashGuard);
+    assert.equal(guards.filter(fn => fn.__ccCrashGuard === 'uncaughtException').length, 1,
+      'the uncaughtException guard is registered');
+    assert.equal(guards.filter(fn => fn.__ccCrashGuard === 'unhandledRejection').length, 1,
+      'the unhandledRejection guard is registered');
+    // Invoke the exact handlers with the field errors: they must absorb
+    // both fault classes (log, never re-throw) so the app keeps running.
+    const logFile = path.join(userDataDir, 'chromiumcore.log');
+    const logBefore = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
+    assert.doesNotThrow(() => {
+      guards.find(fn => fn.__ccCrashGuard === 'uncaughtException')(new Error('assertion failed: !this.paused'));
+      guards.find(fn => fn.__ccCrashGuard === 'unhandledRejection')(new Error('fetch failed: socket hang up'));
+    });
+    const logAfter = fs.readFileSync(logFile, 'utf8');
+    assert.ok(logAfter.length > logBefore.length, 'the faults were written to the field log');
+    assert.ok(logAfter.includes('assertion failed: !this.paused'), 'the undici assert is in the log (the field crash)');
+    assert.ok(logAfter.includes('socket hang up'), 'the rejection is in the log');
+    // The app keeps working: a subsequent tab operation still functions.
+    const { view } = await freshTab('cg-1', 'https://example.com/');
+    assert.ok(winStub().contentView.__views.includes(view), 'the app is alive after the faults');
+    await closeTabs('cg-1');
   });
 
   await t.test('quitting persists the workspace atomically', () => {
