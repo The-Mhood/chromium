@@ -114,7 +114,7 @@ class FullscreenController {
     this._lastActivityAt = this._now();
     if (!this.chromeVisible) {
       this.chromeVisible = true;
-      this._emit({ type: 'chrome', visible: true });
+      this._emit({ type: 'chrome', visible: true, reason: 'activity' });
       this._emit({ type: 'layout' });
     }
   }
@@ -132,7 +132,10 @@ class FullscreenController {
     if (this.chromeVisible && this._now() - this._lastActivityAt >= this.idleMs &&
         (this.mediaActive || this.autoHideAllowed())) {
       this.chromeVisible = false;
-      this._emit({ type: 'chrome', visible: false });
+      // 'idle-media': the media already hid the chrome on entry; this is a
+      // re-hide after an activity-based reveal. 'idle': the plain 10 s rule
+      // (focused window, external page on screen).
+      this._emit({ type: 'chrome', visible: false, reason: this.mediaActive ? 'idle-media' : 'idle' });
       this._emit({ type: 'layout' });
     }
   }
@@ -184,7 +187,7 @@ class FullscreenController {
     }
     if (!this.chromeVisible) {
       this.chromeVisible = true;
-      this._emit({ type: 'chrome', visible: true });
+      this._emit({ type: 'chrome', visible: true, reason: 'media-leave' });
     }
     this._lastActivityAt = this._now();
     this._emit({ type: 'layout' });
@@ -221,7 +224,7 @@ class FullscreenController {
     if (mediaIsFullscreen) this._adoptMedia(tabId);
     if (!this.chromeVisible && !this.mediaActive) {
       this.chromeVisible = true;
-      this._emit({ type: 'chrome', visible: true });
+      this._emit({ type: 'chrome', visible: true, reason: 'tab-focus' });
     }
     this._emit({ type: 'layout' });
     return previousActive;
@@ -239,7 +242,7 @@ class FullscreenController {
       // Media is playing in fullscreen: the header goes away NOW, without
       // waiting for the inactivity timeout.
       this.chromeVisible = false;
-      this._emit({ type: 'chrome', visible: false });
+      this._emit({ type: 'chrome', visible: false, reason: 'media-enter' });
     }
     this._lastActivityAt = this._now();
     if (!this.userFullscreen && !this._mediaMaximized) {
@@ -276,7 +279,7 @@ class FullscreenController {
     }
     if (changed && !this.chromeVisible) {
       this.chromeVisible = true;
-      this._emit({ type: 'chrome', visible: true });
+      this._emit({ type: 'chrome', visible: true, reason: 'tab-closed' });
     }
     if (this.activeTabId === tabId) this.activeTabId = null;
     this._lastActivityAt = this._now();
