@@ -211,23 +211,60 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          TAG="${GITHUB_REF_NAME#v}"
-          FILES=(
-            artifacts/ChromiumCore-win32-x64/ChromiumCore-1.0.0-win32-x64.exe
-            artifacts/ChromiumCore-darwin-arm64/ChromiumCore-1.0.0-darwin-arm64.zip
-            artifacts/ChromiumCore-darwin-x64/ChromiumCore-1.0.0-darwin-x64.zip
-            artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-universal.apk
-            artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-tv-source.zip
-            artifacts/ChromiumCore-android-tv-app/ChromiumCore-1.0.0-android-tv-app.zip
-            artifacts/ChromiumCore-all-in-one/ChromiumCore-all-in-one.zip
-          )
-          for f in "${FILES[@]}"; do
-            if [ ! -f "$f" ]; then echo "Missing expected release file: $f" >&2; exit 1; fi
-          done
-          # Checksum file for every asset, by basename, plus the unsigned-preview note.
-          for f in "${FILES[@]}"; do sha256sum "$f" | awk -v n="$(basename "$f")" '{print $1"  "n}'; done > SHA256SUMS.txt
-          printf '\nEvery build is unsigned (a preview release). On first run:\n  - Windows: SmartScreen "More info" -> "Run".\n  - macOS: right-click the app -> Open (or run: xattr -dr com.apple.quarantine /Applications/ChromiumCore.app).\n  - Android TV: allow installs from unknown sources, then sideload the APK.\n' >> SHA256SUMS.txt
-          NOTES=$(printf "ChromiumCore v%s\n\n- Windows (64-bit): ChromiumCore-1.0.0-win32-x64.exe — NSIS installer.\n- macOS Apple Silicon: ChromiumCore-1.0.0-darwin-arm64.zip\n- macOS Intel: ChromiumCore-1.0.0-darwin-x64.zip\n- Android TV: ChromiumCore-1.0.0-android-universal.apk (or the all-in-one / tv-app ZIPs).\n\nThis release rebuilds the Android TV navigation: the D-pad is now the page's scroll wheel (UP/DOWN scroll from anywhere, the pointer stays put), and when the page cannot scroll a direction the arrows move the pointer instead — at the top of a page UP climbs to the site header, then to the address bar. If a TV's WebView drops the wheel event, scrolling falls back to the classic scroll path so a held key still works, and TVs without an on-screen keyboard tell you so when you open the address bar. The YouTube shield (bundled from shared/ into the TV build) is unchanged — you can now actually reach YouTube to see it work.\n\nSHA-256 sums for every asset are in SHA256SUMS.txt." "$TAG")
-          gh release create "v$TAG" --title "ChromiumCore v$TAG" --target "${GITHUB_SHA}" --notes "$NOTES" SHA256SUMS.txt "${FILES[@]}"
-          echo "Published release v$TAG with ${#FILES[@]} assets."
+          set -uo pipefail
+          (
+            set -euo pipefail
+            TAG="${GITHUB_REF_NAME#v}"
+            FILES=(
+              artifacts/ChromiumCore-win32-x64/ChromiumCore-1.0.0-win32-x64.exe
+              artifacts/ChromiumCore-darwin-arm64/ChromiumCore-1.0.0-darwin-arm64.zip
+              artifacts/ChromiumCore-darwin-x64/ChromiumCore-1.0.0-darwin-x64.zip
+              artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-universal.apk
+              artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-tv-source.zip
+              artifacts/ChromiumCore-android-tv-app/ChromiumCore-1.0.0-android-tv-app.zip
+              artifacts/ChromiumCore-all-in-one/ChromiumCore-all-in-one.zip
+            )
+            for f in "${FILES[@]}"; do
+              if [ ! -f "$f" ]; then echo "Missing expected release file: $f" >&2; exit 1; fi
+            done
+            # Checksum file for every asset, by basename, plus the unsigned-preview note.
+            for f in "${FILES[@]}"; do sha256sum "$f" | awk -v n="$(basename "$f")" '{print $1"  "n}'; done > SHA256SUMS.txt
+            printf '\nEvery build is unsigned (a preview release). On first run:\n  - Windows: SmartScreen "More info" -> "Run".\n  - macOS: right-click the app -> Open (or run: xattr -dr com.apple.quarantine /Applications/ChromiumCore.app).\n  - Android TV: allow installs from unknown sources, then sideload the APK.\n' >> SHA256SUMS.txt
+            NOTES=$(printf "ChromiumCore v%s\n\n- Windows (64-bit): ChromiumCore-1.0.0-win32-x64.exe — NSIS installer.\n- macOS Apple Silicon: ChromiumCore-1.0.0-darwin-arm64.zip\n- macOS Intel: ChromiumCore-1.0.0-darwin-x64.zip\n- Android TV: ChromiumCore-1.0.0-android-universal.apk (or the all-in-one / tv-app ZIPs).\n\nThis release rebuilds the Android TV navigation: the D-pad is now the page's scroll wheel (UP/DOWN scroll from anywhere, the pointer stays put), and when the page cannot scroll a direction the arrows move the pointer instead — at the top of a page UP climbs to the site header, then to the address bar. If a TV's WebView drops the wheel event, scrolling falls back to the classic scroll path so a held key still works, and TVs without an on-screen keyboard tell you so when you open the address bar. The YouTube shield (bundled from shared/ into the TV build) is unchanged — you can now actually reach YouTube to see it work.\n\nSHA-256 sums for every asset are in SHA256SUMS.txt." "$TAG")
+            # Plain API calls (no gh CLI): every step echoes what it did, so the
+            # failure annotation below always shows the exact failing call.
+            API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
+            AUTH="Authorization: Bearer ${GH_TOKEN}"
+            PAYLOAD=$(jq -n --arg tag "v$TAG" --arg target "$GITHUB_SHA" --arg title "ChromiumCore v$TAG" --arg body "$NOTES" \
+              '{tag_name: $tag, target_commitish: $target, name: $title, body: $body, draft: false, prerelease: false}')
+            echo "Creating release v$TAG (target $GITHUB_SHA)..."
+            RELEASE_JSON=$(curl -sS -f -X POST "$API" -H "$AUTH" -H "Accept: application/vnd.github+json" -d "$PAYLOAD")
+            echo "Release created: $(echo "$RELEASE_JSON" | jq -r .html_url)"
+            UPLOAD_URL=$(echo "$RELEASE_JSON" | jq -r .upload_url | sed 's/{?name,label}//')
+            for f in "${FILES[@]}"; do
+              echo "Uploading $(basename "$f") ($(du -h "$f" | cut -f1))..."
+              curl -sS -f -X PUT "${UPLOAD_URL}?name=$(basename "$f")" -H "$AUTH" -H "Content-Type: application/octet-stream" --data-binary "@$f" > /dev/null
+              echo "  done."
+            done
+            echo "Published release v$TAG with ${#FILES[@]} assets."
+          ) > release.log 2>&1
+          status=$?
+          cat release.log
+          exit $status
+      # Job logs are not always downloadable from every environment, so a
+      # failed publish throws its full log as an error annotation.
+      - if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let tail = '';
+            try {
+              tail = fs.readFileSync('release.log', 'utf8').trim().split('\n').slice(-60).join('\n');
+            } catch (e) { tail = '(no release.log captured)'; }
+            throw new Error(
+              'ChromiumCore release publish failed (node ' + process.version +
+              '), tag ' + (process.env.GITHUB_REF_NAME || '?') +
+              ', commit ' + (context.sha || '?') + '.\n--- log tail ---\n' +
+              (tail || '(no output captured)')
+            );
