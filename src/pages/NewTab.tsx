@@ -1,4 +1,4 @@
-import { ArrowRight, ArrowUpRight, CloudOff, ExternalLink, Globe2, Plus, RefreshCw, Search, ShieldCheck, ShieldOff } from 'lucide-react';
+import { AlertTriangle, ArrowRight, ArrowUpRight, CloudOff, ExternalLink, Globe2, Plus, RefreshCw, Search, ShieldCheck, ShieldOff, X } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import { useBrowser } from '../store/browser';
 import { Brand, CoreMark, SiteIcon } from '../components/Brand';
@@ -27,7 +27,7 @@ function loadingUrl(url: string): string {
 }
 
 export function ExternalPage({ url, title, issue }: { url: string; title: string; issue?: TabIssue }) {
-  const { navigate, navigatePage, protection } = useBrowser();
+  const { navigate, navigatePage, protection, activeTabId, closeTab, retryUnresponsive } = useBrowser();
   const hostname = new URL(url).hostname.replace(/^www\./, '');
   if (window.chromiumCore) {
     // Desktop app: the tab's WebContentsView loads over this card as soon as
@@ -48,6 +48,16 @@ export function ExternalPage({ url, title, issue }: { url: string; title: string
       let issueHost = hostname;
       try { issueHost = new URL(issue.url).hostname.replace(/^www\./, ''); } catch { /* keep the tab's host */ }
       return <div className="external-page"><div className="external-icon-tile"><CloudOff size={30} /></div><h1>Couldn't reach {issueHost}</h1><p className="external-url">{issue.url}</p><p>The address could not be loaded.<br />Check the address or your connection.</p><button className="button button-primary" onClick={() => navigate(url)}><RefreshCw size={15} />Try again</button></div>;
+    }
+    // A page that LOADED and then froze (an ad or script pinning the
+    // renderer) or crashed: the view is held back by the main process, so
+    // this card is the on-screen recovery. "Reload page" issues the SMART
+    // reload — the main process force-crashes the frozen renderer first,
+    // so the retry actually lands (a plain reload would queue behind the
+    // dead JS and the card would come back forever).
+    if (issue && issue.kind === 'unresponsive') {
+      const crashed = issue.crashed === true;
+      return <div className="external-page"><div className="external-icon-tile danger"><AlertTriangle size={30} /></div><h1>{crashed ? `This tab crashed` : `This tab stopped responding`}</h1><p className="external-url">{loadingUrl(url)}</p><p>{crashed ? 'The page’s renderer process ended unexpectedly.' : 'The page loaded, but its renderer stopped responding — usually a heavy ad or script.'} It is still open in the background.</p><div className="external-page-actions"><button className="button button-primary" onClick={() => retryUnresponsive()}><RefreshCw size={15} />Reload page</button><button className="button button-white" onClick={() => closeTab(activeTabId)}><X size={15} />Close tab</button></div></div>;
     }
     return <div className="external-page external-loading" title={url}><span className="external-spinner" aria-hidden="true" /><h1>{title}</h1><p className="external-url">{loadingUrl(url)}</p><p>Loading {hostname}…</p><div className="external-note"><ShieldCheck size={15} />{protection.enabled ? 'Protected browsing — ads, popups and redirects are being filtered.' : 'Protection is paused for this page.'}</div></div>;
   }

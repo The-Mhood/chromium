@@ -80,12 +80,16 @@ export interface FullscreenState {
   window: boolean;
 }
 
-/** Why a tab's page is not on screen: blocked by protection, or the host
- *  could not be reached. Drives the honest placeholder states. */
+/** Why a tab's page is not on screen: blocked by protection, the host could
+ *  not be reached, or the renderer froze/crashed after loading (the card
+ *  then offers Reload and Close — the frozen-tab recovery path). */
 export interface TabIssue {
-  kind: 'blocked' | 'failed';
+  kind: 'blocked' | 'failed' | 'unresponsive';
   url: string;
   type?: 'Ad' | 'Tracker' | 'Pop-up' | 'Threat';
+  /** unresponsive only: true when the renderer process died (crash/OOM)
+   *  instead of merely freezing — the card wording follows suit. */
+  crashed?: boolean;
 }
 
 export interface DesktopBridge {
@@ -115,6 +119,8 @@ export interface DesktopBridge {
   onPopupBlocked: (callback: (info: { url: string; source: string; reason?: string }) => void) => () => void;
   onNavigationBlocked: (callback: (info: { id: string; url: string; type: TabIssue['type'] }) => void) => () => void;
   onLoadFailed: (callback: (info: { id: string; url: string }) => void) => () => void;
+  onTabUnresponsive: (callback: (info: { id: string; url: string; crashed?: boolean }) => void) => () => void;
+  onTabResponsive: (callback: (info: { id: string }) => void) => () => void;
   onTabClosed: (callback: (info: { id: string }) => void) => () => void;
   onToast: (callback: (info: { text: string; tone: 'success' | 'info' | 'error' }) => void) => () => void;
   onDialogData: (callback: (data: { url: string; title: string; media: boolean; sourceTabId: string | null }) => void) => () => void;

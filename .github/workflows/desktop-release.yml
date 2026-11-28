@@ -120,3 +120,75 @@ jobs:
           name: ChromiumCore-android-tv-app
           path: public/download/ChromiumCore-1.0.0-android-tv-app.zip
           if-no-files-found: error
+
+  # The convenience bundle: the Android TV APK, the Windows installer and the
+  # Mac apps in ONE zip that extracts into three labelled folders. It runs
+  # after every platform build, downloads all the release artifacts and
+  # repackages them. It is an ADDITIONAL artifact — it never replaces the
+  # per-platform ones (those are what the per-platform download links use).
+  bundle:
+    needs: [package, android-tv]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          # Every artifact from this run lands in artifacts/<name>/.
+          path: artifacts
+      - name: Build the all-in-one bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="ChromiumCore-all-in-one"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/windows" "$ROOT/mac" "$ROOT/android-tv"
+
+          require() { if [ ! -f "$1" ]; then echo "Missing expected release file: $1" >&2; exit 1; fi; }
+          WIN=artifacts/ChromiumCore-win32-x64/ChromiumCore-1.0.0-win32-x64.exe
+          MAC_ARM=artifacts/ChromiumCore-darwin-arm64/ChromiumCore-1.0.0-darwin-arm64.zip
+          MAC_X64=artifacts/ChromiumCore-darwin-x64/ChromiumCore-1.0.0-darwin-x64.zip
+          APK=artifacts/ChromiumCore-android-tv/ChromiumCore-1.0.0-android-universal.apk
+          require "$WIN"; require "$MAC_ARM"; require "$MAC_X64"; require "$APK"
+
+          cp "$WIN"     "$ROOT/windows/"
+          cp "$MAC_ARM" "$ROOT/mac/"
+          cp "$MAC_X64" "$ROOT/mac/"
+          cp "$APK"     "$ROOT/android-tv/"
+
+          cat > "$ROOT/README.txt" <<'EOF'
+          ChromiumCore — all three apps in one download
+          =============================================
+          Extract this archive and open the folder for your device:
+
+          windows/
+            ChromiumCore Setup .... .exe
+            Double-click to install (Windows 10 or later). Because the build
+            is unsigned, Windows SmartScreen may warn — choose More info,
+            then Run.
+
+          mac/
+            Two ZIPs — use the one that matches your Mac:
+              ChromiumCore-...-darwin-arm64.zip   Apple Silicon (M1 or newer)
+              ChromiumCore-...-darwin-x64.zip     Intel
+            Open the ZIP and drag ChromiumCore.app into Applications. macOS
+            may flag it as unsigned — right-click the app, choose Open.
+
+          android-tv/
+            ChromiumCore-...-android-universal.apk
+            Sideload it onto an Android TV / Google TV / Fire TV (allow
+            installs from unknown sources in the TV's security settings).
+
+          Every build is unsigned. If you want to be thorough, verify the
+          SHA-256 of the file you install before running it.
+          EOF
+
+          ( cd "$ROOT" && find . -type f | sort | sed 's|^\./||' ) > "$ROOT/CONTENTS.txt"
+          rm -f ChromiumCore-all-in-one.zip
+          zip -qry ChromiumCore-all-in-one.zip "$ROOT"
+          echo "=== ChromiumCore-all-in-one.zip ==="
+          unzip -l ChromiumCore-all-in-one.zip
+          du -h ChromiumCore-all-in-one.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChromiumCore-all-in-one
+          path: ChromiumCore-all-in-one.zip
+          if-no-files-found: error
