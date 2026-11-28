@@ -188,6 +188,26 @@ test('a file removed after page load does not trigger a success notification', a
 });
 
 test('Android TV card documents the remote pointer and sideload steps', async ({ page }) => {
+  // The SHA-256 button only enables when the archive actually exists on the
+  // server (the dev server ships no release files), so the test serves a
+  // fake Android APK + manifest over the network: the card must report the
+  // file available and the checksum modal must show the manifest's hash.
+  const fakeSha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  await page.route('**/download/ChromiumCore-1.0.0-android-universal.apk', route => route.fulfill({
+    contentType: 'application/vnd.android.package-archive',
+    headers: { 'content-length': '1234' },
+    body: Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+  }));
+  await page.route('**/download/manifest.json', route => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      version: '1.0.0',
+      source: 'chromiumcore-source.zip',
+      releases: [
+        { platform: 'android', arch: 'universal', name: 'Android TV', file: 'ChromiumCore-1.0.0-android-universal.apk', size: '1.7 MB', sha256: fakeSha },
+      ],
+    }),
+  }));
   await page.getByRole('button', { name: 'Downloads', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'ChromiumCore for Android TV' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Built for the remote. Pointer included.' })).toBeVisible();
@@ -197,7 +217,9 @@ test('Android TV card documents the remote pointer and sideload steps', async ({
   await expect(page.getByRole('dialog').getByText('Install the APK.')).toBeVisible();
   await expect(page.getByRole('dialog').getByText('adb install', { exact: false })).toBeVisible();
   await page.getByRole('button', { name: 'Sounds good' }).click();
-  await page.locator('.download-platform').nth(2).getByRole('button', { name: 'SHA-256' }).click();
+  const shaButton = page.locator('.download-platform').nth(2).getByRole('button', { name: 'SHA-256' });
+  await expect(shaButton).toBeEnabled('the served APK makes the card available, enabling SHA-256');
+  await shaButton.click();
   const manifest = await (await page.request.get('/download/manifest.json')).json();
   await expect(page.locator('.checksum-code')).toHaveText(manifest.releases.find((item: { platform: string }) => item.platform === 'android').sha256);
 });
