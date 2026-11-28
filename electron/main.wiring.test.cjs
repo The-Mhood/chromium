@@ -77,7 +77,12 @@ function makeWebContents(id) {
     getTitle: () => { try { return new URL(wc.__url).hostname; } catch { return ''; } },
     isLoading: () => false,
     isLoadingMainFrame: () => false,
-    isFullscreen: () => false,
+    // Real Electron: isFullscreen() mirrors the document's HTML fullscreen
+    // state, flipping exactly when enter/leave-html-full-screen fire (see
+    // emit below). Tests may also set __fsState directly WITHOUT emitting —
+    // that is the "event lost in the field" scenario the idle resync
+    // (runChromeIdleTick) must catch on its own.
+    isFullscreen: () => wc.__fsState === true,
     // Crash/freeze model for the recovery path: __crashed mirrors a dead
     // renderer; forcefullyCrashRenderer (the main process's recovery action
     // for a FROZEN renderer) kills it and — as in real Electron — the
@@ -138,7 +143,13 @@ function makeWebContents(id) {
       };
       listeners.set(event, [...(listeners.get(event) || []), wrapper]);
     },
-    emit: (event, ...args) => { for (const fn of [...(listeners.get(event) || [])] || []) fn(...args); },
+    emit: (event, ...args) => {
+      // Keep the real isFullscreen() in step with the document's fullscreen
+      // state, exactly as in Electron.
+      if (event === 'enter-html-full-screen') wc.__fsState = true;
+      if (event === 'leave-html-full-screen') wc.__fsState = false;
+      for (const fn of [...(listeners.get(event) || [])] || []) fn(...args);
+    },
     debugger: {
       // attach() throws by default (the document-start script path stays
       // degraded — the real app's failure mode); scenarios that need the
@@ -1208,6 +1219,39 @@ test('main process wiring (Electron stub)', async t => {
     }
   });
 
+  await t.test('lost enter/leave events: the idle resync drives media fullscreen from isFullscreen()', async () => {
+    // The field regression: the video WAS in the document's fullscreen state
+    // (page black, player filling the viewport) but the
+    // enter-html-full-screen event never reached the main process — the app
+    // header stayed up and the window never maximized ("window fails
+    // fullscreen for media"). The resync in runChromeIdleTick re-derives
+    // the media session from the focused tab's real isFullscreen() each
+    // tick, so a lost enter is adopted and a lost leave released.
+    const { view } = await freshTab('resync-1', 'https://video.example.com/lost-event');
+    const hiddenSends = () => calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === false).length;
+    const visibleSends = () => calls.sends.filter(s => s.channel === 'core:chrome-visibility' && s.payload === true).length;
+    try {
+      assert.equal(winStub().__maximized, false, 'precondition: the window is not maximized');
+      const h0 = hiddenSends();
+      // The document went fullscreen WITHOUT the event: flip the real
+      // state only — the main process must notice by itself.
+      view.webContents.__fsState = true;
+      await new Promise(resolve => setTimeout(resolve, 900)); // a few idle ticks
+      assert.ok(hiddenSends() > h0, 'the resync hid the header although the enter event never arrived');
+      assert.equal(winStub().__maximized, true, 'the resync maximized the window for the media');
+      assert.equal(winStub().__fullscreen, false, 'still no OS fullscreen transition');
+      // The player exits fullscreen, leave event lost the same way.
+      const v0 = visibleSends();
+      view.webContents.__fsState = false;
+      await new Promise(resolve => setTimeout(resolve, 900));
+      assert.ok(visibleSends() > v0, 'the resync restored the header although the leave event never arrived');
+      assert.equal(winStub().__maximized, false, 'the window unmaximized with the media');
+    } finally {
+      view.webContents.__fsState = false;
+      await closeTabs('resync-1');
+    }
+  });
+
   await t.test('site links (the fmhy.net failure): a fresh click opens at once, no DevTools needed', async () => {
     // No CDP at all — the exact degraded path the packaged app was on.
     // The click is admitted SYNCHRONOUSLY from the browser's input pipeline
@@ -1296,6 +1340,40 @@ test('main process wiring (Electron stub)', async t => {
       dialogs.forEach(w => w.close());
     } finally {
       await closeTabs('sd-1', 'sd-tab');
+      for (const w of BrowserWindowStub.windows.filter(w => w.__dialog)) if (!w.__destroyed) w.close();
+    }
+  });
+
+  await t.test('dialog startup grace: an immediate blur does not self-close the dialog', async () => {
+    // The field regression: on real machines the show/focus hand-off
+    // bounced — the always-on-top frameless dialog blurred within
+    // milliseconds of being created and the blur handler closed it before
+    // the user could see it ("double-click does nothing"). The grace
+    // (DIALOG_BLUR_GRACE_MS) ignores blurs right after creation; a real
+    // outside click lands well past it and still dismisses.
+    const { view: page } = await freshTab('dlg-1', 'https://victim.example.com/');
+    const url = 'https://site.test/dialog-grace';
+    try {
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+      await settle();
+      const firstTab = await freshTab('dlg-tab', url);
+      await new Promise(resolve => setTimeout(resolve, 900));
+      clickOn(page.webContents);
+      page.webContents.__openHandler({ url, disposition: 'foreground-tab' });
+      await settle();
+      const dialog = BrowserWindowStub.windows.find(w => w.__dialog);
+      assert.ok(dialog, 'the slow double-click served the dialog');
+      // The focus bounce: a blur milliseconds after creation.
+      dialog.emit('blur');
+      assert.equal(dialog.__destroyed, false, 'the startup blur did not kill the dialog');
+      // Past the grace: the outside click dismisses the dialog, as designed.
+      await new Promise(resolve => setTimeout(resolve, 700));
+      dialog.emit('blur');
+      assert.equal(dialog.__destroyed, true, 'the blur past the grace closed the dialog');
+      assert.ok(!firstTab || !winStub().contentView.__views.includes(firstTab.view), 'the first tap tab was closed for the dialog');
+    } finally {
+      await closeTabs('dlg-1', 'dlg-tab');
       for (const w of BrowserWindowStub.windows.filter(w => w.__dialog)) if (!w.__destroyed) w.close();
     }
   });

@@ -351,7 +351,16 @@ fsCtl.onEffect(effect => {
     }
     settleLayout();
   }
-  if (effect.type === 'chrome') send('core:chrome-visibility', effect.visible);
+  if (effect.type === 'chrome') {
+    // Field trace: the header-visibility decision that reaches the renderer
+    // (core:chrome-visibility). If the log shows "hide" and the field still
+    // reports a visible header, the break is renderer-side; if no line
+    // appears at all, the state machine never decided to hide.
+    console.log('[fs] chrome', effect.visible ? 'show' : 'hide', JSON.stringify({ reason: effect.reason || null, mediaTabId: fsCtl.mediaTabId, activeTabId: fsCtl.activeTabId, userFullscreen: fsCtl.userFullscreen }));
+    send('core:chrome-visibility', effect.visible);
+  }
+  if (effect.type === 'window-maximize') console.log('[fs] window', effect.on ? 'maximize' : 'unmaximize');
+  if (effect.type === 'window-fullscreen') console.log('[fs] window-fullscreen=' + effect.value);
   if (effect.type === 'layout' || effect.type === 'chrome') applyLayout();
   syncFullscreenState();
 });
@@ -642,11 +651,22 @@ function linkDialogCoolingDown(contentsId, url) {
 
 /** Close the just-opened (or still pending) tab for a double-clicked link
  *  and show the link-options dialog at the cursor. Returns false when the
- *  dialog for this link was already served within the cooldown. */
-function serveLinkDialog({ url, sourceContentsId, sourceTabId, text, media }) {
+ *  dialog for this link was already served within the cooldown.
+ *
+ *  `route` is the field trace for WHICH double-click detector fired:
+ *  'in-page' (the isolated link world), 'mouse-fallback' (the main-process
+ *  before-mouse-event route, CDP-independent), 'window-open-dedup' /
+ *  'link-click-dedup' (the main-process dedup gate for new-tab opens).
+ *  A field log with NO serve line for a double-click means every route
+ *  missed; a serve line without a dialog line means the dialog died. */
+function serveLinkDialog({ url, sourceContentsId, sourceTabId, text, media, route = 'in-page' }) {
   const coolKey = sourceContentsId + '\u001f' + url;
   const nowMs = Date.now();
-  if ((dialogCooldowns.get(coolKey) || 0) > nowMs) return false;
+  if ((dialogCooldowns.get(coolKey) || 0) > nowMs) {
+    console.log('[link] dialog not served (cooldown)', JSON.stringify({ route, url }));
+    return false;
+  }
+  console.log('[link] dialog served', JSON.stringify({ route, url, sourceTabId }));
   dialogCooldowns.set(coolKey, nowMs + DIALOG_COOLDOWN_MS);
   // A double-click on a link that opens a new tab: the FIRST click already
   // opened the tab (immediate single-click behaviour). The second click is
@@ -756,7 +776,7 @@ async function handleLinkClickOpen({ url, sourceUrl, disposition, contents, atMs
     const held = pendingLinkOpens.get(linkOpenKey(contentsId, url));
     if (held && atMs - held.atMs <= LINK_SECOND_CLICK_MS) {
       logPopup({ source, url, disposition, frame: logFrame, decision: 'deny', reason: 'double-click', created: false });
-      serveLinkDialog({ url, sourceContentsId: contentsId, sourceTabId, text: '', media: false });
+      serveLinkDialog({ url, sourceContentsId: contentsId, sourceTabId, text: '', media: false, route: 'link-click-dedup' });
     } else {
       logPopup({ source, url, disposition, frame: logFrame, decision: 'deny', reason: 'dedup-pending', created: false });
     }
@@ -809,7 +829,7 @@ async function handleWindowOpen(details, contents) {
     const held = pendingLinkOpens.get(linkOpenKey(contents.id, url));
     if (held && atMs - held.atMs <= LINK_SECOND_CLICK_MS) {
       logPopup({ source: safeHost(sourceUrl), url, disposition, decision: 'deny', reason: 'double-click', created: false, stage: 'window-open' });
-      serveLinkDialog({ url, sourceContentsId: contents.id, sourceTabId: tabIdOfContents(contents), text: '', media: false });
+      serveLinkDialog({ url, sourceContentsId: contents.id, sourceTabId: tabIdOfContents(contents), text: '', media: false, route: 'window-open-dedup' });
       return;
     }
   }
@@ -1212,8 +1232,9 @@ function wireBrowsingContents(contents, id, opts = {}) {
           // meantime, in which case the in-page route is back in charge.
           const current = syncQueue.get(contents.id);
           if (current && current.linkIdentifier) return;
-          if (href) serveLinkDialog({ url: href, sourceContentsId: contents.id, sourceTabId: tabIdOfContents(contents) });
-        }).catch(() => { /* degraded */ });
+          if (href) serveLinkDialog({ url: href, sourceContentsId: contents.id, sourceTabId: tabIdOfContents(contents), route: 'mouse-fallback' });
+          else console.log('[link] mouse-fallback: no anchor under the cursor', JSON.stringify({ x: input.x, y: input.y, url: contents.getURL() }));
+        }).catch(error => { console.warn('[link] mouse-fallback resolve failed:', error.message); });
       } else {
         lastMouseDown = { x: input.x, y: input.y, at: nowMs, url: contents.getURL() };
       }
@@ -1349,12 +1370,14 @@ function wireBrowsingContents(contents, id, opts = {}) {
     // run) left the header visible during a video's fullscreen.
     contents.on('enter-html-full-screen', () => {
       if (contents.isDestroyed()) return;
+      console.log('[fs] media enter event', JSON.stringify({ tab: id, url: contents.getURL(), active: id === activeId }));
       fsCtl.mediaEnter(id);
       armFullscreenReassert();
     });
     contents.on('leave-html-full-screen', () => {
       if (contents.isDestroyed()) return;
       const owned = fsCtl.mediaTabId === id;
+      console.log('[fs] media leave event', JSON.stringify({ tab: id, url: contents.getURL(), owned }));
       fsCtl.mediaLeave(id);
       // The browser fullscreen rides the media session: when the document
       // leaves media fullscreen (Esc, the player's exit control, or
@@ -1523,6 +1546,11 @@ function handleLinkMessage(contents, raw) {
   let payload;
   try { payload = JSON.parse(raw); } catch { return; }
   if (contents.isDestroyed() || !payload || typeof payload !== 'object') return;
+  // Field trace: the isolated world's channel is alive and talking. A
+  // double-click that produces NO line here (while [cdp] shows an attached
+  // debugger) is an in-page script problem; a line here that produces no
+  // [link] served line is a main-process problem.
+  console.log('[link] in-page message', JSON.stringify({ t: payload.t, url: payload.url || null, contextIdOk: true }));
   if (payload.t === 'dialog') {
     let url;
     try { url = browsingUrl(payload.url); } catch { return; }
@@ -1535,6 +1563,7 @@ function handleLinkMessage(contents, raw) {
       sourceTabId,
       text: payload.text,
       media: payload.media,
+      route: 'in-page',
     });
   } else if (payload.t === 'commit') {
     handleLinkCommit(contents, payload);
@@ -1546,6 +1575,12 @@ function handleLinkMessage(contents, raw) {
 // renderer in dialog mode (same design language, keyboard + Esc support),
 // positioned at the double-click point.
 // ---------------------------------------------------------------------------
+
+// How long after creation the dialog ignores a blur (see openLinkDialog:
+// the focus hand-off race). 600 ms covers the ready-to-show + focus settle
+// without ever swallowing a deliberate outside click (the earliest one
+// takes >150 ms longer than the dialog appearing).
+const DIALOG_BLUR_GRACE_MS = 600;
 
 function closeLinkDialog() {
   if (linkDialogWin && !linkDialogWin.isDestroyed()) {
@@ -1588,26 +1623,47 @@ function openLinkDialog({ url, title, media = false, x, y, sourceTabId }) {
   });
   linkDialogWin.setAlwaysOnTop(true, 'screen-saver');
   linkDialogWin.setMenu(null);
+  const dialogBornAt = Date.now();
+  console.log('[dialog] created', JSON.stringify({ url, x: winBounds.x + dx, y: winBounds.y + dy }));
   // The window is created hidden (show: false) to avoid a white flash: it
   // becomes visible only once its first frame is ready. Forgetting this
   // show() is the "double-click does nothing" defect — the dialog is built,
   // loads its page, and then simply never appears on screen.
   linkDialogWin.once('ready-to-show', () => {
     if (!linkDialogWin || linkDialogWin.isDestroyed()) return;
+    console.log('[dialog] ready-to-show (showing)', { ageMs: Date.now() - dialogBornAt });
     linkDialogWin.show();
     linkDialogWin.focus();
   });
-  // Leave on any focus loss: an outside click dismisses the dialog.
-  linkDialogWin.on('blur', () => { if (linkDialogWin && !linkDialogWin.isDestroyed()) linkDialogWin.close(); });
+  // Leave on any focus loss: an outside click dismisses the dialog. EXCEPT
+  // during the startup grace: the show/focus hand-off has bounced focus on
+  // real machines (the OS re-asserting the window the click came from),
+  // and a blur there closed the dialog before the user could see it — the
+  // field "double-click does nothing" report. A real outside click lands
+  // well past the grace; the Escape key and the X button are unaffected.
+  linkDialogWin.on('blur', () => {
+    if (!linkDialogWin || linkDialogWin.isDestroyed()) return;
+    const ageMs = Date.now() - dialogBornAt;
+    if (ageMs < DIALOG_BLUR_GRACE_MS) {
+      console.log('[dialog] blur ignored (startup grace)', { ageMs });
+      return;
+    }
+    console.log('[dialog] closed on blur', { ageMs });
+    linkDialogWin.close();
+  });
   linkDialogWin.webContents.on('before-input-event', (_event, input) => {
     if (input.type === 'keyDown' && input.key === 'Escape' && linkDialogWin && !linkDialogWin.isDestroyed()) linkDialogWin.close();
   });
   linkDialogWin.webContents.on('did-finish-load', () => {
     if (!linkDialogWin || linkDialogWin.isDestroyed()) return;
+    // The renderer's dialog view renders nothing until this arrives
+    // (LinkDialog returns null without data): if the field log shows
+    // "ready-to-show" but a blank window, this send is the break point.
+    console.log('[dialog] load finished, sending dialog data', { ageMs: Date.now() - dialogBornAt });
     linkDialogWin.webContents.send('core:dialog-data', { url, title, media: media === true, sourceTabId: sourceTabId || null });
     linkDialogWin.webContents.focus();
   });
-  linkDialogWin.on('closed', () => { linkDialogWin = null; });
+  linkDialogWin.on('closed', () => { console.log('[dialog] closed', { ageMs: Date.now() - dialogBornAt }); linkDialogWin = null; });
   linkDialogWin.loadFile(path.join(__dirname, '../renderer/index.html'), { query: { linkDialog: '1' } });
 }
 
@@ -1849,6 +1905,9 @@ function syncPageScripts(contents) {
         entry.identifier = null;
         entry.popupIdentifier = null;
         entry.linkIdentifier = null;
+        // Field trace: the isolated worlds (popup shield, YouTube shield,
+        // the double-click channel) are only alive while this attach holds.
+        console.log('[cdp] attached', JSON.stringify({ contentsId: id }));
         if (!entry.cdpListening) {
           entry.cdpListening = true;
           cdp.on('message', (method, params) => handleCdpMessage(contents, entry, method, params));
@@ -1857,6 +1916,7 @@ function syncPageScripts(contents) {
             entry.popupIdentifier = null;
             entry.linkIdentifier = null;
             entry.linkContextIds.clear();
+            if (!contents.isDestroyed()) console.warn('[cdp] debugger detached — double-click falls back to the main-process routes', JSON.stringify({ contentsId: id }));
             schedulePageScriptHeal(contents, entry);
           });
         }
@@ -1868,7 +1928,7 @@ function syncPageScripts(contents) {
         // attach) already exists — resolve its context explicitly.
         refreshLinkContexts(contents, entry);
       } catch (error) {
-        console.warn('Page scripts unavailable:', error.message);
+        console.warn('[cdp] attach failed', JSON.stringify({ contentsId: id, error: error.message, healAttempts: entry.healAttempts }));
         schedulePageScriptHeal(contents, entry);
         return;
       }
@@ -1895,7 +1955,8 @@ function syncPageScripts(contents) {
       try {
         const result = await withTimeout(cdp.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: linkSupportSource, worldName: LINK_WORLD }), 'install link support');
         entry.linkIdentifier = result.identifier;
-      } catch (error) { console.warn('Link support could not be installed:', error.message); }
+        console.log('[cdp] link support installed', JSON.stringify({ contentsId: id, identifier: result.identifier }));
+      } catch (error) { console.warn('[cdp] link support could not be installed:', error.message); }
     }
     if (wantShield) {
       try {
@@ -2137,6 +2198,58 @@ function registerIPC() {
 // Window
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The 250 ms chrome-idle driver: cursor activity, the state machine tick,
+// and — the field fix — the media-fullscreen RESYNC.
+//
+// The enter-html-full-screen / leave-html-full-screen events have been lost
+// in the field (a video in document fullscreen, the app header still up,
+// the window not maximized — the "fullscreen fails for media" report). The
+// focused tab's real isFullscreen() is the source of truth this codebase
+// already trusts for the focus re-sync (core:focus), so each tick re-derives
+// the media session from it: a lost enter is adopted, a lost leave is
+// released. isFullscreen() is a local synchronous read — no IPC, no
+// debugger, no cost worth measuring at this rate.
+// ---------------------------------------------------------------------------
+let lastFsSnapshotAt = 0;
+function runChromeIdleTick() {
+  if (!win || win.isDestroyed()) return;
+  let cursorMoved = false;
+  try {
+    const point = screen.getCursorScreenPoint();
+    const rect = win.getBounds();
+    const inside = point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height;
+    if (inside && lastCursorPoint && (point.x !== lastCursorPoint.x || point.y !== lastCursorPoint.y)) cursorMoved = true;
+    lastCursorPoint = point;
+  } catch {
+    lastCursorPoint = null; // headless or display-less environment
+  }
+  if (showExternal && activeId) {
+    try {
+      const contents = views.get(activeId) && views.get(activeId).webContents;
+      if (contents && !contents.isDestroyed()) {
+        const realFullscreen = !!contents.isFullscreen();
+        if (realFullscreen && fsCtl.mediaTabId !== activeId) {
+          console.log('[fs] media resync: adopting tab ' + activeId + ' (enter event missed)', JSON.stringify({ url: contents.getURL() }));
+          fsCtl.adoptMedia(activeId);
+        } else if (!realFullscreen && fsCtl.mediaTabId === activeId) {
+          console.log('[fs] media resync: releasing tab ' + activeId + ' (leave event missed)', JSON.stringify({ url: contents.getURL() }));
+          fsCtl.mediaLeave(activeId);
+        }
+      }
+    } catch { /* a resync fault must never break the idle clock */ }
+  }
+  fsCtl.tick({ windowFocused: win.isFocused(), showingExternal: showExternal, cursorMoved });
+  // One small state snapshot per 30 s: with the chrome/media lines above it
+  // pins down WHERE a "the header never hid" report broke (never decided,
+  // decided but the window was unfocused, or an internal page on screen).
+  const nowMs = Date.now();
+  if (nowMs - lastFsSnapshotAt >= 30000) {
+    lastFsSnapshotAt = nowMs;
+    console.log('[fs] state', JSON.stringify({ userFullscreen: fsCtl.userFullscreen, mediaTabId: fsCtl.mediaTabId, activeTabId: fsCtl.activeTabId, chromeVisible: fsCtl.chromeVisible, windowFocused: win.isFocused(), showingExternal: showExternal, activeUrl: activeId && views.get(activeId) ? views.get(activeId).webContents.getURL() : null }));
+  }
+}
+
 function createWindow() {
   win = new BrowserWindow({ width: 1440, height: 1000, minWidth: 850, minHeight: 620, frame: false, show: false, backgroundColor: '#f8f9fb', title: 'ChromiumCore', icon: path.join(__dirname, '../assets/icon.png'), webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
   // The application renderer is first-party UI (the New Tab quick links,
@@ -2224,20 +2337,7 @@ function createWindow() {
   win.webContents.on('did-finish-load', measureChromeHeight);
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
   clearInterval(chromeIdleTimer);
-  chromeIdleTimer = setInterval(() => {
-    if (!win || win.isDestroyed()) return;
-    let cursorMoved = false;
-    try {
-      const point = screen.getCursorScreenPoint();
-      const rect = win.getBounds();
-      const inside = point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y && point.y < rect.y + rect.height;
-      if (inside && lastCursorPoint && (point.x !== lastCursorPoint.x || point.y !== lastCursorPoint.y)) cursorMoved = true;
-      lastCursorPoint = point;
-    } catch {
-      lastCursorPoint = null; // headless or display-less environment
-    }
-    fsCtl.tick({ windowFocused: win.isFocused(), showingExternal: showExternal, cursorMoved });
-  }, 250);
+  chromeIdleTimer = setInterval(runChromeIdleTick, 250);
 }
 
 app.setName('ChromiumCore');
